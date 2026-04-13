@@ -1,0 +1,85 @@
+# Default values for forecast-serving.
+# Override with: helm install forecast-serving ./helm/forecast-serving -f my-values.yaml
+
+replicaCount: 1
+
+image:
+  repository: cpu-serving
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+
+# Prometheus auto-discovery annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+    # nginx.ingress.kubernetes.io/rewrite-target: /
+  hosts:
+    - host: forecast.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: forecast-tls
+  #   hosts:
+  #     - forecast.local
+
+# CPU/memory requests and limits.
+# Inference is CPU-only; Random Forest on 10 features is sub-millisecond.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  # Scale on CPU since inference is CPU-bound
+  targetCPUUtilizationPercentage: 70
+
+# MLflow connection — stored in a Kubernetes Secret, not plain env vars
+mlflow:
+  trackingUri: "http://mlflow:5000"
+
+model:
+  name: "cpu-forecasting"
+  stage: "Production"
+  # Number of lag observations the model expects as input
+  timeSteps: "10"
+
+# /live — process is running (does not require model to be loaded)
+# /ready — model is loaded and inference is possible
+# This split prevents Kubernetes from restarting a healthy pod
+# that is simply waiting for MLflow to become available.
+livenessProbe:
+  httpGet:
+    path: /live
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 6  # allow ~30s for model load before marking unready

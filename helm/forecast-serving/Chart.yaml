@@ -1,0 +1,16 @@
+apiVersion: v2
+name: forecast-serving
+description: >
+  Workload forecast inference service.
+  Exposes a REST API for predicting CPU utilization,
+  intended as a decision-support component for autoscalers and capacity tools.
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - mlops
+  - forecasting
+  - inference
+  - ai-infrastructure
+maintainers:
+  - name: Mozart89

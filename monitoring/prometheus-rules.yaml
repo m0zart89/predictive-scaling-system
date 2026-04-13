@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+data:
+  forecast-serving.yml: |
+    groups:
+
+      # ── Availability SLO ────────────────────────────────────────────────────────
+      # Target: 99.5% of requests must succeed (5xx error budget = 0.5%)
+      - name: forecast-serving.availability
+        interval: 30s
+        rules:
+          - alert: ForecastServiceHighErrorRate
+            expr: |
+              sum(rate(http_requests_total{job="cpu-serving", status_code=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{job="cpu-serving"}[5m])) > 0.005
+            for: 2m
+            labels:
+              severity: warning
+              slo: availability
+              service: forecast-serving
+            annotations:
+              summary: "Forecast service error rate exceeds SLO (> 0.5%)"
+              description: >
+                5xx error rate is {{ $value | humanizePercentage }}.
+                SLO budget is 0.5%. Check pod logs and MLflow connectivity.
+
+          - alert: ForecastServiceDown
+            expr: absent(up{job="cpu-serving"}) or up{job="cpu-serving"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              service: forecast-serving
+            annotations:
+              summary: "Forecast service is unreachable"
+              description: >
+                Prometheus cannot scrape forecast-serving for 1m.
+                Pod may be down, unready, or the Service selector is broken.
+
+      # ── Latency SLO ─────────────────────────────────────────────────────────────
+      # Target: p99 latency on /predict < 200ms
+      - name: forecast-serving.latency
+        interval: 30s
+        rules:
+          - alert: ForecastPredictLatencyHigh
+            expr: |
+              histogram_quantile(0.99,
+                rate(http_request_duration_seconds_bucket{
+                  job="cpu-serving",
+                  handler="/predict"
+                }[5m])
+              ) > 0.2
+            for: 5m
+            labels:
+              severity: warning
+              slo: latency
+              service: forecast-serving
+            annotations:
+              summary: "/predict p99 latency exceeds 200ms SLO"
+              description: >
+                p99 latency is {{ $value | humanizeDuration }} over the last 5m.
+                Expected < 200ms. May indicate model reload in progress or resource contention.
+
+      # ── Model health ─────────────────────────────────────────────────────────────
+      - name: forecast-serving.model
+        interval: 60s
+        rules:
+          - alert: ForecastNoTrafficToPredictEndpoint
+            expr: |
+              absent(rate(http_requests_total{job="cpu-serving", handler="/predict"}[15m]))
+            for: 15m
+            labels:
+              severity: warning
+              service: forecast-serving
+            annotations:
+              summary: "No requests to /predict in 15 minutes"
+              description: >
+                /predict has received no traffic in 15m.
+                This may indicate the model is not loaded (check /health),
+                or the upstream caller (autoscaler / scheduler) has stopped polling.
+
+          - alert: ForecastReloadErrorRate
+            expr: |
+              rate(http_requests_total{
+                job="cpu-serving",
+                handler="/reload",
+                status_code=~"5.."
+              }[10m]) > 0
+            for: 1m
+            labels:
+              severity: warning
+              service: forecast-serving
+            annotations:
+              summary: "Model reload is failing"
+              description: >
+                POST /reload is returning 5xx errors.
+                MLflow may be unavailable or the Production model stage is empty.

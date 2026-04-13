@@ -1,0 +1,25 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+/.venv/
+/venv/
+/.env
+
+# IDE
+/.idea/
+/.vscode/
+
+# Claude Code internal
+/.claude/
+
+# Local documents (not part of the codebase)
+*.pdf
+
+# MLflow local artifacts (populated at runtime, not versioned)
+/mlflow-artifacts/
+mlruns/
