@@ -6,6 +6,10 @@
 
 replicaCount: 1
 
+# Set by the predictive-stack umbrella chart; standalone installs use image.tag.
+global:
+  imageTag: ""
+
 image:
   repository: ghcr.io/m0zart89/predictive-scaling-system/predictive-scaler
   # Empty: use global.imageTag (set by the predictive-stack umbrella chart), else "latest".
