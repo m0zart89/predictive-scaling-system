@@ -1,0 +1,110 @@
+name: benchmark
+
+# Predictive scaler vs reactive HPA on a kind cluster (bench/run.sh):
+# warm-up + training, one compressed day under a CPU HPA, one under the
+# predictive scaler, then docs/benchmark.md and PNG charts. About 3 hours.
+# Manual (any branch) and weekly on main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      day_seconds:
+        description: Length of one compressed day in seconds
+        default: "2400"
+      warmup_days:
+        description: Compressed days of warm-up load to train on
+        default: "2"
+      commit_results:
+        description: Commit docs/benchmark.md and the charts to the branch
+        type: boolean
+        default: true
+  schedule:
+    - cron: "23 2 * * 1"   # Mondays 02:23 UTC
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  KIND_VERSION: v0.33.0
+  HELM_VERSION: "3.22.1"
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    name: predictive vs reactive
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install kind and report dependencies
+        run: |
+          curl -sSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          pip install matplotlib==3.9.2
+
+      - name: "Bring the stack up (no model yet: it is trained on the warm-up)"
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          BUILD_IMAGES: "1"
+          STEP_SECONDS: "30"
+          DEMO_SCALING: none
+          MAX_REPLICAS: "6"
+          TRAIN: "0"
+          SMOKE: "0"
+        run: ./scripts/up.sh
+
+      - name: Run the benchmark
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          DAY_SECONDS: ${{ github.event.inputs.day_seconds || '2400' }}
+          WARMUP_DAYS: ${{ github.event.inputs.warmup_days || '2' }}
+          STEP_SECONDS: "30"
+          MAX_REPLICAS: "6"
+          OUT_DIR: bench-results
+        run: ./bench/run.sh
+
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          mkdir -p bench-results
+          kubectl get pods -A -o wide > bench-results/pods-all.txt 2>&1 || true
+          kubectl -n predictive get events --sort-by=.lastTimestamp > bench-results/events.txt 2>&1 || true
+          for d in predictive-scaler forecast-serving cpu-burner mlflow prometheus keda-operator; do
+            kubectl -n predictive logs "deploy/$d" --all-containers=true --tail=500 > "bench-results/$d.log" 2>&1 || true
+          done
+          kubectl -n predictive logs -l app=bench-load --tail=200 > bench-results/bench-load.log 2>&1 || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.sha }}
+          path: bench-results/
+          if-no-files-found: warn
+
+      - name: Commit the report
+        if: success() && (github.event_name == 'schedule' || github.event.inputs.commit_results == 'true')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/benchmark.md docs/benchmark/
+          if git diff --cached --quiet; then
+            echo "report unchanged"
+          else
+            git commit -m "bench: results from ${GITHUB_SHA::7} ($(date -u +%Y-%m-%d))"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
