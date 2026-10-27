@@ -35,9 +35,9 @@ class FakeForecast:
         self.exc = exc
         self.calls = []
 
-    def predict(self, base_url, values, timeout, series=None, timestamp=None):
+    def predict(self, base_url, values, timeout, series=None, timestamp=None, step_seconds=None):
         self.calls.append(list(values))
-        self.kwargs = dict(series=series, timestamp=timestamp)
+        self.kwargs = dict(series=series, timestamp=timestamp, step_seconds=step_seconds)
         if self.exc:
             raise self.exc
         out = self.fn(values)

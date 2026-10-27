@@ -247,9 +247,12 @@ class PredictRequest(BaseModel):
     values: List[float]
     # Optional, for forecast quality tracking: which series this window belongs
     # to (callers forecasting several workloads should pass a distinct key per
-    # workload) and the unix time of the last value (default: arrival time).
+    # workload), the unix time of the last value (default: arrival time) and
+    # the spacing of the values (default: the model's step_seconds; a caller
+    # compressing time, e.g. the demo with stepSeconds=30, must say so).
     series: str = ""
     timestamp: Optional[float] = None
+    step_seconds: Optional[int] = None
 
     @field_validator("values")
     @classmethod
@@ -266,6 +269,13 @@ class PredictRequest(BaseModel):
     def timestamp_must_be_finite(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and (not math.isfinite(v) or v <= 0):
             raise ValueError("timestamp must be a positive unix time in seconds")
+        return v
+
+    @field_validator("step_seconds")
+    @classmethod
+    def step_must_be_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("step_seconds must be > 0")
         return v
 
 
@@ -407,8 +417,8 @@ def predict(req: PredictRequest):
         raise HTTPException(status_code=500, detail="Model produced a non-finite prediction.")
 
     try:
-        TRACKER.record(req.series, req.values, predictions, forecast_meta["step_seconds"],
-                       req.timestamp)
+        TRACKER.record(req.series, req.values, predictions,
+                       req.step_seconds or forecast_meta["step_seconds"], req.timestamp)
     except Exception:   # quality tracking must never fail a prediction
         log.exception("forecast quality tracking failed")
 

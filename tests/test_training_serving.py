@@ -51,6 +51,7 @@ def serving(monkeypatch):
         monkeypatch.setattr(serving_app, name, getattr(serving_app, name))
     monkeypatch.setattr(serving_app, "MODEL_ALIAS", "champion")
     monkeypatch.setattr(serving_app, "MODEL_STAGE", "Production")
+    serving_app.TRACKER.reset()
     return TestClient(serving_app.app)
 
 
@@ -172,3 +173,19 @@ def test_predict_scores_earlier_forecasts_against_later_windows(registry, servin
 def test_bad_timestamp_is_rejected(registry, serving):
     r = serving.post("/predict", json={"values": [0.1] * 10, "timestamp": -5})
     assert r.status_code == 422
+    assert serving.post("/predict", json={"values": [0.1] * 10, "step_seconds": 0}).status_code == 422
+
+
+def test_compressed_time_windows_are_scored_at_their_own_spacing(registry, serving):
+    """A caller feeding 30-second samples to a 5-minute model (the demo's
+    stepSeconds=30) says so, and the forecast is scored one 30 s step later."""
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    t0 = 1_700_000_000
+    first = serving.post("/predict", json={"values": [0.5] * 10, "series": "x", "timestamp": t0,
+                                           "step_seconds": 30}).json()
+    serving.post("/predict", json={"values": [0.5] * 9 + [0.7], "series": "x", "timestamp": t0 + 30,
+                                   "step_seconds": 30})
+    info = serving.get("/model-info").json()
+    assert info["rolling_mae"] == {"1": pytest.approx(abs(0.7 - first["prediction"]), abs=1e-6)}

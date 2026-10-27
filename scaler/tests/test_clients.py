@@ -155,8 +155,10 @@ def test_forecast_unreachable():
 
 def test_forecast_sends_series_and_timestamp_when_given(http):
     http.body = {"prediction": 0.4}
-    ForecastClient().predict(http.url, [0.1], timeout=2, series="demo/cpu-burner", timestamp=1700.5)
+    ForecastClient().predict(http.url, [0.1], timeout=2, series="demo/cpu-burner", timestamp=1700.5,
+                             step_seconds=30)
     body = json.loads(http.requests[-1][2])
     assert body["series"] == "demo/cpu-burner" and body["timestamp"] == 1700.5
+    assert body["step_seconds"] == 30
     ForecastClient().predict(http.url, [0.1], timeout=2)
     assert set(json.loads(http.requests[-1][2])) == {"values"}

@@ -123,6 +123,14 @@ class ForecastTracker:
             self.pending.set(sum(len(q) for q in self._pending.values()))
         return resolved
 
+    def reset(self) -> None:
+        """Forget pending forecasts and errors (tests; not exposed over HTTP)."""
+        with self._lock:
+            self._pending.clear()
+            self._errors.clear()
+            self.rolling_mae.clear()
+            self.pending.set(0)
+
     def snapshot(self) -> Dict[int, float]:
         """Current rolling MAE per horizon step (for tests and /model-info)."""
         with self._lock:

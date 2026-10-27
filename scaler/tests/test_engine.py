@@ -195,3 +195,4 @@ def test_forecast_call_carries_series_key_and_window_time(metrics):
     assert fc.kwargs["series"] == f"{NS}/{NAME}"
     # the same instant Prometheus was asked for, so serving can match the actual later
     assert fc.kwargs["timestamp"] == pytest.approx(prom.calls[0]["now"], abs=1e-6)
+    assert fc.kwargs["step_seconds"] == 300

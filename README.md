@@ -133,7 +133,7 @@ Accepts the last N CPU utilization values (where N matches `TIME_STEPS`, default
 }
 ```
 
-`series` and `timestamp` (unix time of the last value) are optional. They let the service score this forecast against the actual value a later window brings; the KEDA scaler sends both so forecasts for different `ScaledObject`s are never compared with each other's data.
+`series`, `timestamp` (unix time of the last value) and `step_seconds` (their spacing, when it differs from the model's) are optional. They let the service score this forecast against the actual value a later window brings; the KEDA scaler sends both so forecasts for different `ScaledObject`s are never compared with each other's data.
 
 **Response:**
 ```json

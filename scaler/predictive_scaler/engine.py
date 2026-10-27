@@ -121,7 +121,8 @@ class PredictiveEngine:
                 # series + timestamp let forecast-serving score this forecast
                 # against the actual value once a later window carries it
                 horizon = self.forecast.predict(cfg.forecast_url, model_input, cfg.timeout_seconds,
-                                                series=f"{namespace}/{name}", timestamp=now)
+                                                series=f"{namespace}/{name}", timestamp=now,
+                                                step_seconds=cfg.step_seconds)
             except ForecastError as exc:
                 self.metrics.forecast_failures.labels(**labels, reason=exc.reason).inc()
                 source = "observed"
