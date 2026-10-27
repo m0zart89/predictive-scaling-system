@@ -104,7 +104,6 @@ spec:
             - -c
             - |
               until wget -qO- http://mlflow:5000/health >/dev/null 2>&1; do echo waiting for mlflow; sleep 3; done
-              until wget -qO- http://forecast-serving:8080/live >/dev/null 2>&1; do echo waiting for forecast-serving; sleep 3; done
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

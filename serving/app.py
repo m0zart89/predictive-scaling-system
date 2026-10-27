@@ -4,6 +4,7 @@ import os
 import pickle
 import logging
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +37,10 @@ META_ARTIFACT       = "forecast_meta.json"
 FORECAST_MAE_WINDOW = int(os.getenv("FORECAST_MAE_WINDOW", "100"))
 FORECAST_MAX_SERIES = int(os.getenv("FORECAST_MAX_SERIES", "64"))
 FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
+# While no model is loaded, retry MLflow this often (0 disables). A fresh
+# cluster has no champion until the first training run; this picks it up
+# without anyone having to call /reload.
+MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "30"))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -199,41 +204,50 @@ def load_model() -> None:
 
 
 # ── Startup model load ─────────────────────────────────────────────────────────
-def _load_model_safe() -> None:
+_stop_loading = threading.Event()
+
+
+def _load_model_until_available() -> None:
     """
-    Background model load. Called from lifespan so it does not block container startup.
-    The /ready probe returns 503 until this completes successfully, which is the
-    correct Kubernetes mechanism for gating traffic — not a blocking startup hook.
+    Background model load, retried every MODEL_RETRY_SECONDS until a model is
+    loaded (or /reload gets there first). Runs in a thread started from the
+    lifespan so container startup is never blocked; /ready returns 503 until
+    a model is in memory, which is how Kubernetes gates traffic.
     """
-    try:
-        load_model()
-    except Exception as exc:
-        MODEL_LOADED.set(0)
-        log.warning(
-            "Model not available at startup (%s). "
-            "Service running in degraded state. POST /reload to recover.",
-            exc,
-        )
+    attempt = 0
+    while not _stop_loading.is_set() and _bundle is None:
+        attempt += 1
+        try:
+            load_model()
+            return
+        except Exception as exc:
+            MODEL_LOADED.set(0)
+            if attempt == 1:
+                log.warning("Model not available at startup (%s). Service running in degraded "
+                            "state; retrying every %gs, or POST /reload.", exc, MODEL_RETRY_SECONDS)
+            elif attempt % 10 == 0:
+                log.warning("Still no model after %d attempts: %s", attempt, exc)
+        if MODEL_RETRY_SECONDS <= 0:
+            return
+        _stop_loading.wait(MODEL_RETRY_SECONDS)
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    import asyncio
-
     log.info(
         "Workload Forecast Service starting — MODEL=%s ALIAS=%s STAGE=%s MLFLOW=%s",
         MODEL_NAME, MODEL_ALIAS or "-", MODEL_STAGE or "-", MLFLOW_TRACKING_URI,
     )
-    # Run model load in a thread pool so the container starts immediately.
-    # /ready returns 503 until load_model() completes — Kubernetes readiness probe
-    # is the correct gating mechanism, not a blocking startup hook.
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _load_model_safe)
+    # Load (and keep retrying) in a daemon thread so the container starts
+    # immediately; /ready holds traffic until a model is in memory.
+    _stop_loading.clear()
+    threading.Thread(target=_load_model_until_available, name="model-loader", daemon=True).start()
     log.info("Model loading initiated in background. Traffic held until /ready returns 200.")
 
     yield
 
+    _stop_loading.set()
     log.info("Workload Forecast Service shutting down")
 
 
