@@ -165,12 +165,14 @@ def markdown(a: dict, b: dict, runs: Sequence[dict], png: Optional[str]) -> str:
         + (f", {meta['date']})" if meta.get("date") else ")")
         + "; do not edit by hand. How it is measured: [bench/README.md](../bench/README.md)._",
         "",
-        "Same kind cluster, same cpu-burner workload (500m CPU per replica, target 0.35 cores "
-        "per replica in both modes), same compressed day of load "
+        f"Same kind cluster, same cpu-burner workload ({meta.get('cpu_request', '500m')} CPU per "
+        f"replica, up to {meta.get('max_replicas', '?')} replicas), same compressed day of load "
         f"({a['duration_min']:.0f} min per run): quiet night, sharp ramp at 06:00, lunch dip, "
-        "second ramp at 13:00, evening decline. Run A scales with a plain CPU HPA at 70%; "
-        "run B with the KEDA predictive scaler (`mode=max`, `forecastAggregation=max`) on a "
-        "model trained on the warm-up days of the same pattern.",
+        f"second ramp at 13:00, evening decline. Run A scales with a plain CPU HPA at "
+        f"{meta.get('hpa_target', '70')}%; run B with the KEDA predictive scaler (`mode=max`, "
+        f"`forecastAggregation=max`, target {meta.get('target_value', '0.35')} cores per replica, "
+        f"{meta.get('step_seconds', '30')} s step) on a model trained on the warm-up days of the "
+        "same pattern.",
         "",
         "| Metric | A: reactive HPA | B: predictive | B vs A |",
         "|---|---|---|---|",

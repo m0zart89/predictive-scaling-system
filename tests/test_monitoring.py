@@ -32,6 +32,8 @@ def test_known_expressions_pass(expr):
 
 
 @pytest.mark.parametrize("expr", [
+    'sum(rate(http_requests_total{job="forecast-serving", status_code=~"5.."}[5m]))',
+    'forecast_rolling_mae{step="1"}',
     "forecast_rolling_mae_typo",
     'rate(predictive_scaler_decision_total[5m])',
     "sum by (le) (rate(forecast_abs_errors_bucket[1h]))",

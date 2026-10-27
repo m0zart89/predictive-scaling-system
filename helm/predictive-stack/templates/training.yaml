@@ -44,7 +44,7 @@ spec:
                 - name: TRAIN_PROMETHEUS_URL
                   value: http://prometheus:9090
                 - name: TRAIN_QUERY
-                  value: {{ $t.cronjob.query | quote }}
+                  value: {{ $t.cronjob.query | default .Values.demo.query | quote }}
                 - name: TRAIN_DAYS
                   value: {{ $t.cronjob.days | quote }}
                 - name: TRAIN_STEP_SECONDS

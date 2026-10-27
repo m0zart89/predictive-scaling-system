@@ -109,7 +109,7 @@ spec:
         scalerAddress: predictive-scaler.{{ .Release.Namespace }}.svc.cluster.local:6000
         prometheusServerAddress: http://prometheus.{{ .Release.Namespace }}.svc.cluster.local:9090
         # Total demand in cores; independent of replica count.
-        query: sum(rate(process_cpu_seconds_total{app="cpu-burner"}[1m]))
+        query: {{ $demo.query | quote }}
         forecastServiceURL: http://forecast-serving.{{ .Release.Namespace }}.svc.cluster.local:8080
         targetValue: {{ $demo.predictive.targetValue | quote }}
         capacity: {{ $demo.predictive.capacity | quote }}

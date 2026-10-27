@@ -74,8 +74,11 @@ kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/$IN
 log "Installing metrics-server ($METRICS_SERVER_VERSION) — needed by the plain CPU HPA"
 kubectl apply -f "https://github.com/kubernetes-sigs/metrics-server/releases/download/$METRICS_SERVER_VERSION/components.yaml" >/dev/null
 # kind's kubelets use self-signed certificates
-kubectl -n kube-system patch deployment metrics-server --type=json -p='[
-  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]' >/dev/null 2>&1 || true
+if ! kubectl -n kube-system get deployment metrics-server -o jsonpath='{.spec.template.spec.containers[0].args}' \
+    | grep -q kubelet-insecure-tls; then
+  kubectl -n kube-system patch deployment metrics-server --type=json -p='[
+    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]' >/dev/null
+fi
 
 # ── 2. images ──────────────────────────────────────────────────────────────────
 IMAGES="forecast-serving:serving predictive-scaler:scaler cpu-burner:demo/cpu-burner forecast-training:training"
@@ -143,7 +146,8 @@ helm upgrade "$RELEASE" helm/predictive-stack -n "$NAMESPACE" --reuse-values \
   --timeout 10m >/dev/null
 
 if [ "$TRAIN" = "1" ]; then
-  job=$(kubectl -n "$NAMESPACE" get jobs -l app=train-bootstrap -o jsonpath='{.items[-1:].metadata.name}')
+  job=$(kubectl -n "$NAMESPACE" get jobs -l app=train-bootstrap --sort-by=.metadata.creationTimestamp \
+          -o jsonpath='{.items[-1:].metadata.name}')
   log "Waiting for training job $job"
   if ! kubectl -n "$NAMESPACE" wait --for=condition=complete "job/$job" --timeout=20m; then
     kubectl -n "$NAMESPACE" logs "job/$job" --all-containers=true | tail -50

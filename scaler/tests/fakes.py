@@ -18,12 +18,19 @@ class FakePrometheus:
         self.exc = exc
         self.calls = []
 
-    def fetch_window(self, address, query, points, step_seconds, timeout, now=None):
+    NOW = 1_700_000_000.0   # time of the last sample the fake returns
+
+    def fetch_series(self, address, query, points, step_seconds, timeout, now=None):
         self.calls.append(dict(address=address, query=query, points=points,
-                               step_seconds=step_seconds, timeout=timeout, now=now))
+                               step_seconds=step_seconds, timeout=timeout))
         if self.exc:
             raise self.exc
-        return self.values[-points:]
+        values = self.values[-points:]
+        timestamps = [self.NOW - (len(values) - 1 - i) * step_seconds for i in range(len(values))]
+        return timestamps, values
+
+    def fetch_window(self, *args, **kwargs):
+        return self.fetch_series(*args, **kwargs)[1]
 
 
 class FakeForecast:

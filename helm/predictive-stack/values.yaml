@@ -96,6 +96,10 @@ ingress:
 
 demo:
   enabled: true
+  # Total demand of the workload in cores, independent of replica count. Used
+  # by the ScaledObject (scaling) and the retraining CronJob (training data),
+  # so the model is fed exactly the series it was trained on.
+  query: sum(rate(process_cpu_seconds_total{app="cpu-burner"}[1m]))
   image:
     repository: ghcr.io/m0zart89/predictive-scaling-system/cpu-burner
     tag: ""               # "" = global.imageTag
@@ -148,7 +152,7 @@ training:
   cronjob:
     enabled: true
     schedule: "17 3 * * *"
-    query: 'sum(rate(process_cpu_seconds_total{app="cpu-burner"}[5m]))'
+    query: ""             # "" = demo.query
     days: "14"
     stepSeconds: "300"
     timeSteps: "10"

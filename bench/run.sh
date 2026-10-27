@@ -91,7 +91,6 @@ if [ "$SKIP_WARMUP" != "1" ]; then
   log "training on the warm-up data (${STEP_SECONDS}s step)"
   days=$(python3 -c "print($WARMUP_DAYS * $DAY_SECONDS / 86400 + 0.002)")
   helm_set training.cronjob.stepSeconds="$STEP_SECONDS" training.cronjob.days="$days" \
-    "training.cronjob.query=sum(rate(process_cpu_seconds_total{app=\"cpu-burner\"}[1m]))" \
     training.cronjob.minImprovement=0
   k delete job bench-train --ignore-not-found >/dev/null
   k create job bench-train --from=cronjob/forecast-retrain >/dev/null
@@ -100,21 +99,28 @@ if [ "$SKIP_WARMUP" != "1" ]; then
   k logs job/bench-train > "$OUT_DIR/train.log" 2>&1
   grep -q '"decision": "promoted"' "$OUT_DIR/train.log" \
     || { tail -30 "$OUT_DIR/train.log"; die "training did not promote a model"; }
-  # wait until forecast-serving reports the new version
-  for i in $(seq 1 30); do
+  # the JSON summary is the last thing the job prints (stderr logging comes first)
+  version=$(python3 -c "import json; t=open('$OUT_DIR/train.log').read(); i=t.rfind('\n{\n'); print(json.loads(t[i + 1 if i >= 0 else t.index('{'):])['version'])")
+  log "waiting for forecast-serving to serve version $version"
+  for i in $(seq 1 36); do
     curl -sS --resolve "forecast.$DOMAIN:80:127.0.0.1" "http://forecast.$DOMAIN/model-info" \
-      | grep -q '"model_loaded": *true' && break
+      > "$OUT_DIR/model-info.json" 2>/dev/null || true
+    grep -q "\"model_version\": *\"$version\"" "$OUT_DIR/model-info.json" && break
+    [ "$i" = 36 ] && { cat "$OUT_DIR/model-info.json"; die "forecast-serving did not load version $version"; }
     sleep 5
   done
-  curl -sS --resolve "forecast.$DOMAIN:80:127.0.0.1" "http://forecast.$DOMAIN/model-info" \
-    | tee "$OUT_DIR/model-info.json"; echo
+  cat "$OUT_DIR/model-info.json"; echo
   reset_workload
 fi
 
+cpu_request=$(k get deploy cpu-burner -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}')
+target_value=$(helm get values "$RELEASE" -n "$NAMESPACE" -a -o json | python3 -c "import json,sys; v=json.load(sys.stdin); print(v['demo']['predictive']['targetValue'])")
+hpa_target=$(helm get values "$RELEASE" -n "$NAMESPACE" -a -o json | python3 -c "import json,sys; v=json.load(sys.stdin); print(v['demo']['hpa']['targetCPUUtilizationPercentage'])")
 meta=(--meta "commit=${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
       --meta "date=$(date -u +%Y-%m-%d)" --meta "day_seconds=$DAY_SECONDS"
       --meta "step_seconds=$STEP_SECONDS" --meta "max_replicas=$MAX_REPLICAS"
-      --meta "work_ms=$WORK_MS" --meta "think_ms=$THINK_MS")
+      --meta "work_ms=$WORK_MS" --meta "think_ms=$THINK_MS"
+      --meta "cpu_request=$cpu_request" --meta "target_value=$target_value" --meta "hpa_target=$hpa_target")
 
 # ── run A: reactive HPA ────────────────────────────────────────────────────────
 log "run A: plain CPU HPA (70%)"

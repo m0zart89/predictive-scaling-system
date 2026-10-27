@@ -77,14 +77,27 @@ def test_prometheus_window_is_parsed_and_trimmed(http):
     assert float(q["end"][0]) - float(q["start"][0]) == pytest.approx(90)
 
 
-def test_prometheus_drops_non_finite_samples(http):
-    http.body = matrix(["0.1", "NaN", "+Inf", "0.3"])
-    assert PrometheusClient().fetch_window(http.url, "q", 10, 30, 2) == [0.1, 0.3]
+def test_prometheus_keeps_only_the_trailing_run_after_a_hole(http):
+    # a NaN (division by zero) or missing sample is a hole: the window restarts after it
+    http.body = matrix(["0.1", "NaN", "+Inf", "0.3", "0.4"])
+    ts, values = PrometheusClient().fetch_series(http.url, "q", 10, 30, 2)
+    assert values == [0.3, 0.4]
+    assert ts == [1700000090.0, 1700000120.0]
+    assert PrometheusClient().fetch_window(http.url, "q", 10, 30, 2) == [0.3, 0.4]
+
+
+def test_prometheus_samples_must_be_step_seconds_apart(http):
+    http.body = {"status": "success", "data": {"resultType": "matrix", "result": [
+        {"metric": {}, "values": [[1700000000, "0.1"], [1700000030, "0.2"],
+                                  [1700000090, "0.3"], [1700000120, "0.4"]]}]}}
+    ts, values = PrometheusClient().fetch_series(http.url, "q", 10, 30, 2)
+    assert values == [0.3, 0.4] and ts[-1] == 1700000120.0
 
 
 def test_prometheus_empty_result_is_empty_list(http):
     http.body = matrix()
     assert PrometheusClient().fetch_window(http.url, "q", 10, 30, 2) == []
+    assert PrometheusClient().fetch_series(http.url, "q", 10, 30, 2) == ([], [])
 
 
 def test_prometheus_rejects_multiple_series(http):

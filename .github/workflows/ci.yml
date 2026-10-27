@@ -35,7 +35,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r serving/requirements.txt pytest httpx pytest-timeout pyyaml
+        # tests/test_training_serving.py also imports training/ (same pins)
+        run: pip install -r serving/requirements.txt -r training/requirements.txt pytest httpx pytest-timeout pyyaml
 
       - name: Run tests
         run: pytest tests/ -v --timeout=30

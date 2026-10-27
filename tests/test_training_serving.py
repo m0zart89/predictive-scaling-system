@@ -47,8 +47,7 @@ def registry(tmp_path, monkeypatch):
 @pytest.fixture
 def serving(monkeypatch):
     """Serving app with clean model state; restored afterwards."""
-    for name in ("model", "scaler", "_meta", "forecast_meta"):
-        monkeypatch.setattr(serving_app, name, getattr(serving_app, name))
+    monkeypatch.setattr(serving_app, "_bundle", None)
     monkeypatch.setattr(serving_app, "MODEL_ALIAS", "champion")
     monkeypatch.setattr(serving_app, "MODEL_STAGE", "Production")
     serving_app.TRACKER.reset()
@@ -79,11 +78,6 @@ def test_pipeline_model_serves_identical_multistep_forecast(registry, serving):
     # out-of-range load: the delta model follows it instead of capping at the training max
     high = [v + 3.0 for v in window]
     assert serving.post("/predict", json={"values": high}).json()["prediction"] > 2.5
-
-    rec = serving.post("/recommend-scale", json={"values": window,
-                                                 "scale_up_threshold": 10}).json()
-    assert rec["predicted_peak"] == pytest.approx(max(body["predictions"]), abs=1e-4)
-    assert rec["predicted_utilization"] == pytest.approx(body["prediction"], abs=1e-4)
 
 
 def test_wrong_window_length_uses_model_time_steps(registry, serving):
@@ -144,6 +138,23 @@ def test_no_alias_and_no_stage_fails_cleanly(registry, serving, monkeypatch):
     with pytest.raises(Exception):
         serving_app.load_model()
     assert serving.get("/ready").status_code == 503
+
+
+def test_failed_reload_keeps_the_loaded_model(registry, serving, monkeypatch):
+    from prometheus_client import REGISTRY
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    serving_app.TRACKER.record("x", [0.5] * 10, [0.5, 0.5], 300, timestamp=1_700_000_000)
+
+    monkeypatch.setattr(serving_app, "MODEL_NAME", "does-not-exist")
+    client = TestClient(serving_app.app, raise_server_exceptions=False)
+    assert client.post("/reload").status_code == 500
+    assert client.get("/ready").status_code == 200
+    assert REGISTRY.get_sample_value("forecast_model_loaded") == 1
+    assert REGISTRY.get_sample_value("forecast_pending_forecasts") == 1   # untouched
+    assert client.post("/predict", json={"values": [0.1] * 10}).status_code == 200
 
 
 def test_predict_scores_earlier_forecasts_against_later_windows(registry, serving):

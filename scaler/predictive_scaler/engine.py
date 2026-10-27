@@ -94,11 +94,10 @@ class PredictiveEngine:
     def _compute(self, namespace: str, name: str, cfg: ScalerConfig) -> Decision:
         labels = {"namespace": namespace, "scaledobject": name}
 
-        now = time.time()
         try:
-            values = self.prometheus.fetch_window(
+            timestamps, values = self.prometheus.fetch_series(
                 cfg.prometheus_address, cfg.query, cfg.time_steps,
-                cfg.step_seconds, cfg.timeout_seconds, now=now,
+                cfg.step_seconds, cfg.timeout_seconds,
             )
         except PrometheusError:
             self.metrics.prometheus_failures.labels(**labels).inc()
@@ -118,10 +117,10 @@ class PredictiveEngine:
             model_input = [v / cfg.capacity for v in values]
             started = time.perf_counter()
             try:
-                # series + timestamp let forecast-serving score this forecast
-                # against the actual value once a later window carries it
+                # series + the last sample's time let forecast-serving score this
+                # forecast against the actual value once a later window carries it
                 horizon = self.forecast.predict(cfg.forecast_url, model_input, cfg.timeout_seconds,
-                                                series=f"{namespace}/{name}", timestamp=now,
+                                                series=f"{namespace}/{name}", timestamp=timestamps[-1],
                                                 step_seconds=cfg.step_seconds)
             except ForecastError as exc:
                 self.metrics.forecast_failures.labels(**labels, reason=exc.reason).inc()

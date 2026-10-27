@@ -12,7 +12,8 @@ the model or MLflow is broken rather than a transient blip.
 
 ## How to check
 
-1. Which endpoint: `sum by (handler, status_code) (rate(http_requests_total{status_code=~"5.."}[5m]))`.
+1. Which endpoint: `sum by (handler, status) (rate(http_requests_total{status=~"5.."}[5m]))`
+   (`status` is the class, `5xx`).
    - `/predict` 500: inference error — the model raised, or returned a
      non-finite value (`forecast_prediction_failures_total{reason="inference"}`).
    - `/reload` 500: MLflow unreachable or no champion — see

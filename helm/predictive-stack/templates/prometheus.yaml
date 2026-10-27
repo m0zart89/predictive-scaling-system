@@ -114,7 +114,7 @@ spec:
       labels:
         app: prometheus
       annotations:
-        checksum/config: {{ (.Files.Glob "files/rules/*.yml").AsConfig | sha256sum }}
+        checksum/config: {{ print ((.Files.Glob "files/rules/*.yml").AsConfig) .Values.prometheus.scrapeInterval .Values.prometheus.evaluationInterval | sha256sum }}
     spec:
       serviceAccountName: prometheus
       securityContext:

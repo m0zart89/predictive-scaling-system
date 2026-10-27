@@ -69,6 +69,27 @@ LIBRARY_METRICS = {
     "keda_scaler_metrics_value", "keda_scaler_errors_total",
 }
 HISTOGRAM_SUFFIXES = ("_bucket", "_count", "_sum", "_created")
+# Labels a metric actually carries, for the metrics whose labels are easy to
+# get wrong (the instrumentator names the status class `status`, not
+# `status_code`). Common target labels are always allowed.
+TARGET_LABELS = {"job", "instance", "namespace", "pod", "app", "le", "quantile"}
+METRIC_LABELS = {
+    "http_requests_total": {"handler", "method", "status"},
+    "http_request_duration_seconds": {"handler", "method"},
+    "http_request_size_bytes": {"handler"},
+    "http_response_size_bytes": {"handler"},
+    "forecast_prediction_failures_total": {"reason"},
+    "forecast_model_reloads_total": {"result"},
+    "forecast_model_info": {"model_name", "model_version", "model_stage", "run_id", "horizon"},
+    "forecast_abs_error": {"horizon_step"},
+    "forecast_rolling_mae": {"horizon_step"},
+    "predictive_scaler_decisions_total": {"scaledobject", "source"},
+    "predictive_scaler_forecast_failures_total": {"scaledobject", "reason"},
+    "predictive_scaler_grpc_requests_total": {"method", "code"},
+    "bench_requests_total": {"result"},
+}
+_MATCHER = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{([^}]*)\}")
+_LABEL_NAME = re.compile(r"\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|!=|=)")
 
 
 class Problem(Exception):
@@ -110,10 +131,31 @@ _PROMQL_WORDS = {"by", "without", "on", "ignoring", "group_left", "group_right",
                  "label_values", "ceil", "floor", "round", "abs", "clamp_min", "clamp_max",
                  "delta", "deriv", "predict_linear", "topk", "bottomk", "stddev", "time",
                  "vector", "scalar", "changes", "resets", "s", "m", "h", "d", "w", "y",
-                 "ms", "inf", "nan"}
+                 "ms", "inf", "nan", "absent_over_time", "max_over_time", "min_over_time",
+                 "avg_over_time", "sum_over_time", "count_over_time", "last_over_time"}
+
+
+def check_labels(expr: str, where: str) -> None:
+    """Label names in `metric{...}` matchers must exist on that metric."""
+    for m in _MATCHER.finditer(expr):
+        metric, body = m.group(1), m.group(2)
+        base = metric
+        for suffix in HISTOGRAM_SUFFIXES:
+            if metric.endswith(suffix):
+                base = metric[: -len(suffix)]
+                break
+        allowed = METRIC_LABELS.get(base)
+        if allowed is None:
+            continue
+        for lm in _LABEL_NAME.finditer(body):
+            name = lm.group(1)
+            if name not in allowed and name not in TARGET_LABELS:
+                raise Problem(f"{where}: {metric} has no label {name!r} "
+                              f"(labels: {', '.join(sorted(allowed | TARGET_LABELS))}) in {expr!r}")
 
 
 def check_expr(expr: str, known: set, where: str) -> None:
+    check_labels(expr, where)
     cleaned = _LABEL_GROUPS.sub(" ", _STRINGS.sub('""', expr))
     cleaned = re.sub(r"\$[A-Za-z_][A-Za-z0-9_]*", " ", cleaned)   # Grafana variables
     cleaned = re.sub(r"label_values\((.*),\s*[A-Za-z_]\w*\)", r"\1", cleaned)  # (metric, label)
@@ -199,6 +241,9 @@ def load_rules() -> dict:
     return dict(cm.get("data") or {})
 
 
+KNOWN_METRICS: set = set()
+
+
 def check_rules(rule_files: dict) -> list:
     import yaml
 
@@ -213,6 +258,7 @@ def check_rules(rule_files: dict) -> list:
                 where = f"{fname}: alert {name}"
                 if not r.get("expr"):
                     raise Problem(f"{where}: no expr")
+                check_expr(str(r["expr"]), KNOWN_METRICS, where)
                 ann = r.get("annotations") or {}
                 url = ann.get("runbook_url")
                 if url != f"{RUNBOOK_URL_PREFIX}{name}.md":
@@ -289,6 +335,7 @@ def main(argv=None) -> int:
 
     try:
         known = exported_metrics() | LIBRARY_METRICS
+        KNOWN_METRICS.update(known)
         dashboards = load_dashboards()
         check_dashboards(dashboards, known)
         rule_files = load_rules()

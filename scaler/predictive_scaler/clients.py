@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class PrometheusError(RuntimeError):
@@ -37,12 +37,20 @@ def _read_json(req: urllib.request.Request, timeout: float) -> dict:
 class PrometheusClient:
     def fetch_window(self, address: str, query: str, points: int, step_seconds: int,
                      timeout: float, now: Optional[float] = None) -> List[float]:
+        """Values of fetch_series (kept for callers that do not need timestamps)."""
+        return self.fetch_series(address, query, points, step_seconds, timeout, now)[1]
+
+    def fetch_series(self, address: str, query: str, points: int, step_seconds: int,
+                     timeout: float, now: Optional[float] = None) -> Tuple[List[float], List[float]]:
         """
-        Return up to `points` most recent samples of `query`, oldest first.
+        Return (timestamps, values) of up to `points` most recent samples of
+        `query`, oldest first — the trailing run of consecutive finite samples
+        exactly `step_seconds` apart. A gap (missing scrape, NaN from a division
+        by zero) shortens the window instead of hiding a hole from the model;
+        the engine then scales on observed demand until the window refills.
 
         The query must resolve to exactly one series — aggregate it in PromQL
         (sum/avg) so the scaler never has to guess how to combine series.
-        Non-finite samples (NaN from division by zero, etc.) are dropped.
         """
         end = time.time() if now is None else now
         # [end - points*step, end] yields points+1 samples, so one missing sample
@@ -74,17 +82,23 @@ class PrometheusClient:
                 "(e.g. wrap it in sum(...))"
             )
         if not result:
-            return []
+            return [], []
 
+        timestamps: List[float] = []
         values: List[float] = []
-        for _, raw in result[0].get("values", []):
+        for ts, raw in result[0].get("values", []):
             try:
                 v = float(raw)
             except (TypeError, ValueError):
+                v = math.nan
+            if not math.isfinite(v):
+                timestamps, values = [], []          # a hole: start the run again
                 continue
-            if math.isfinite(v):
-                values.append(v)
-        return values[-points:]
+            if timestamps and abs(float(ts) - timestamps[-1] - step_seconds) > 1:
+                timestamps, values = [], []          # samples not step_seconds apart
+            timestamps.append(float(ts))
+            values.append(v)
+        return timestamps[-points:], values[-points:]
 
 
 class ForecastClient:

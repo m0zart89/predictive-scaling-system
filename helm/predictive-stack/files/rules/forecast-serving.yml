@@ -7,7 +7,7 @@ groups:
     rules:
       - alert: ForecastServiceHighErrorRate
         expr: |
-          sum(rate(http_requests_total{job="forecast-serving", status_code=~"5.."}[5m]))
+          sum(rate(http_requests_total{job="forecast-serving", status=~"5.."}[5m]))
           /
           sum(rate(http_requests_total{job="forecast-serving"}[5m])) > 0.005
         for: 2m
@@ -76,7 +76,7 @@ groups:
           summary: "No requests to /predict in 15 minutes"
           description: >
             /predict has received no traffic in 15m.
-            This may indicate the model is not loaded (check /health),
+            This may indicate the model is not loaded (check /ready),
             or the upstream caller (autoscaler / scheduler) has stopped polling.
 
       - alert: ForecastReloadErrorRate
@@ -84,7 +84,7 @@ groups:
           rate(http_requests_total{
             job="forecast-serving",
             handler="/reload",
-            status_code=~"5.."
+            status=~"5.."
           }[10m]) > 0
         for: 1m
         labels:
