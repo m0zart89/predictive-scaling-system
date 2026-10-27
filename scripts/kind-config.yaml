@@ -1,0 +1,22 @@
+# kind cluster for scripts/up.sh and .github/workflows/e2e.yml.
+# Ports 80/443 on the host go to ingress-nginx, so the stack is reachable at
+# http://<service>.localhost without NodePorts or node IPs.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    # KEDA 2.21 targets Kubernetes 1.34–1.36; kind v0.33.0 ships this image.
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
