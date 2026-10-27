@@ -143,3 +143,32 @@ def test_no_alias_and_no_stage_fails_cleanly(registry, serving, monkeypatch):
     with pytest.raises(Exception):
         serving_app.load_model()
     assert serving.get("/ready").status_code == 503
+
+
+def test_predict_scores_earlier_forecasts_against_later_windows(registry, serving):
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+
+    t0 = int(ts[-2])
+    window = [float(v) for v in values[-11:-1]]
+    first = serving.post("/predict", json={"values": window, "series": "demo/cpu-burner",
+                                           "timestamp": t0}).json()
+    later = [float(v) for v in values[-10:]]            # one step on: holds the actual
+    serving.post("/predict", json={"values": later, "series": "demo/cpu-burner",
+                                   "timestamp": t0 + STEP})
+
+    expected = abs(later[-1] - first["prediction"])
+    info = serving.get("/model-info").json()
+    assert info["rolling_mae"] == {"1": pytest.approx(expected, abs=1e-6)}
+    assert info["model_version"] == "1"
+
+    metrics = serving.get("/metrics").text
+    assert 'forecast_rolling_mae{horizon_step="1"}' in metrics
+    assert 'forecast_abs_error_count{horizon_step="1"} 1.0' in metrics
+    assert 'forecast_model_info{' in metrics and 'model_version="1"' in metrics
+
+
+def test_bad_timestamp_is_rejected(registry, serving):
+    r = serving.post("/predict", json={"values": [0.1] * 10, "timestamp": -5})
+    assert r.status_code == 422

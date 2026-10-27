@@ -20,7 +20,7 @@ class FakePrometheus:
 
     def fetch_window(self, address, query, points, step_seconds, timeout, now=None):
         self.calls.append(dict(address=address, query=query, points=points,
-                               step_seconds=step_seconds, timeout=timeout))
+                               step_seconds=step_seconds, timeout=timeout, now=now))
         if self.exc:
             raise self.exc
         return self.values[-points:]
@@ -35,8 +35,9 @@ class FakeForecast:
         self.exc = exc
         self.calls = []
 
-    def predict(self, base_url, values, timeout):
+    def predict(self, base_url, values, timeout, series=None, timestamp=None):
         self.calls.append(list(values))
+        self.kwargs = dict(series=series, timestamp=timestamp)
         if self.exc:
             raise self.exc
         out = self.fn(values)

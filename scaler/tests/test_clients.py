@@ -151,3 +151,12 @@ def test_forecast_unreachable():
     with pytest.raises(ForecastError) as err:
         ForecastClient().predict("http://127.0.0.1:1", [0.1], timeout=1)
     assert err.value.reason == "unavailable"
+
+
+def test_forecast_sends_series_and_timestamp_when_given(http):
+    http.body = {"prediction": 0.4}
+    ForecastClient().predict(http.url, [0.1], timeout=2, series="demo/cpu-burner", timestamp=1700.5)
+    body = json.loads(http.requests[-1][2])
+    assert body["series"] == "demo/cpu-burner" and body["timestamp"] == 1700.5
+    ForecastClient().predict(http.url, [0.1], timeout=2)
+    assert set(json.loads(http.requests[-1][2])) == {"values"}

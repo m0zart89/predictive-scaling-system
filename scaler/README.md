@@ -30,6 +30,11 @@ result to KEDA as an external metric. KEDA's HPA then sets
 Invalid metadata is rejected with gRPC `INVALID_ARGUMENT`, which KEDA shows
 as an event on the `ScaledObject`.
 
+Each `/predict` call also carries `series` (`<namespace>/<scaledobject>`) and
+`timestamp` (the instant the window was read at), so forecast-serving can
+score the forecast against the actual value a later window brings
+(`forecast_rolling_mae` by horizon step).
+
 ## Failure policy
 
 | Condition | Reported value |

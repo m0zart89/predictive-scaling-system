@@ -88,13 +88,23 @@ class PrometheusClient:
 
 
 class ForecastClient:
-    def predict(self, base_url: str, values: List[float], timeout: float) -> List[float]:
+    def predict(self, base_url: str, values: List[float], timeout: float,
+                series: Optional[str] = None, timestamp: Optional[float] = None) -> List[float]:
         """
         Call POST /predict and return the forecast for each step of the model's
         horizon (model space). Models with a single-step horizon, and services
         that predate multi-step forecasts, yield a one-element list.
+
+        `series` and `timestamp` (unix time of the last sample) let the service
+        score this forecast against the actual values a later window carries;
+        older services ignore them.
         """
-        payload = json.dumps({"values": values}).encode("utf-8")
+        body_out: dict = {"values": values}
+        if series:
+            body_out["series"] = series
+        if timestamp is not None:
+            body_out["timestamp"] = timestamp
+        payload = json.dumps(body_out).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/predict",
             data=payload,

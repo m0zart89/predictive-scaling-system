@@ -18,6 +18,8 @@ import mlflow.sklearn
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
+from quality import ForecastTracker
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 MODEL_NAME          = os.getenv("MODEL_NAME",          "cpu-forecasting")
@@ -28,6 +30,11 @@ MODEL_STAGE         = os.getenv("MODEL_STAGE",         "Production")
 # Only used for models without a forecast_meta.json (registered by the notebook).
 TIME_STEPS          = int(os.getenv("TIME_STEPS",      "10"))
 META_ARTIFACT       = "forecast_meta.json"
+# Forecast quality tracking (see quality.py): rolling-MAE window per horizon
+# step, and memory bounds for the forecasts waiting to be scored.
+FORECAST_MAE_WINDOW = int(os.getenv("FORECAST_MAE_WINDOW", "100"))
+FORECAST_MAX_SERIES = int(os.getenv("FORECAST_MAX_SERIES", "64"))
+FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -60,6 +67,15 @@ MODEL_LOADED = Gauge(
     "forecast_model_loaded",
     "1 if a model is loaded and ready to serve predictions, 0 otherwise",
 )
+MODEL_INFO = Gauge(
+    "forecast_model_info",
+    "Loaded model, as labels (always 1); lets dashboards show which version served",
+    ["model_name", "model_version", "model_stage", "run_id", "horizon"],
+)
+# Scores past forecasts against the actual values that later windows carry:
+# forecast_abs_error / forecast_rolling_mae, both by horizon step.
+TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_MAX_PENDING,
+                          mae_window=FORECAST_MAE_WINDOW)
 
 # ── Model state ────────────────────────────────────────────────────────────────
 model    = None
@@ -159,6 +175,9 @@ def load_model() -> None:
     }
 
     MODEL_LOADED.set(1)
+    MODEL_INFO.clear()   # one series only: drop the previous version's labels
+    MODEL_INFO.labels(model_name=MODEL_NAME, model_version=version, model_stage=selector,
+                      run_id=run_id, horizon=str(loaded_meta["horizon"])).set(1)
     MODEL_RELOADS.labels(result="success").inc()
     log.info(
         "Model loaded: name=%s %s version=%s run_id=%s time_steps=%s horizon=%s target=%s",
@@ -226,6 +245,11 @@ class PredictRequest(BaseModel):
     # raw (unscaled).
     # The service applies the stored MinMaxScaler internally.
     values: List[float]
+    # Optional, for forecast quality tracking: which series this window belongs
+    # to (callers forecasting several workloads should pass a distinct key per
+    # workload) and the unix time of the last value (default: arrival time).
+    series: str = ""
+    timestamp: Optional[float] = None
 
     @field_validator("values")
     @classmethod
@@ -235,6 +259,13 @@ class PredictRequest(BaseModel):
         for i, x in enumerate(v):
             if not math.isfinite(x):
                 raise ValueError(f"values[{i}] is not finite: {x!r}")
+        return v
+
+    @field_validator("timestamp")
+    @classmethod
+    def timestamp_must_be_finite(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and (not math.isfinite(v) or v <= 0):
+            raise ValueError("timestamp must be a positive unix time in seconds")
         return v
 
 
@@ -321,6 +352,7 @@ def model_info():
         "step_seconds": forecast_meta["step_seconds"],
         "features":     forecast_meta["features"],
         "target":       forecast_meta["target"],
+        "rolling_mae":  {str(k): round(v, 6) for k, v in sorted(TRACKER.snapshot().items())},
         **_meta,
     }
 
@@ -373,6 +405,12 @@ def predict(req: PredictRequest):
         PREDICTION_FAILURES.labels(reason="inference").inc()
         log.error("Model returned non-finite prediction %r for input %s", predictions, req.values)
         raise HTTPException(status_code=500, detail="Model produced a non-finite prediction.")
+
+    try:
+        TRACKER.record(req.series, req.values, predictions, forecast_meta["step_seconds"],
+                       req.timestamp)
+    except Exception:   # quality tracking must never fail a prediction
+        log.exception("forecast quality tracking failed")
 
     return PredictResponse(
         prediction=predictions[0],
