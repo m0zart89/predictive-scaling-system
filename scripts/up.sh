@@ -160,10 +160,10 @@ if [ "$SMOKE" = "1" ]; then
   # Run the check inside the cluster with the scaler image: it has grpcio and the
   # generated stubs. GetMetrics needs Prometheus samples of cpu-burner, so give
   # it a little load first and retry until the window has data.
-  kubectl -n "$NAMESPACE" run smoke-load --image=busybox:1.36 --restart=Never --rm -i --quiet -- \
+  kubectl -n "$NAMESPACE" run smoke-load --image=busybox:1.36 --restart=Never --rm -i --quiet --command -- \
     sh -c 'for i in $(seq 1 40); do wget -q -O- "http://cpu-burner:8080/work?ms=50" >/dev/null; done; echo load ok' || true
   kubectl -n "$NAMESPACE" run scaler-smoke --image="$REGISTRY/predictive-scaler:$IMAGE_TAG" \
-    --image-pull-policy=IfNotPresent --restart=Never --rm -i --quiet \
+    --image-pull-policy=IfNotPresent --restart=Never --rm -i --quiet --command \
     --env="NS=$NAMESPACE" --env="STEP=$STEP_SECONDS" -- python - <<'PY'
 import os, time, grpc
 from predictive_scaler import externalscaler_pb2 as pb, externalscaler_pb2_grpc as pbg

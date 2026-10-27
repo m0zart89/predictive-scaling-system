@@ -47,7 +47,7 @@ log "before: forecast decisions=$before_forecast, cpu-burner replicas=$replicas_
 # One pod runs batches of concurrent /work calls: 1 client, then 4 after RAMP_AT.
 log "Loading cpu-burner for ${LOAD_SECONDS}s (ramp at ${RAMP_AT}s)"
 k delete pod e2e-load --ignore-not-found >/dev/null
-k run e2e-load --image=busybox:1.36 --restart=Never \
+k run e2e-load --image=busybox:1.36 --restart=Never --command \
   --env="LOAD_SECONDS=$LOAD_SECONDS" --env="RAMP_AT=$RAMP_AT" -- sh -c '
 start=$(date +%s)
 while [ $(( $(date +%s) - start )) -lt "$LOAD_SECONDS" ]; do
