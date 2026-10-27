@@ -1,7 +1,7 @@
 # AI infrastructure prototype for predictive autoscaling and workload-aware resource optimization
 
 **Status:** Prototype / Portfolio  
-**Stack:** Python · FastAPI · MLflow · scikit-learn · Kubernetes · Prometheus · Grafana
+**Stack:** Python · FastAPI · gRPC · MLflow · scikit-learn · Kubernetes · KEDA · Prometheus · Grafana
 
 ---
 
@@ -179,7 +179,7 @@ In a production deployment, the Grafana dashboard would include alerting rules o
 
 ## Infrastructure Integration
 
-This section describes how the system would integrate with Kubernetes in a real deployment. **None of this is currently implemented** — the autoscaling integration is conceptual.
+The forecast is wired into Kubernetes autoscaling through a **KEDA external scaler** ([`scaler/`](scaler/)): KEDA asks it for a metric, it answers with forecast demand, and the HPA that KEDA manages scales the workload on that number. A runnable walkthrough with a demo workload is in [`demo/`](demo/README.md).
 
 ### Reactive scaling (current state of the art)
 
@@ -197,7 +197,23 @@ Forecast predicts threshold breach in T+5min → scale event triggered at T → 
 
 The forecast service enables this by exposing predicted utilization as a queryable value. The integration mechanism depends on the autoscaler in use:
 
-**KEDA external scaler:** KEDA's `ScaledObject` supports HTTP-based external scalers. A lightweight adapter service would call `POST /predict`, compare the result against a configured threshold, and return a target replica count to KEDA. This requires ~50 lines of Go or Python — the heavy lifting is in the forecasting service.
+### How the predictive scaler works (implemented)
+
+```
+Prometheus ──query_range (last 10 samples)──► predictive-scaler ──POST /predict──► forecast-serving
+                                                     │
+                                  reported = max(forecast, observed)
+                                                     │
+            HPA ◄── replicas = ceil(reported / targetValue) ◄── KEDA ◄── gRPC GetMetrics
+```
+
+- **Stateless and generic.** Each `ScaledObject` carries its own PromQL query, target per replica and forecast URL in trigger metadata; one scaler deployment serves any number of workloads.
+- **Forecast adds capacity, never removes it.** In the default `max` mode the scaler reports `max(forecast, observed)`, so the forecast can scale up ahead of load but cannot scale below what is in use right now. `mode: forecast` trusts the model fully.
+- **Degrades to reactive, not to zero.** If forecast-serving is down or the history window is not full yet, the scaler reports observed demand — the workload keeps scaling like a plain HPA. If Prometheus itself fails, it returns a gRPC error and KEDA applies the `ScaledObject`'s `fallback` replicas instead of the scaler inventing a number.
+- **Observable.** Per-`ScaledObject` metrics for observed, predicted and reported demand, desired replicas, fallbacks and forecast latency; native gRPC health probes.
+- **Why not `/recommend-scale`.** That endpoint returns a scale-up/down/hold verdict against thresholds. KEDA needs a number it can divide by a per-replica target, so the scaler calls `/predict` and does the replica arithmetic itself.
+
+### Other integration options
 
 **Custom metrics adapter:** An HPA with `externalMetric` type reads from an external metrics API. A bridge service could expose the forecast as a custom metric in Kubernetes' metrics pipeline (via `custom.metrics.k8s.io`).
 
@@ -251,7 +267,8 @@ These are known simplifications, not omissions:
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
 - **Single-step horizon.** The model predicts one interval (5 minutes) ahead. Multi-step forecasting (15, 30, 60 minutes) is needed for capacity planning decisions with longer lead times and requires either a different model architecture or an autoregressive wrapper.
 - **No concept drift detection.** The model is trained once on January 2022 data. In production, CPU patterns shift as workloads change. Without drift detection and scheduled retraining, prediction quality degrades silently.
-- **No autoscaling integration.** The KEDA/HPA integration described above is not implemented. The service provides the data contract; the controller integration is left as future work.
+- **Autoscaling not yet benchmarked in a cluster.** The KEDA external scaler is implemented and tested (unit tests plus gRPC tests through the generated client), and checked end-to-end against the real forecast service, but there is no measured comparison with a reactive HPA yet.
+- **Forecasts cannot leave the training range.** Tree-based models never predict above the largest value they were trained on, and on a steady ramp they regress towards the mean. The scaler's `max(forecast, observed)` default and its `capacity` mapping keep this safe, but a trend-aware model would add more lead time.
 - **Static training pipeline.** The notebook is not automated. In production, retraining should be triggered by a CronJob or event, not a manual notebook execution.
 - **No persistent Grafana dashboards.** Dashboard definitions are not committed to the repository. In a real system, dashboards would be version-controlled and provisioned via ConfigMap.
 - **Local Kubernetes only.** Manifests use NodePort and Minikube-specific image loading. This is appropriate for local development; production would use `Ingress`, image registries, and namespace RBAC.
@@ -260,8 +277,8 @@ These are known simplifications, not omissions:
 
 ## Future Work
 
-**KEDA external scaler integration**  
-Implement the HTTP adapter that translates `/predict` output into KEDA's scaler protocol. This closes the loop from forecast to actual scaling action and is the most direct path to validating the end-to-end system.
+**Predictive vs reactive benchmark**  
+Run the demo workload under a daily traffic pattern twice — once with a CPU-based HPA, once with the predictive scaler — and compare p95 latency during ramps and idle replica-minutes. This is what turns the prototype into evidence. (The KEDA external scaler it relies on is implemented in `scaler/`.)
 
 **Automated retraining pipeline**  
 Replace the manual notebook with a Kubernetes `CronJob` that: fetches recent metrics from Prometheus, retrains the model, logs to MLflow, and promotes the new version to `Production` if validation metrics improve. This makes the system self-updating rather than point-in-time.
@@ -359,8 +376,15 @@ open http://192.168.49.2:30300
 vuna/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml               # Lint → build → helm lint pipeline
+│       └── ci.yml               # Lint → tests → image builds → helm lint pipeline
+├── scaler/                      # KEDA external scaler (gRPC): Prometheus → /predict → replicas
+│   ├── predictive_scaler/       # config, clients, decision engine, gRPC server, metrics
+│   ├── tests/                   # unit + gRPC tests
+│   ├── gen_proto.sh             # regenerate gRPC stubs from externalscaler.proto
+│   └── Dockerfile
+├── demo/                        # cpu-burner workload + ScaledObject + walkthrough
 ├── helm/
+│   ├── predictive-scaler/       # Helm chart for the scaler
 │   └── forecast-serving/        # Helm chart (production deployment path)
 │       ├── Chart.yaml
 │       ├── values.yaml

@@ -1,0 +1,73 @@
+# Scales cpu-burner on forecast CPU demand.
+#
+# KEDA asks the predictive scaler for a metric and computes
+#   desiredReplicas = ceil(reportedDemand / targetValue)
+# where reportedDemand = max(forecast, observed) in cores.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cpu-burner
+  namespace: demo
+spec:
+  scaleTargetRef:
+    name: cpu-burner
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  pollingInterval: 15
+  cooldownPeriod: 300
+
+  # Used when the scaler returns an error (Prometheus down, no samples):
+  # hold a safe replica count instead of guessing.
+  fallback:
+    failureThreshold: 3
+    replicas: 4
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        # Scale up immediately — that is the point of forecasting ahead.
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        # Scale down slowly to avoid flapping on noisy forecasts.
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+
+  triggers:
+    - type: external
+      metricType: AverageValue
+      metadata:
+        scalerAddress: predictive-scaler.keda.svc.cluster.local:6000
+
+        prometheusServerAddress: http://prometheus.default.svc.cluster.local:9090
+        # Total demand in cores; independent of replica count.
+        query: sum(rate(process_cpu_seconds_total{app="cpu-burner"}[1m]))
+        forecastServiceURL: http://forecast-serving.default.svc.cluster.local:8080
+
+        # Cores one replica should carry: 70% of its 500m request.
+        targetValue: "0.35"
+        # Converts demand into the model's training units:
+        # model input = demand / capacity. The training series spans ~0–2,
+        # and this workload tops out at 10 replicas x 500m = 5 cores,
+        # so 5 / 2.5 = 2.0 keeps the full range inside what the model has seen.
+        capacity: "2.5"
+
+        # The model expects 10 samples at 5-minute spacing (as trained).
+        # For a quick demo, compress time with stepSeconds: "30" — the
+        # forecast is then 30 s ahead instead of 5 min.
+        timeSteps: "10"
+        stepSeconds: "300"
+
+        # max: forecast may add capacity early but never removes capacity
+        # that is in use right now. forecast: trust the model fully.
+        mode: max
+        activationValue: "0"
+        cacheSeconds: "15"
+        timeoutSeconds: "3"

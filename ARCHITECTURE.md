@@ -107,6 +107,8 @@ The `/reload` endpoint is the synchronisation point between the registry and the
 
 ### Expected integration pattern
 
+This loop is implemented by the KEDA external scaler in `scaler/`; see the README section *How the predictive scaler works*. It differs from the sketch below in two deliberate ways: it reports a demand value instead of applying thresholds (KEDA turns demand into replicas as `ceil(demand / targetValue)`), and it reports `max(forecast, observed)` so a forecast can never scale a workload below its current use.
+
 ```
 [Control loop — runs every N seconds]
 
