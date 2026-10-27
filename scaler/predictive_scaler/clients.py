@@ -88,8 +88,12 @@ class PrometheusClient:
 
 
 class ForecastClient:
-    def predict(self, base_url: str, values: List[float], timeout: float) -> float:
-        """Call POST /predict and return the predicted value (model space)."""
+    def predict(self, base_url: str, values: List[float], timeout: float) -> List[float]:
+        """
+        Call POST /predict and return the forecast for each step of the model's
+        horizon (model space). Models with a single-step horizon, and services
+        that predate multi-step forecasts, yield a one-element list.
+        """
         payload = json.dumps({"values": values}).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/predict",
@@ -108,9 +112,10 @@ class ForecastClient:
             raise ForecastError("forecast service returned invalid JSON", "bad_response") from exc
 
         try:
-            prediction = float(body["prediction"])
-        except (KeyError, TypeError, ValueError) as exc:
+            raw = body.get("predictions") or [body["prediction"]]
+            predictions = [float(v) for v in raw]
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise ForecastError("forecast response has no numeric 'prediction'", "bad_response") from exc
-        if not math.isfinite(prediction):
+        if not predictions or not all(math.isfinite(v) for v in predictions):
             raise ForecastError("forecast service returned a non-finite prediction", "bad_response")
-        return prediction
+        return predictions

@@ -27,7 +27,8 @@ class FakePrometheus:
 
 
 class FakeForecast:
-    """Answers with fn(values) (default: last value) or raises."""
+    """Answers with fn(values) (default: last value) or raises. fn may return a
+    float (single-step model) or a list (multi-step horizon)."""
 
     def __init__(self, fn=None, exc=None):
         self.fn = fn or (lambda values: values[-1])
@@ -38,7 +39,8 @@ class FakeForecast:
         self.calls.append(list(values))
         if self.exc:
             raise self.exc
-        return self.fn(values)
+        out = self.fn(values)
+        return list(out) if isinstance(out, (list, tuple)) else [out]
 
 
 def make_config(**overrides):

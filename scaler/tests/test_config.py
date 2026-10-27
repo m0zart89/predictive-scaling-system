@@ -61,3 +61,10 @@ def test_mode_is_case_insensitive():
 def test_cache_key_changes_with_settings():
     assert make_config().cache_key == make_config().cache_key
     assert make_config().cache_key != make_config(targetValue="0.6").cache_key
+
+
+def test_forecast_aggregation():
+    assert make_config().forecast_aggregation == "next"
+    assert make_config(forecastAggregation="MAX").forecast_aggregation == "max"
+    with pytest.raises(ConfigError, match="forecastAggregation"):
+        make_config(forecastAggregation="mean")

@@ -117,15 +117,19 @@ class PredictiveEngine:
             model_input = [v / cfg.capacity for v in values]
             started = time.perf_counter()
             try:
-                model_out = self.forecast.predict(cfg.forecast_url, model_input, cfg.timeout_seconds)
+                horizon = self.forecast.predict(cfg.forecast_url, model_input, cfg.timeout_seconds)
             except ForecastError as exc:
                 self.metrics.forecast_failures.labels(**labels, reason=exc.reason).inc()
                 source = "observed"
                 reason = f"forecast unavailable ({exc}); falling back to observed demand"
             else:
+                # next: the coming interval. max: the peak over the model's whole
+                # horizon, which buys lead time equal to the horizon.
+                model_out = max(horizon) if cfg.forecast_aggregation == "max" else horizon[0]
                 predicted = max(0.0, model_out * cfg.capacity)
                 source = "forecast"
-                reason = f"forecast {predicted:.4g}, observed {observed:.4g}, mode={cfg.mode}"
+                reason = (f"forecast {predicted:.4g} ({cfg.forecast_aggregation} of "
+                          f"{len(horizon)} step(s)), observed {observed:.4g}, mode={cfg.mode}")
             finally:
                 self.metrics.forecast_latency.observe(time.perf_counter() - started)
 

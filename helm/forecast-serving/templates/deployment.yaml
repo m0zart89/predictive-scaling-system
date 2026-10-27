@@ -43,6 +43,8 @@ spec:
                   key: MLFLOW_TRACKING_URI
             - name: MODEL_NAME
               value: {{ .Values.model.name | quote }}
+            - name: MODEL_ALIAS
+              value: {{ .Values.model.alias | quote }}
             - name: MODEL_STAGE
               value: {{ .Values.model.stage | quote }}
             - name: TIME_STEPS
