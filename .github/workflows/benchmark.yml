@@ -3,9 +3,12 @@ name: benchmark
 # Predictive scaler vs reactive HPA on a kind cluster (bench/run.sh):
 # warm-up + training, one compressed day under a CPU HPA, one under the
 # predictive scaler, then docs/benchmark.md and PNG charts. About 3 hours.
-# Manual (any branch) and weekly on main.
+# Manual (any branch), weekly on main, or by adding the `benchmark` label to a
+# pull request (workflow_dispatch only knows workflows that exist on main).
 
 on:
+  pull_request:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       day_seconds:
@@ -22,7 +25,7 @@ on:
     - cron: "23 2 * * 1"   # Mondays 02:23 UTC
 
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.head_ref || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -35,12 +38,15 @@ permissions:
 jobs:
   bench:
     name: predictive vs reactive
+    if: github.event_name != 'pull_request' || github.event.label.name == 'benchmark'
     runs-on: ubuntu-latest
     timeout-minutes: 330
+    env:
+      BRANCH: ${{ github.head_ref || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.head_ref || github.ref }}
 
       - uses: azure/setup-helm@v4
         with:
@@ -97,7 +103,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit the report
-        if: success() && (github.event_name == 'schedule' || github.event.inputs.commit_results == 'true')
+        if: success() && github.event.inputs.commit_results != 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -105,6 +111,9 @@ jobs:
           if git diff --cached --quiet; then
             echo "report unchanged"
           else
-            git commit -m "bench: results from ${GITHUB_SHA::7} ($(date -u +%Y-%m-%d))"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git commit -m "bench: results from $(git rev-parse --short HEAD) ($(date -u +%Y-%m-%d))"
+            # the branch may have moved during the ~3 h run
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
           fi
