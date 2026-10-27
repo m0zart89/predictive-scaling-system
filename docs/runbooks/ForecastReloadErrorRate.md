@@ -26,8 +26,9 @@ alias, and by `scripts`/operators after a manual promotion.
 
 ## How to fix
 
-- No champion yet: run training (`python -m forecast_training --export
-  notebooks/data-jan-2022.json ...` or the CronJob), then `POST /reload`.
+- No champion yet: run training (`scripts/up.sh` does it on a fresh cluster;
+  or `python -m forecast_training --export notebooks/data-jan-2022.json ...`,
+  or the CronJob), then `POST /reload`.
 - MLflow down: restore it (PVC, OOM); the alert clears on the next
   successful reload.
 - Broken version: move the alias to a good version and reload.

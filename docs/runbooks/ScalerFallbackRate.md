@@ -32,7 +32,7 @@ The scaler falls back to observed demand when:
 4. `reason="bad_response"`: usually a window-length mismatch — the
    ScaledObject's `timeSteps` differs from the model's `time_steps`
    (`GET /model-info`), so `/predict` returns 422. The scaler logs the exact
-   error: `kubectl -n keda logs deploy/predictive-scaler`.
+   error: `kubectl -n predictive logs deploy/predictive-scaler`.
 5. Prometheus gaps shorten the window: look for holes in the workload's
    series over the last `timeSteps × stepSeconds`.
 
@@ -42,5 +42,7 @@ The scaler falls back to observed demand when:
 - Load a model / fix the model: `POST /reload` once MLflow has a champion.
 - Mismatched `timeSteps`/`stepSeconds`: edit the ScaledObject trigger
   metadata to match the model; the scaler picks it up on the next call.
-- Persistent scrape gaps: fix the scrape target (pod annotations, Prometheus
-  pod discovery) — see [ScalerPrometheusErrors](ScalerPrometheusErrors.md).
+- Persistent scrape gaps: the scaler only uses the trailing run of
+  consecutive samples, so a hole every few minutes keeps the window short —
+  fix the scrape target (pod annotations, Prometheus pod discovery); see
+  [ScalerPrometheusErrors](ScalerPrometheusErrors.md).

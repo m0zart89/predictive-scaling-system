@@ -34,13 +34,9 @@ kubectl -n predictive run load --rm -it --image=busybox:1.36 --restart=Never -- 
 `scripts/e2e.sh` does the same with a ramp for 10 minutes and checks that the
 scaler's decisions came from forecasts and that the HPA changed replicas.
 
-### Raw manifests
-
-`cpu-burner.yaml` and `scaledobject.yaml` are the `kubectl apply` variant for
-a cluster where KEDA (`helm install keda kedacore/keda -n keda
---create-namespace`), the scaler (`helm install predictive-scaler
-helm/predictive-scaler/ -n keda`) and the serving stack from the raw manifests
-already run; they assume the `demo` namespace and the GHCR images.
+The Deployment, Service and ScaledObject live in
+`helm/predictive-stack/templates/demo.yaml` (`demo.scaling=predictive`); the
+trigger metadata is documented in [scaler/README.md](../scaler/README.md).
 
 ## Watch it
 

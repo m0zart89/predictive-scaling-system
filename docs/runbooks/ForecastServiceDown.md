@@ -11,20 +11,20 @@ workloads keep scaling reactively; nothing is pinned.
 
 ## How to check
 
-1. `kubectl get pods -l app.kubernetes.io/name=forecast-serving` (Helm) or
-   `-l app=cpu-serving` (raw manifests): CrashLoopBackOff, Pending, OOMKilled?
+1. `kubectl -n predictive get pods -l app.kubernetes.io/name=forecast-serving`:
+   CrashLoopBackOff, Pending, OOMKilled?
 2. `kubectl describe pod ...` for image pull errors and probe failures. Note
    that `/ready` returning 503 does **not** stop scraping: the pod is scraped
    by its address, not through the Service, so `up == 0` means the process
    is not answering at all.
-3. Service / scrape config: the static `cpu-serving:8080` target in
-   `monitoring/prometheus-config.yaml` must match the Service name of the
-   deployment in use.
+3. Scrape config: the pod must carry the `prometheus.io/scrape` annotations
+   and live in the namespace Prometheus discovers (the release namespace;
+   see the `kubernetes-pods` job in `helm/predictive-stack/templates/prometheus.yaml`).
 
 ## How to fix
 
 - Crash on start: check logs; the service starts even without MLflow
   (degraded, `/ready` 503) so a crash is a bug or a bad image.
 - Pending: resource requests vs node capacity.
-- Wrong target name: fix the scrape config or the Service, then reload
-  Prometheus (`kubectl rollout restart deploy/prometheus`).
+- Missing annotations or wrong namespace: fix the Deployment, then restart
+  Prometheus if its config changed (`kubectl -n predictive rollout restart deploy/prometheus`).

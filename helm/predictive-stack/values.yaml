@@ -71,13 +71,6 @@ grafana:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {cpu: 500m, memory: 512Mi}
 
-loki:
-  enabled: false
-  image: grafana/loki:3.0.0
-  resources:
-    requests: {cpu: 50m, memory: 128Mi}
-    limits: {cpu: 200m, memory: 256Mi}
-
 # One Ingress with a host per component: <name>.<domain>. With the kind
 # config in scripts/kind-config.yaml and ingress-nginx, *.localhost resolves
 # to the cluster from the host machine.

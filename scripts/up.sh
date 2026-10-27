@@ -22,7 +22,7 @@
 #   MAX_REPLICAS   demo.maxReplicas                      (default: 10)
 #   TRAIN          1 = train the first model from the saved export (default: 1)
 #   SMOKE          1 = run the smoke tests at the end     (default: 1)
-#   HELM_EXTRA     extra arguments for helm upgrade (e.g. "--set loki.enabled=true")
+#   HELM_EXTRA     extra arguments for helm upgrade (e.g. "--set grafana.anonymous=false")
 #   DOMAIN         ingress domain                         (default: localhost)
 set -euo pipefail
 

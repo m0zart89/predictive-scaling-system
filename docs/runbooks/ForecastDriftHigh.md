@@ -36,7 +36,7 @@ workload may be under-provisioned.
 ## How to fix
 
 - **Workload changed, model stale:** retrain now instead of waiting for the
-  nightly CronJob: `kubectl create job --from=cronjob/forecast-retrain
+  nightly CronJob: `kubectl -n predictive create job --from=cronjob/forecast-retrain
   retrain-manual`. The pipeline only moves `@champion` to a model that beats
   the current one on data neither has seen, then calls `/reload`.
 - **A reload made it worse:** roll back by pointing the alias at the previous

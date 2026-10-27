@@ -13,7 +13,7 @@ no longer autoscaled in either direction until this clears.
 
 ## How to check
 
-1. Scaler logs name the failure: `kubectl -n keda logs deploy/predictive-scaler
+1. Scaler logs name the failure: `kubectl -n predictive logs deploy/predictive-scaler
    | grep -i prometheus` — `unreachable`, `HTTP 4xx/5xx`, `returned N series`
    or `no samples`.
 2. Run the ScaledObject's `query` in the Prometheus UI over the last
@@ -21,13 +21,13 @@ no longer autoscaled in either direction until this clears.
    - **Error:** PromQL mistake in the trigger metadata.
    - **Empty:** the workload's pods are not being scraped — check the pod
      annotations (`prometheus.io/scrape`, `port`, `path`) and that Prometheus
-     discovers the namespace (see the `kubernetes-pods` job in
-     `monitoring/prometheus-config.yaml`).
+     discovers the namespace (the `kubernetes-pods` job in
+     `helm/predictive-stack/templates/prometheus.yaml` covers the release namespace).
    - **Several series:** wrap the query in `sum(...)`.
 3. `prometheusServerAddress` in the trigger must be reachable from the
-   scaler's namespace: `kubectl -n keda exec deploy/predictive-scaler --
-   python -c "import urllib.request;print(urllib.request.urlopen('http://prometheus.default.svc.cluster.local:9090/-/ready').status)"`.
-4. Prometheus itself: `kubectl get pods -l app=prometheus`, restarts, OOM.
+   scaler's namespace: `kubectl -n predictive exec deploy/predictive-scaler --
+   python -c "import urllib.request;print(urllib.request.urlopen('http://prometheus.predictive.svc.cluster.local:9090/-/ready').status)"`.
+4. Prometheus itself: `kubectl -n predictive get pods -l app=prometheus`, restarts, OOM.
 
 ## How to fix
 

@@ -30,7 +30,8 @@ python -m forecast_training --prometheus http://prometheus:9090 \
 
 Every flag has an environment variable (`TRAIN_*`, `MODEL_NAME`, `MODEL_ALIAS`,
 `SERVING_RELOAD_URL`) — see `python -m forecast_training --help` and
-`k8s/retrain-cronjob.yaml`. The JSON summary on stdout says what happened:
+the chart's CronJob (`helm/predictive-stack/templates/training.yaml`). The JSON
+summary on stdout says what happened:
 `promoted`, `kept_champion`, `rejected` or `dry_run`, with the reason.
 
 ## Candidates

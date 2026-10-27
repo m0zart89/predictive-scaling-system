@@ -65,7 +65,7 @@ mlflow:
 
 model:
   name: "cpu-forecasting"
-  # Registry alias moved by the retraining job (k8s/retrain-cronjob.yaml).
+  # Registry alias moved by the retraining job (training/).
   alias: "champion"
   # Fallback while no alias exists yet (models registered by the notebook).
   stage: "Production"

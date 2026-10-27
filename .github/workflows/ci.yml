@@ -156,9 +156,9 @@ jobs:
       - name: Install PyYAML
         run: pip install pyyaml==6.0.1
 
-      # Validates monitoring/dashboards/*.json (structure, metric names against
-      # the code), checks every alert links an existing runbook, and fails if
-      # the dashboards ConfigMap in monitoring/grafana.yaml was not re-rendered.
+      # Validates monitoring/dashboards/*.json and the alert rules (structure,
+      # metric and label names against the code, a runbook per alert) and fails
+      # if the copies in helm/predictive-stack/files/ were not re-synced.
       - name: Validate dashboards, rules and runbooks
         run: python monitoring/render.py --check
 
@@ -181,7 +181,7 @@ jobs:
         run: |
           helm lint helm/forecast-serving/ helm/predictive-scaler/
           helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
-          helm lint helm/predictive-stack/ --set demo.scaling=hpa --set loki.enabled=true
+          helm lint helm/predictive-stack/ --set demo.scaling=hpa
 
       - name: Helm template (dry-run)
         run: |

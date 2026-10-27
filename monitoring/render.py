@@ -2,21 +2,19 @@
 """
 Dashboards and alert rules as code: validate, and render the Grafana ConfigMap.
 
-    python monitoring/render.py          # validate, then write the ConfigMap into grafana.yaml
-    python monitoring/render.py --check  # validate; fail if grafana.yaml is out of date (CI)
+    python monitoring/render.py          # validate, then sync the copies the chart ships
+    python monitoring/render.py --check  # validate; fail if the chart's copies are stale (CI)
 
 Sources of truth:
 
-* monitoring/dashboards/*.json      Grafana dashboards. Rendered into the
-                                    `grafana-dashboards` ConfigMap between the
-                                    GENERATED markers in monitoring/grafana.yaml,
-                                    which the Grafana Deployment mounts.
-* monitoring/prometheus-rules.yaml  Alerting rules. Every alert must link a
-                                    runbook in docs/runbooks/<AlertName>.md.
+* monitoring/dashboards/*.json      Grafana dashboards.
+* monitoring/prometheus-rules.yaml  Alerting rules (a ConfigMap manifest; the
+                                    rule files are its data). Every alert must
+                                    link a runbook in docs/runbooks/<AlertName>.md.
 
-Both are also copied into helm/predictive-stack/files/{dashboards,rules}/,
-which the umbrella chart loads with .Files.Glob; --check fails if the copies
-drifted.
+Both are copied into helm/predictive-stack/files/{dashboards,rules}/, which
+the umbrella chart loads with .Files.Glob into the Grafana and Prometheus
+ConfigMaps; --check fails if the copies drifted.
 
 Checks (standard library + PyYAML, no Grafana or promtool needed):
 
@@ -40,15 +38,10 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DASHBOARD_DIR = os.path.join(ROOT, "monitoring", "dashboards")
-GRAFANA_YAML = os.path.join(ROOT, "monitoring", "grafana.yaml")
 RULES_YAML = os.path.join(ROOT, "monitoring", "prometheus-rules.yaml")
 RUNBOOK_DIR = os.path.join(ROOT, "docs", "runbooks")
 CHART_FILES = os.path.join(ROOT, "helm", "predictive-stack", "files")
 RUNBOOK_URL_PREFIX = "https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/"
-CONFIGMAP_NAME = "grafana-dashboards"
-
-BEGIN = "# ── BEGIN GENERATED (python monitoring/render.py) — edit monitoring/dashboards/*.json instead ──"
-END = "# ── END GENERATED ──"
 
 # Files whose Counter/Gauge/Histogram names the repo exports.
 METRIC_SOURCES = [
@@ -277,16 +270,6 @@ def check_rules(rule_files: dict) -> list:
 
 # ── rendering ──────────────────────────────────────────────────────────────────
 
-def render_configmap(dashboards: dict) -> str:
-    lines = [BEGIN, "apiVersion: v1", "kind: ConfigMap", "metadata:",
-             f"  name: {CONFIGMAP_NAME}", "data:"]
-    for name, d in dashboards.items():
-        lines.append(f"  {name}: |")
-        lines.extend("    " + line for line in json.dumps(d, indent=2, sort_keys=True).splitlines())
-    lines.append(END)
-    return "\n".join(lines) + "\n"
-
-
 def chart_files(dashboards: dict, rule_files: dict) -> dict:
     """Relative path → content for the copies the umbrella chart ships."""
     out = {}
@@ -320,17 +303,9 @@ def sync_chart_files(files: dict, check: bool) -> list:
     return changed
 
 
-def splice(text: str, block: str) -> str:
-    start, end = text.find(BEGIN), text.find(END)
-    if start < 0 or end < 0 or end < start:
-        raise Problem(f"{GRAFANA_YAML}: GENERATED markers not found")
-    end += len(END) + 1   # include the newline after the END marker
-    return text[:start] + block + text[end:]
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true", help="validate only; fail if grafana.yaml is stale")
+    ap.add_argument("--check", action="store_true", help="validate only; fail if the chart copies are stale")
     args = ap.parse_args(argv)
 
     try:
@@ -340,18 +315,6 @@ def main(argv=None) -> int:
         check_dashboards(dashboards, known)
         rule_files = load_rules()
         alerts = check_rules(rule_files)
-
-        with open(GRAFANA_YAML) as f:
-            current = f.read()
-        updated = splice(current, render_configmap(dashboards))
-        if args.check:
-            if updated != current:
-                raise Problem(f"{os.path.relpath(GRAFANA_YAML, ROOT)} is out of date: "
-                              "run python monitoring/render.py and commit")
-        elif updated != current:
-            with open(GRAFANA_YAML, "w") as f:
-                f.write(updated)
-            print(f"updated {os.path.relpath(GRAFANA_YAML, ROOT)}")
 
         changed = sync_chart_files(chart_files(dashboards, rule_files), args.check)
         if changed and args.check:

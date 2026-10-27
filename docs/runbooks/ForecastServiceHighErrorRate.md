@@ -28,7 +28,8 @@ the model or MLflow is broken rather than a transient blip.
 
 - Inference errors after a reload: roll the `@champion` alias back to the
   previous version and `POST /reload`.
-- Errors from a bad artifact: re-run training (`k8s/retrain-cronjob.yaml`)
+- Errors from a bad artifact: re-run training
+  (`kubectl -n predictive create job --from=cronjob/forecast-retrain retrain-manual`)
   to register a fresh version.
 - Transient (pod restart during a rollout): the alert clears after 2 minutes
   of clean traffic.
