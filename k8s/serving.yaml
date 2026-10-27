@@ -27,6 +27,8 @@ spec:
               value: "http://mlflow:5000"
             - name: MODEL_NAME
               value: "cpu-forecasting"
+            - name: MODEL_ALIAS
+              value: "champion"
             - name: MODEL_STAGE
               value: "Production"
             - name: TIME_STEPS

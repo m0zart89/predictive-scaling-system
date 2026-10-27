@@ -5,3 +5,8 @@ mlflow==2.11.1
 scikit-learn==1.4.2
 numpy==1.26.4
 prometheus-fastapi-instrumentator==7.0.2
+# Transitive pins: mlflow 2.11 imports pkg_resources (removed from setuptools 81)
+# and its SQL store breaks on SQLAlchemy 2.1. Unpinned, a fresh build can fail
+# at import time with no change in this repo.
+setuptools<81
+sqlalchemy<2.1

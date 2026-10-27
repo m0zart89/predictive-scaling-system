@@ -68,6 +68,10 @@ spec:
         # max: forecast may add capacity early but never removes capacity
         # that is in use right now. forecast: trust the model fully.
         mode: max
+        # next: forecast for the coming interval. max: peak of the model's
+        # whole horizon (6 steps = 30 min for models from training/), which
+        # scales up that far ahead of a predicted spike.
+        forecastAggregation: max
         activationValue: "0"
         cacheSeconds: "15"
         timeoutSeconds: "3"

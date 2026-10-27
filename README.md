@@ -265,26 +265,47 @@ MLflow provides the model versioning and stage promotion semantics needed to saf
 These are known simplifications, not omissions:
 
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
-- **Single-step horizon.** The model predicts one interval (5 minutes) ahead. Multi-step forecasting (15, 30, 60 minutes) is needed for capacity planning decisions with longer lead times and requires either a different model architecture or an autoregressive wrapper.
-- **No concept drift detection.** The model is trained once on January 2022 data. In production, CPU patterns shift as workloads change. Without drift detection and scheduled retraining, prediction quality degrades silently.
+- **No drift alerting yet.** Retraining runs on a schedule (`k8s/retrain-cronjob.yaml`), but nothing yet compares live forecasts with what actually happened, so a model that degrades between runs is not flagged.
 - **Autoscaling not yet benchmarked in a cluster.** The KEDA external scaler is implemented and tested (unit tests plus gRPC tests through the generated client), and checked end-to-end against the real forecast service, but there is no measured comparison with a reactive HPA yet.
-- **Forecasts cannot leave the training range.** Tree-based models never predict above the largest value they were trained on, and on a steady ramp they regress towards the mean. The scaler's `max(forecast, observed)` default and its `capacity` mapping keep this safe, but a trend-aware model would add more lead time.
-- **Static training pipeline.** The notebook is not automated. In production, retraining should be triggered by a CronJob or event, not a manual notebook execution.
+- **Short, noisy history.** One month of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
 - **No persistent Grafana dashboards.** Dashboard definitions are not committed to the repository. In a real system, dashboards would be version-controlled and provisioned via ConfigMap.
 - **Local Kubernetes only.** Manifests use NodePort and Minikube-specific image loading. This is appropriate for local development; production would use `Ingress`, image registries, and namespace RBAC.
 
 ---
 
+## Retraining Pipeline
+
+The notebook is the exploration record; production models come from [`training/`](training/README.md), run nightly by `k8s/retrain-cronjob.yaml`:
+
+```
+Prometheus (14 days) → regularise + fill gaps → train candidates → holdout RMSE
+     → level-tracking check → compare with @champion on data it has not seen
+     → register + move alias → POST /reload on forecast-serving
+```
+
+What it changed, measured on the January data (6-step / 30-minute horizon, last 20% held out):
+
+| Model | Holdout RMSE | Level tracking | Eligible |
+|---|---|---|---|
+| persistence (last value) | 0.536 | — | baseline |
+| `rf_level` (the notebook's model) | **0.193** | 0.00 | no |
+| `hgb_delta` | 0.199 | 1.00 | **selected** |
+| `rf_delta` | 0.200 | 1.00 | yes |
+| `ridge_delta` | 0.246 | 0.38 | no |
+
+The notebook's Random Forest has the best RMSE on this holdout, and it would be the wrong model to autoscale on: given load above anything in training it forecasts *within* the training range — on a ramp to 3 cores it predicted 0.56. *Level tracking* measures exactly that (how far the forecast moves when the input moves beyond the training range), and candidates below 0.5 are not eligible. The delta models predict the change from the last value, so they follow new levels one-for-one at a ~3% RMSE cost.
+
+Other properties:
+
+- **Multi-step forecasts.** `/predict` now returns `predictions` for the whole horizon (`prediction` is still the next step). The scaler can scale for the horizon peak with `forecastAggregation: max`, buying lead time equal to the horizon.
+- **Fair champion comparison.** Each registered version is tagged with `data_end_ts`; the next run compares against it only on windows after that point (and keeps the champion if there are too few), because a model always looks best on data it was fitted to.
+- **Registry aliases, not stages.** Serving loads `models:/cpu-forecasting@champion` and falls back to the legacy `Production` stage, so notebook-registered models keep working.
+- **Pinned transitive dependencies.** MLflow 2.11 fails to import with setuptools ≥ 81 and SQLAlchemy 2.1; both are now pinned in serving and training.
+
 ## Future Work
 
 **Predictive vs reactive benchmark**  
 Run the demo workload under a daily traffic pattern twice — once with a CPU-based HPA, once with the predictive scaler — and compare p95 latency during ramps and idle replica-minutes. This is what turns the prototype into evidence. (The KEDA external scaler it relies on is implemented in `scaler/`.)
-
-**Automated retraining pipeline**  
-Replace the manual notebook with a Kubernetes `CronJob` that: fetches recent metrics from Prometheus, retrains the model, logs to MLflow, and promotes the new version to `Production` if validation metrics improve. This makes the system self-updating rather than point-in-time.
-
-**Multi-step forecasting**  
-Extend the model to output a forecast horizon (e.g., next 6 steps / 30 minutes). This enables capacity planning tools to reason about scaling lead times and pod startup budgets.
 
 **Additional signals**  
 Add memory utilisation and request queue depth as input features. CPU alone is a weak proxy for capacity need in memory-bound or I/O-bound workloads.
@@ -337,11 +358,15 @@ kubectl apply -f monitoring/grafana.yaml
 kubectl get pods
 ```
 
-**Train models and register to MLflow:**
+**Train a model and register it to MLflow** (sets the `@champion` alias):
 ```bash
-cd notebooks && jupyter notebook project.ipynb
-# Run all cells. The final cell promotes the best model to Production.
+pip install -r training/requirements.txt
+MLFLOW_TRACKING_URI=http://192.168.49.2:30500 PYTHONPATH=training \
+  python -m forecast_training --export notebooks/data-jan-2022.json \
+    --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z
 ```
+Nightly retraining from live Prometheus: build `training/` into the cluster and apply `k8s/retrain-cronjob.yaml`.
+The notebook (`notebooks/project.ipynb`) remains as the exploration record; models it promotes to the `Production` stage are still served when no `@champion` alias exists.
 
 **Load model into the running service:**
 ```bash
@@ -377,6 +402,10 @@ vuna/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml               # Lint → tests → image builds → helm lint pipeline
+├── training/                    # Retraining pipeline: candidates, level-tracking gate, MLflow aliases
+│   ├── forecast_training/       # data, features (shared contract), models, registry, CLI
+│   ├── tests/                   # unit + end-to-end against a SQLite MLflow registry
+│   └── Dockerfile
 ├── scaler/                      # KEDA external scaler (gRPC): Prometheus → /predict → replicas
 │   ├── predictive_scaler/       # config, clients, decision engine, gRPC server, metrics
 │   ├── tests/                   # unit + gRPC tests
@@ -405,7 +434,8 @@ vuna/
 ├── mlflow/
 │   └── k8s.yaml                 # Deployment + PVC + Service
 ├── k8s/
-│   └── serving.yaml             # Raw manifests (local dev alternative to Helm)
+│   ├── serving.yaml             # Raw manifests (local dev alternative to Helm)
+│   └── retrain-cronjob.yaml     # Nightly retraining job
 ├── monitoring/
 │   ├── prometheus-config.yaml   # Prometheus ConfigMap + Deployment + Service
 │   ├── prometheus-rules.yaml    # Alerting rules (availability + latency SLOs)

@@ -21,6 +21,7 @@ result to KEDA as an external metric. KEDA's HPA then sets
 | `timeSteps` | no | `10` | samples per forecast; must match the model's `TIME_STEPS` |
 | `stepSeconds` | no | `300` | spacing of samples; the model was trained on 5-minute data |
 | `mode` | no | `max` | `max`: report max(forecast, observed). `forecast`: report the forecast alone |
+| `forecastAggregation` | no | `next` | `next`: first forecast step. `max`: peak over the model's horizon (more lead time) |
 | `activationValue` | no | `0` | `IsActive` is true when reported demand exceeds this |
 | `cacheSeconds` | no | `15` | reuse a decision for this long (KEDA polls often) |
 | `timeoutSeconds` | no | `3` | per-request timeout for Prometheus and forecast-serving |

@@ -170,3 +170,18 @@ def test_errors_are_not_cached(metrics):
         with pytest.raises(PrometheusError):
             eng.decide(NS, NAME, cfg)
     assert len(prom.calls) == 2
+
+
+# ── multi-step horizon ─────────────────────────────────────────────────────────
+
+def test_next_aggregation_uses_first_step(metrics):
+    eng = engine_with(metrics, FakePrometheus(WINDOW), FakeForecast(lambda v: [0.5, 0.9, 0.7]))
+    d = eng.decide(NS, NAME, make_config(mode="forecast"))
+    assert d.predicted == pytest.approx(0.5)
+
+
+def test_max_aggregation_scales_for_the_peak_of_the_horizon(metrics):
+    eng = engine_with(metrics, FakePrometheus(WINDOW), FakeForecast(lambda v: [0.5, 0.9, 0.7]))
+    d = eng.decide(NS, NAME, make_config(mode="forecast", forecastAggregation="max"))
+    assert d.predicted == pytest.approx(0.9)
+    assert "max of 3 step(s)" in d.reason

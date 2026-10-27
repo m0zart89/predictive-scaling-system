@@ -60,8 +60,11 @@ mlflow:
 
 model:
   name: "cpu-forecasting"
+  # Registry alias moved by the retraining job (k8s/retrain-cronjob.yaml).
+  alias: "champion"
+  # Fallback while no alias exists yet (models registered by the notebook).
   stage: "Production"
-  # Number of lag observations the model expects as input
+  # Window size for legacy models only; newer models carry it in forecast_meta.json
   timeSteps: "10"
 
 # /live — process is running (does not require model to be loaded)

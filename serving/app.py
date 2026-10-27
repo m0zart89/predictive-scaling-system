@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import pickle
@@ -14,13 +15,19 @@ from prometheus_client import Counter, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 import mlflow
 import mlflow.sklearn
+from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 MODEL_NAME          = os.getenv("MODEL_NAME",          "cpu-forecasting")
+# Registry alias set by the retraining pipeline (training/). If the alias does
+# not exist yet, the service falls back to the legacy stage the notebook uses.
+MODEL_ALIAS         = os.getenv("MODEL_ALIAS",         "champion")
 MODEL_STAGE         = os.getenv("MODEL_STAGE",         "Production")
+# Only used for models without a forecast_meta.json (registered by the notebook).
 TIME_STEPS          = int(os.getenv("TIME_STEPS",      "10"))
+META_ARTIFACT       = "forecast_meta.json"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -59,40 +66,93 @@ model    = None
 scaler   = None
 _meta: dict = {}   # operational metadata populated on each successful load
 
+# How to turn a window into model features and outputs back into values.
+# Must match training/forecast_training/features.py (tests/test_training_serving.py
+# checks that both sides agree). Models without a forecast_meta.json artifact
+# were registered by the notebook: TIME_STEPS scaled values in, one value out.
+LEGACY_FORECAST_META = {"time_steps": TIME_STEPS, "horizon": 1, "step_seconds": 300,
+                        "features": "window", "target": "level"}
+forecast_meta: dict = dict(LEGACY_FORECAST_META)
 
-# ── Model loading ──────────────────────────────────────────────────────────────
-def load_model() -> None:
-    global model, scaler, _meta
 
-    log.info(
-        "Loading model name=%s stage=%s from MLflow at %s",
-        MODEL_NAME, MODEL_STAGE, MLFLOW_TRACKING_URI,
-    )
+def _features(scaled: np.ndarray, kind: str) -> np.ndarray:
+    """scaled: (1, time_steps). 'anchored' = window relative to its last value, plus that value."""
+    if kind == "window":
+        return scaled
+    if kind == "anchored":
+        last = scaled[:, -1:]
+        return np.hstack([scaled[:, :-1] - last, last])
+    raise ValueError(f"unknown feature kind {kind!r}")
 
-    client    = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    model_uri = f"models:/{MODEL_NAME}/{MODEL_STAGE}"
 
-    loaded_model = mlflow.sklearn.load_model(model_uri)
+def forecast(values: List[float]) -> List[float]:
+    """Raw window → forecast for each step of the model's horizon (raw units)."""
+    meta   = forecast_meta
+    arr    = np.array(values, dtype=float).reshape(-1, 1)
+    scaled = scaler.transform(arr).reshape(1, -1)
+    out    = np.asarray(model.predict(_features(scaled, meta["features"])), dtype=float)
+    out    = out.reshape(1, -1)
+    if meta["target"] == "delta":
+        out = out + scaled[:, -1:]
+    return [float(v) for v in scaler.inverse_transform(out.reshape(-1, 1)).ravel()]
 
+
+def _resolve_version(client: MlflowClient):
+    """Find the model version to serve: the alias if set, else the legacy stage."""
+    if MODEL_ALIAS:
+        try:
+            v = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+            return v, f"models:/{MODEL_NAME}@{MODEL_ALIAS}", f"@{MODEL_ALIAS}"
+        except MlflowException as exc:
+            if not MODEL_STAGE:
+                raise
+            log.info("Alias @%s not found (%s); falling back to stage %s",
+                     MODEL_ALIAS, exc.error_code, MODEL_STAGE)
+    if not MODEL_STAGE:
+        raise RuntimeError("Neither MODEL_ALIAS nor MODEL_STAGE is set")
     versions = client.get_latest_versions(MODEL_NAME, stages=[MODEL_STAGE])
     if not versions:
         raise RuntimeError(f"No model version found in stage '{MODEL_STAGE}'")
+    return versions[0], f"models:/{MODEL_NAME}/{MODEL_STAGE}", MODEL_STAGE
 
-    v        = versions[0]
-    run_id   = v.run_id
-    version  = v.version
 
-    scaler_dir  = client.download_artifacts(run_id, "scaler", dst_path=tempfile.mkdtemp())
-    scaler_path = os.path.join(scaler_dir, os.listdir(scaler_dir)[0])
+# ── Model loading ──────────────────────────────────────────────────────────────
+def load_model() -> None:
+    global model, scaler, _meta, forecast_meta
+
+    log.info(
+        "Loading model name=%s alias=%s (fallback stage=%s) from MLflow at %s",
+        MODEL_NAME, MODEL_ALIAS or "-", MODEL_STAGE or "-", MLFLOW_TRACKING_URI,
+    )
+
+    client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    v, model_uri, selector = _resolve_version(client)
+    # The REST store returns versions as strings, the SQL store as ints.
+    run_id, version = v.run_id, str(v.version)
+
+    loaded_model = mlflow.sklearn.load_model(model_uri)
+
+    tmp = tempfile.mkdtemp()
+    scaler_dir  = client.download_artifacts(run_id, "scaler", dst_path=tmp)
+    scaler_path = os.path.join(scaler_dir, sorted(os.listdir(scaler_dir))[0])
     with open(scaler_path, "rb") as f:
         loaded_scaler = pickle.load(f)
 
-    # Commit atomically — avoid partial state if the scaler load fails
-    model  = loaded_model
-    scaler = loaded_scaler
+    try:
+        meta_path = client.download_artifacts(run_id, META_ARTIFACT, dst_path=tmp)
+        with open(meta_path) as f:
+            loaded_meta = {**LEGACY_FORECAST_META, **json.load(f)}
+    except (MlflowException, OSError):
+        loaded_meta = dict(LEGACY_FORECAST_META)
+    if loaded_meta["features"] not in ("window", "anchored") or \
+            loaded_meta["target"] not in ("level", "delta"):
+        raise RuntimeError(f"Unsupported {META_ARTIFACT}: {loaded_meta}")
+
+    # Commit atomically — avoid partial state if any artifact fails to load
+    model, scaler, forecast_meta = loaded_model, loaded_scaler, loaded_meta
     _meta  = {
         "model_name":    MODEL_NAME,
-        "model_stage":   MODEL_STAGE,
+        "model_stage":   selector,
         "model_version": version,
         "run_id":        run_id,
         "loaded_at":     datetime.now(timezone.utc).isoformat(),
@@ -101,8 +161,9 @@ def load_model() -> None:
     MODEL_LOADED.set(1)
     MODEL_RELOADS.labels(result="success").inc()
     log.info(
-        "Model loaded: name=%s stage=%s version=%s run_id=%s",
-        MODEL_NAME, MODEL_STAGE, version, run_id,
+        "Model loaded: name=%s %s version=%s run_id=%s time_steps=%s horizon=%s target=%s",
+        MODEL_NAME, selector, version, run_id, loaded_meta["time_steps"],
+        loaded_meta["horizon"], loaded_meta["target"],
     )
 
 
@@ -130,8 +191,8 @@ async def lifespan(application: FastAPI):
     import asyncio
 
     log.info(
-        "Workload Forecast Service starting — MODEL=%s STAGE=%s STEPS=%d MLFLOW=%s",
-        MODEL_NAME, MODEL_STAGE, TIME_STEPS, MLFLOW_TRACKING_URI,
+        "Workload Forecast Service starting — MODEL=%s ALIAS=%s STAGE=%s MLFLOW=%s",
+        MODEL_NAME, MODEL_ALIAS or "-", MODEL_STAGE or "-", MLFLOW_TRACKING_URI,
     )
     # Run model load in a thread pool so the container starts immediately.
     # /ready returns 503 until load_model() completes — Kubernetes readiness probe
@@ -161,7 +222,8 @@ Instrumentator().instrument(app).expose(app)
 
 # ── Request / response schemas ─────────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    # Last TIME_STEPS cpu_usage values at 5-minute intervals, raw (unscaled).
+    # Last time_steps cpu_usage values at step_seconds intervals (see /model-info),
+    # raw (unscaled).
     # The service applies the stored MinMaxScaler internally.
     values: List[float]
 
@@ -179,9 +241,11 @@ class PredictRequest(BaseModel):
 class PredictResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    prediction:    float
+    prediction:    float          # next interval (first step of `predictions`)
+    predictions:   List[float]    # one value per step of the model's horizon
+    step_seconds:  int            # spacing of `predictions`
     model:         str
-    stage:         str
+    stage:         str            # registry selector the model was loaded from
     model_version: Optional[str] = None
 
 
@@ -207,7 +271,8 @@ class RecommendScaleRequest(BaseModel):
 class RecommendScaleResponse(BaseModel):
     # "scale_up" | "scale_down" | "hold"
     recommendation:        str
-    predicted_utilization: float
+    predicted_utilization: float   # next interval
+    predicted_peak:        float   # max over the forecast horizon (drives the decision)
     current_replicas:      int
     reason:                str
     model:                 str
@@ -251,7 +316,11 @@ def model_info():
     """
     return {
         "model_loaded": model is not None,
-        "time_steps":   TIME_STEPS,
+        "time_steps":   forecast_meta["time_steps"],
+        "horizon":      forecast_meta["horizon"],
+        "step_seconds": forecast_meta["step_seconds"],
+        "features":     forecast_meta["features"],
+        "target":       forecast_meta["target"],
         **_meta,
     }
 
@@ -270,10 +339,12 @@ def health():
 @app.post("/predict", response_model=PredictResponse, tags=["inference"])
 def predict(req: PredictRequest):
     """
-    Predict CPU utilization for the next 5-minute interval.
+    Predict CPU utilization for the next interval(s).
 
-    Input: the last TIME_STEPS observations (raw, unscaled).
-    Output: predicted utilization value + model provenance.
+    Input: the last `time_steps` observations (raw, unscaled; see /model-info).
+    Output: `prediction` for the next interval, `predictions` for every step of
+    the model's horizon (one value for models registered by the notebook), and
+    model provenance.
 
     The model_version field in the response allows callers to detect a model
     swap that occurred between requests (e.g. after POST /reload).
@@ -281,34 +352,34 @@ def predict(req: PredictRequest):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded. POST /reload to recover.")
 
-    if len(req.values) != TIME_STEPS:
+    time_steps = forecast_meta["time_steps"]
+    if len(req.values) != time_steps:
         PREDICTION_FAILURES.labels(reason="validation").inc()
         raise HTTPException(
             status_code=422,
-            detail=f"Expected exactly {TIME_STEPS} values, got {len(req.values)}.",
+            detail=f"Expected exactly {time_steps} values, got {len(req.values)}.",
         )
 
     PREDICTION_REQUESTS.inc()
 
     try:
-        arr        = np.array(req.values).reshape(-1, 1)
-        scaled     = scaler.transform(arr).flatten().reshape(1, -1)
-        pred_raw   = model.predict(scaled)
-        prediction = float(scaler.inverse_transform(pred_raw.reshape(-1, 1)).flatten()[0])
+        predictions = forecast(req.values)
     except Exception as exc:
         PREDICTION_FAILURES.labels(reason="inference").inc()
         log.exception("Inference failed: %s", exc)
         raise HTTPException(status_code=500, detail="Inference error. Check service logs.")
 
-    if not math.isfinite(prediction):
+    if not all(math.isfinite(p) for p in predictions):
         PREDICTION_FAILURES.labels(reason="inference").inc()
-        log.error("Model returned non-finite prediction %r for input %s", prediction, req.values)
+        log.error("Model returned non-finite prediction %r for input %s", predictions, req.values)
         raise HTTPException(status_code=500, detail="Model produced a non-finite prediction.")
 
     return PredictResponse(
-        prediction=prediction,
+        prediction=predictions[0],
+        predictions=predictions,
+        step_seconds=forecast_meta["step_seconds"],
         model=MODEL_NAME,
-        stage=MODEL_STAGE,
+        stage=_meta.get("model_stage", MODEL_STAGE),
         model_version=_meta.get("model_version"),
     )
 
@@ -324,7 +395,10 @@ def recommend_scale(req: RecommendScaleRequest):
     Decision-support endpoint for predictive autoscaling.
 
     Runs the same inference as /predict and applies a configurable threshold policy
-    to produce a scaling recommendation. This endpoint does NOT interact with any
+    to the *peak* of the forecast horizon: scale up if load is expected to exceed
+    the threshold at any point in the horizon, scale down only if it stays below
+    the low threshold for the whole horizon. For single-step models this is the
+    same as the next-interval forecast. This endpoint does NOT interact with any
     Kubernetes API — it returns a recommendation that an external controller
     (KEDA scaler, custom operator) is expected to act on.
 
@@ -334,20 +408,22 @@ def recommend_scale(req: RecommendScaleRequest):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
-    if len(req.values) != TIME_STEPS:
+    time_steps = forecast_meta["time_steps"]
+    if len(req.values) != time_steps:
         raise HTTPException(
             status_code=422,
-            detail=f"Expected exactly {TIME_STEPS} values, got {len(req.values)}.",
+            detail=f"Expected exactly {time_steps} values, got {len(req.values)}.",
         )
 
     try:
-        arr        = np.array(req.values).reshape(-1, 1)
-        scaled     = scaler.transform(arr).flatten().reshape(1, -1)
-        pred_raw   = model.predict(scaled)
-        predicted  = float(scaler.inverse_transform(pred_raw.reshape(-1, 1)).flatten()[0])
+        predictions = forecast(req.values)
     except Exception as exc:
         log.exception("Inference failed in recommend-scale: %s", exc)
         raise HTTPException(status_code=500, detail="Inference error.")
+    if not all(math.isfinite(p) for p in predictions):
+        raise HTTPException(status_code=500, detail="Model produced a non-finite prediction.")
+
+    predicted = max(predictions)
 
     up   = req.scale_up_threshold
     down = req.scale_down_threshold
@@ -378,19 +454,20 @@ def recommend_scale(req: RecommendScaleRequest):
 
     return RecommendScaleResponse(
         recommendation=recommendation,
-        predicted_utilization=round(predicted, 4),
+        predicted_utilization=round(predictions[0], 4),
+        predicted_peak=round(predicted, 4),
         current_replicas=req.current_replicas,
         reason=reason,
         model=MODEL_NAME,
-        stage=MODEL_STAGE,
+        stage=_meta.get("model_stage", MODEL_STAGE),
     )
 
 
 @app.post("/reload", tags=["operations"], summary="Hot-reload model from MLflow")
 def reload():
     """
-    Re-fetch the current Production model from MLflow without restarting the pod.
-    Use this after promoting a new model version to the Production stage.
+    Re-fetch the model from MLflow (MODEL_ALIAS, falling back to MODEL_STAGE)
+    without restarting the pod. The retraining job calls this after moving the alias.
     Returns the new model metadata on success.
     """
     log.info("Model reload triggered via POST /reload")

@@ -114,11 +114,17 @@ def test_prometheus_unreachable():
 # ── Forecast service ───────────────────────────────────────────────────────────
 
 def test_forecast_posts_values_and_reads_prediction(http):
+    # a service that predates multi-step forecasts: only `prediction`
     http.body = {"prediction": 0.42, "model": "cpu-forecasting", "stage": "Production"}
-    assert ForecastClient().predict(http.url, [0.1, 0.2], timeout=2) == 0.42
+    assert ForecastClient().predict(http.url, [0.1, 0.2], timeout=2) == [0.42]
     method, path, payload = http.requests[0]
     assert (method, path) == ("POST", "/predict")
     assert json.loads(payload) == {"values": [0.1, 0.2]}
+
+
+def test_forecast_reads_the_whole_horizon(http):
+    http.body = {"prediction": 0.4, "predictions": [0.4, 0.6, 0.5], "step_seconds": 300}
+    assert ForecastClient().predict(http.url, [0.1], timeout=2) == [0.4, 0.6, 0.5]
 
 
 @pytest.mark.parametrize("status,reason", [(503, "not_ready"), (422, "bad_response"),
@@ -132,7 +138,8 @@ def test_forecast_http_errors_are_classified(http, status, reason):
 
 
 @pytest.mark.parametrize("body", [{}, {"prediction": "abc"}, {"prediction": None},
-                                  b"not json"])
+                                  {"prediction": 0.1, "predictions": [0.1, "NaN"]},
+                                  [0.1], b"not json"])
 def test_forecast_bad_payload(http, body):
     http.body = body
     with pytest.raises(ForecastError) as err:

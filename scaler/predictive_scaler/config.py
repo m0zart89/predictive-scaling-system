@@ -32,6 +32,7 @@ class ConfigError(ValueError):
 
 
 MODES = ("max", "forecast")
+AGGREGATIONS = ("next", "max")
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class ScalerConfig:
     time_steps: int = 10
     step_seconds: int = 300
     mode: str = "max"
+    forecast_aggregation: str = "next"
     activation_value: float = 0.0
     cache_seconds: float = 15.0
     timeout_seconds: float = 3.0
@@ -100,6 +102,10 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     if mode not in MODES:
         raise ConfigError(f"metadata.mode must be one of {MODES}, got {mode!r}")
 
+    agg = (meta.get("forecastAggregation") or "next").strip().lower()
+    if agg not in AGGREGATIONS:
+        raise ConfigError(f"metadata.forecastAggregation must be one of {AGGREGATIONS}, got {agg!r}")
+
     return ScalerConfig(
         prometheus_address=_required(meta, "prometheusServerAddress").rstrip("/"),
         query=_required(meta, "query"),
@@ -109,6 +115,7 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
         time_steps=_positive_int(meta, "timeSteps", default=10),
         step_seconds=_positive_int(meta, "stepSeconds", default=300),
         mode=mode,
+        forecast_aggregation=agg,
         activation_value=_positive_float(meta, "activationValue", default=0.0, allow_zero=True),
         cache_seconds=_positive_float(meta, "cacheSeconds", default=15.0, allow_zero=True),
         timeout_seconds=_positive_float(meta, "timeoutSeconds", default=3.0),
