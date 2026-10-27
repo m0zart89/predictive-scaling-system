@@ -190,7 +190,7 @@ data:
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "process_resident_memory_bytes{job=~\"cpu-serving|forecast-serving\"}",
+              "expr": "process_resident_memory_bytes{job=\"forecast-serving\"}",
               "legendFormat": "RSS",
               "refId": "A"
             }

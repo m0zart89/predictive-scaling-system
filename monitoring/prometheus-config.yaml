@@ -12,20 +12,15 @@ data:
       - /etc/prometheus/rules/*.yml
 
     scrape_configs:
-      - job_name: cpu-serving
+      - job_name: forecast-serving
         static_configs:
-          - targets: ['cpu-serving:8080']
-        metrics_path: /metrics
-
-      - job_name: mlflow
-        static_configs:
-          - targets: ['mlflow:5000']
+          - targets: ['forecast-serving:8080']
         metrics_path: /metrics
 
       # Annotated pods in the autoscaling namespaces: the predictive scaler
       # (keda) and the demo workload (demo). Pod labels are copied onto the
       # series, so ScaledObject queries can select e.g. {app="cpu-burner"}.
-      # Limited to these namespaces so cpu-serving is not scraped twice.
+      # Limited to these namespaces so forecast-serving is not scraped twice.
       - job_name: kubernetes-pods
         kubernetes_sd_configs:
           - role: pod

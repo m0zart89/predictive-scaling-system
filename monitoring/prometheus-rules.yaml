@@ -13,9 +13,9 @@ data:
         rules:
           - alert: ForecastServiceHighErrorRate
             expr: |
-              sum(rate(http_requests_total{job="cpu-serving", status_code=~"5.."}[5m]))
+              sum(rate(http_requests_total{job="forecast-serving", status_code=~"5.."}[5m]))
               /
-              sum(rate(http_requests_total{job="cpu-serving"}[5m])) > 0.005
+              sum(rate(http_requests_total{job="forecast-serving"}[5m])) > 0.005
             for: 2m
             labels:
               severity: warning
@@ -29,7 +29,7 @@ data:
                 SLO budget is 0.5%. Check pod logs and MLflow connectivity.
 
           - alert: ForecastServiceDown
-            expr: absent(up{job="cpu-serving"}) or up{job="cpu-serving"} == 0
+            expr: absent(up{job="forecast-serving"}) or up{job="forecast-serving"} == 0
             for: 1m
             labels:
               severity: critical
@@ -50,7 +50,7 @@ data:
             expr: |
               histogram_quantile(0.99,
                 rate(http_request_duration_seconds_bucket{
-                  job="cpu-serving",
+                  job="forecast-serving",
                   handler="/predict"
                 }[5m])
               ) > 0.2
@@ -72,7 +72,7 @@ data:
         rules:
           - alert: ForecastNoTrafficToPredictEndpoint
             expr: |
-              absent(rate(http_requests_total{job="cpu-serving", handler="/predict"}[15m]))
+              absent(rate(http_requests_total{job="forecast-serving", handler="/predict"}[15m]))
             for: 15m
             labels:
               severity: warning
@@ -88,7 +88,7 @@ data:
           - alert: ForecastReloadErrorRate
             expr: |
               rate(http_requests_total{
-                job="cpu-serving",
+                job="forecast-serving",
                 handler="/reload",
                 status_code=~"5.."
               }[10m]) > 0

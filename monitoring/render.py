@@ -14,6 +14,10 @@ Sources of truth:
 * monitoring/prometheus-rules.yaml  Alerting rules. Every alert must link a
                                     runbook in docs/runbooks/<AlertName>.md.
 
+Both are also copied into helm/predictive-stack/files/{dashboards,rules}/,
+which the umbrella chart loads with .Files.Glob; --check fails if the copies
+drifted.
+
 Checks (standard library + PyYAML, no Grafana or promtool needed):
 
 * each dashboard has a title, a unique uid, and panels with unique ids, a
@@ -39,6 +43,7 @@ DASHBOARD_DIR = os.path.join(ROOT, "monitoring", "dashboards")
 GRAFANA_YAML = os.path.join(ROOT, "monitoring", "grafana.yaml")
 RULES_YAML = os.path.join(ROOT, "monitoring", "prometheus-rules.yaml")
 RUNBOOK_DIR = os.path.join(ROOT, "docs", "runbooks")
+CHART_FILES = os.path.join(ROOT, "helm", "predictive-stack", "files")
 RUNBOOK_URL_PREFIX = "https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/"
 CONFIGMAP_NAME = "grafana-dashboards"
 
@@ -185,13 +190,20 @@ def check_dashboards(dashboards: dict, known: set) -> None:
 
 # ── alert rules and runbooks ───────────────────────────────────────────────────
 
-def check_rules() -> list:
+def load_rules() -> dict:
+    """{file name: rules text} from the prometheus-rules ConfigMap manifest."""
     import yaml
 
     with open(RULES_YAML) as f:
         cm = yaml.safe_load(f)
+    return dict(cm.get("data") or {})
+
+
+def check_rules(rule_files: dict) -> list:
+    import yaml
+
     alerts = []
-    for fname, text in (cm.get("data") or {}).items():
+    for fname, text in rule_files.items():
         groups = yaml.safe_load(text).get("groups") or []
         for g in groups:
             for r in g.get("rules") or []:
@@ -229,6 +241,39 @@ def render_configmap(dashboards: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def chart_files(dashboards: dict, rule_files: dict) -> dict:
+    """Relative path → content for the copies the umbrella chart ships."""
+    out = {}
+    for name, d in dashboards.items():
+        out[os.path.join("dashboards", name)] = json.dumps(d, indent=2, sort_keys=True) + "\n"
+    for name, text in rule_files.items():
+        out[os.path.join("rules", name)] = text if text.endswith("\n") else text + "\n"
+    return out
+
+
+def sync_chart_files(files: dict, check: bool) -> list:
+    """Write (or, with check, compare) the copies under CHART_FILES. Returns changed paths."""
+    changed = []
+    present = set()
+    for sub in ("dashboards", "rules"):
+        for path in glob.glob(os.path.join(CHART_FILES, sub, "*")):
+            present.add(os.path.relpath(path, CHART_FILES))
+    for rel, content in files.items():
+        path = os.path.join(CHART_FILES, rel)
+        current = open(path).read() if os.path.exists(path) else None
+        if current != content:
+            changed.append(rel)
+            if not check:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(content)
+    for rel in sorted(present - set(files)):
+        changed.append(rel)
+        if not check:
+            os.remove(os.path.join(CHART_FILES, rel))
+    return changed
+
+
 def splice(text: str, block: str) -> str:
     start, end = text.find(BEGIN), text.find(END)
     if start < 0 or end < 0 or end < start:
@@ -246,7 +291,8 @@ def main(argv=None) -> int:
         known = exported_metrics() | LIBRARY_METRICS
         dashboards = load_dashboards()
         check_dashboards(dashboards, known)
-        alerts = check_rules()
+        rule_files = load_rules()
+        alerts = check_rules(rule_files)
 
         with open(GRAFANA_YAML) as f:
             current = f.read()
@@ -259,6 +305,13 @@ def main(argv=None) -> int:
             with open(GRAFANA_YAML, "w") as f:
                 f.write(updated)
             print(f"updated {os.path.relpath(GRAFANA_YAML, ROOT)}")
+
+        changed = sync_chart_files(chart_files(dashboards, rule_files), args.check)
+        if changed and args.check:
+            raise Problem(f"{os.path.relpath(CHART_FILES, ROOT)} is out of date ({', '.join(changed)}): "
+                          "run python monitoring/render.py and commit")
+        for rel in changed:
+            print(f"updated {os.path.relpath(os.path.join(CHART_FILES, rel), ROOT)}")
     except Problem as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

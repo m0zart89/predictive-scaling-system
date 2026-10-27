@@ -4,8 +4,9 @@
 replicaCount: 1
 
 image:
-  repository: cpu-serving
-  tag: latest
+  repository: ghcr.io/m0zart89/predictive-scaling-system/forecast-serving
+  # Empty: use global.imageTag (set by the predictive-stack umbrella chart), else "latest".
+  tag: ""
   pullPolicy: IfNotPresent
 
 serviceAccount:

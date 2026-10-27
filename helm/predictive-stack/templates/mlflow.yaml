@@ -1,0 +1,98 @@
+{{- if .Values.mlflow.enabled }}
+{{- if .Values.mlflow.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow
+  labels:
+    app: mlflow
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.mlflow.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.mlflow.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  labels:
+    app: mlflow
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # the PVC is ReadWriteOnce and SQLite is single-writer
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: {{ .Values.mlflow.image | quote }}
+          command:
+            - mlflow
+            - server
+            - --host=0.0.0.0
+            - --port=5000
+            - --backend-store-uri=sqlite:////mlflow/mlflow.db
+            # Clients upload artifacts through the server (no shared volume,
+            # no node IP): mlflow-artifacts:/ resolves against the tracking URI.
+            - --default-artifact-root=mlflow-artifacts:/
+            - --serve-artifacts
+            - --artifacts-destination=/mlflow/artifacts
+          ports:
+            - name: http
+              containerPort: 5000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.mlflow.resources | nindent 12 }}
+          volumeMounts:
+            - name: storage
+              mountPath: /mlflow
+      volumes:
+        - name: storage
+          {{- if .Values.mlflow.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: mlflow
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  labels:
+    app: mlflow
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
+{{- end }}

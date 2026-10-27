@@ -1,25 +1,25 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cpu-serving
+  name: forecast-serving
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: cpu-serving
+      app: forecast-serving
   template:
     metadata:
       labels:
-        app: cpu-serving
+        app: forecast-serving
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
       containers:
-        - name: cpu-serving
-          image: cpu-serving:latest
-          imagePullPolicy: Never
+        - name: forecast-serving
+          image: ghcr.io/m0zart89/predictive-scaling-system/forecast-serving:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:
@@ -51,12 +51,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: cpu-serving
+  name: forecast-serving
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
-    app: cpu-serving
+    app: forecast-serving
   ports:
     - port: 8080
       targetPort: 8080
-      nodePort: 30800

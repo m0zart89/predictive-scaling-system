@@ -1,0 +1,170 @@
+groups:
+
+  # ── Availability SLO ────────────────────────────────────────────────────────
+  # Target: 99.5% of requests must succeed (5xx error budget = 0.5%)
+  - name: forecast-serving.availability
+    interval: 30s
+    rules:
+      - alert: ForecastServiceHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="forecast-serving", status_code=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="forecast-serving"}[5m])) > 0.005
+        for: 2m
+        labels:
+          severity: warning
+          slo: availability
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastServiceHighErrorRate.md
+          summary: "Forecast service error rate exceeds SLO (> 0.5%)"
+          description: >
+            5xx error rate is {{ $value | humanizePercentage }}.
+            SLO budget is 0.5%. Check pod logs and MLflow connectivity.
+
+      - alert: ForecastServiceDown
+        expr: absent(up{job="forecast-serving"}) or up{job="forecast-serving"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastServiceDown.md
+          summary: "Forecast service is unreachable"
+          description: >
+            Prometheus cannot scrape forecast-serving for 1m.
+            Pod may be down, unready, or the Service selector is broken.
+
+  # ── Latency SLO ─────────────────────────────────────────────────────────────
+  # Target: p99 latency on /predict < 200ms
+  - name: forecast-serving.latency
+    interval: 30s
+    rules:
+      - alert: ForecastPredictLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket{
+              job="forecast-serving",
+              handler="/predict"
+            }[5m])
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          slo: latency
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastPredictLatencyHigh.md
+          summary: "/predict p99 latency exceeds 200ms SLO"
+          description: >
+            p99 latency is {{ $value | humanizeDuration }} over the last 5m.
+            Expected < 200ms. May indicate model reload in progress or resource contention.
+
+  # ── Model health ─────────────────────────────────────────────────────────────
+  - name: forecast-serving.model
+    interval: 60s
+    rules:
+      - alert: ForecastNoTrafficToPredictEndpoint
+        expr: |
+          absent(rate(http_requests_total{job="forecast-serving", handler="/predict"}[15m]))
+        for: 15m
+        labels:
+          severity: warning
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastNoTrafficToPredictEndpoint.md
+          summary: "No requests to /predict in 15 minutes"
+          description: >
+            /predict has received no traffic in 15m.
+            This may indicate the model is not loaded (check /health),
+            or the upstream caller (autoscaler / scheduler) has stopped polling.
+
+      - alert: ForecastReloadErrorRate
+        expr: |
+          rate(http_requests_total{
+            job="forecast-serving",
+            handler="/reload",
+            status_code=~"5.."
+          }[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastReloadErrorRate.md
+          summary: "Model reload is failing"
+          description: >
+            POST /reload is returning 5xx errors.
+            MLflow may be unavailable or the Production model stage is empty.
+
+  # ── Forecast quality / drift ─────────────────────────────────────────────
+  # forecast_rolling_mae is the mean |actual - forecast| over the last
+  # FORECAST_MAE_WINDOW resolved forecasts, in model units (demand divided by
+  # the ScaledObject's `capacity`). The threshold is deliberately loose:
+  # tune it to ~2x the holdout RMSE of the champion (MLflow: holdout_rmse_step_N).
+  - name: forecast-quality
+    interval: 60s
+    rules:
+      - alert: ForecastDriftHigh
+        expr: |
+          max by (horizon_step) (forecast_rolling_mae) > 0.25
+        for: 30m
+        labels:
+          severity: warning
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastDriftHigh.md
+          summary: "Forecast error is high (rolling MAE {{ $value | printf \"%.3f\" }} at horizon step {{ $labels.horizon_step }})"
+          description: >
+            Rolling MAE for horizon step {{ $labels.horizon_step }} has been above
+            0.25 for 30 minutes. The model no longer tracks the workload:
+            check the Model quality dashboard, compare with the champion's
+            holdout RMSE in MLflow, and retrain (k8s/retrain-cronjob.yaml).
+
+  # ── Predictive scaler ────────────────────────────────────────────────────
+  - name: predictive-scaler
+    interval: 30s
+    rules:
+      - alert: ScalerFallbackRate
+        expr: |
+          sum by (namespace, scaledobject) (
+            rate(predictive_scaler_decisions_total{source="observed"}[15m])
+          )
+          /
+          sum by (namespace, scaledobject) (
+            rate(predictive_scaler_decisions_total[15m])
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: predictive-scaler
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ScalerFallbackRate.md
+          summary: "{{ $labels.namespace }}/{{ $labels.scaledobject }} is scaling reactively ({{ $value | humanizePercentage }} of decisions)"
+          description: >
+            More than half of the scaling decisions for
+            {{ $labels.namespace }}/{{ $labels.scaledobject }} in the last 15 minutes
+            used observed demand instead of a forecast. Either the history
+            window has not filled yet (expected for timeSteps x stepSeconds
+            after a restart) or forecast-serving is failing: see
+            predictive_scaler_forecast_failures_total by reason.
+
+      - alert: ScalerPrometheusErrors
+        expr: |
+          sum by (namespace, scaledobject) (
+            increase(predictive_scaler_prometheus_failures_total[10m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: predictive-scaler
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ScalerPrometheusErrors.md
+          summary: "Scaler cannot read demand for {{ $labels.namespace }}/{{ $labels.scaledobject }} from Prometheus"
+          description: >
+            The predictive scaler's Prometheus queries for
+            {{ $labels.namespace }}/{{ $labels.scaledobject }} have failed for 5 minutes.
+            It returns gRPC UNAVAILABLE to KEDA, which applies the
+            ScaledObject's fallback replicas: the workload is pinned, not
+            autoscaled. Check Prometheus availability and the trigger's
+            query / prometheusServerAddress.

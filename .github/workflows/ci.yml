@@ -169,18 +169,31 @@ jobs:
 
       - uses: azure/setup-helm@v4
         with:
-          version: "3.14.4"
+          version: "3.22.1"
+
+      - name: Resolve umbrella chart dependencies (KEDA)
+        run: |
+          helm repo add kedacore https://kedacore.github.io/charts
+          helm dependency build helm/predictive-stack
 
       - name: Lint Helm charts
-        run: helm lint helm/forecast-serving/ helm/predictive-scaler/
+        run: |
+          helm lint helm/forecast-serving/ helm/predictive-scaler/
+          helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
+          helm lint helm/predictive-stack/ --set demo.scaling=hpa --set loki.enabled=true
 
       - name: Helm template (dry-run)
         run: |
           for chart in forecast-serving predictive-scaler; do
-            helm template "$chart" "helm/$chart/" \
-              --set image.tag=ci-${{ github.sha }} \
-              --debug > /dev/null
+            helm template "$chart" "helm/$chart/" --set image.tag=ci-${{ github.sha }} --debug > /dev/null
           done
+          helm template predictive helm/predictive-stack/ -n predictive \
+            --set global.imageTag=ci-${{ github.sha }} --set demo.scaling=predictive \
+            --set training.bootstrap.enabled=true > /tmp/stack.yaml
+          # the umbrella chart must carry the same dashboards and rules as monitoring/
+          grep -q 'forecast_rolling_mae' /tmp/stack.yaml
+          grep -q 'alert: ForecastDriftHigh' /tmp/stack.yaml
+          grep -q 'kind: ScaledObject' /tmp/stack.yaml
 
   # Placeholder job — shows the intended CD path without implementing it
   # In a real cluster, this would use ArgoCD image updater or a Helm upgrade action.
