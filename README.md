@@ -93,7 +93,7 @@ Because the service is stateless and all state lives in MLflow, horizontal scali
 
 Prometheus is configured to scrape the serving pod via static config and pod annotations (`prometheus.io/scrape: "true"`). Collected metrics include HTTP request count by endpoint, request duration histograms, and standard Python process metrics.
 
-Grafana is deployed alongside Prometheus. In a production system, the dashboards would include prediction latency SLOs, error rate alerts, and model version tracking. Here the stack is deployed and functional; dashboard definitions are not committed.
+Grafana is deployed alongside Prometheus with three dashboards provisioned from `monitoring/dashboards/` (*Predictive scaling*, *Model quality*, *Forecast serving*). Alerting rules in `monitoring/prometheus-rules.yaml` cover availability, latency, model health, forecast drift and scaler fallbacks; every alert links a runbook in `docs/runbooks/`.
 
 ---
 
@@ -127,9 +127,13 @@ Accepts the last N CPU utilization values (where N matches `TIME_STEPS`, default
 **Request:**
 ```json
 {
-  "values": [0.20, 0.25, 0.30, 0.28, 0.22, 0.35, 0.40, 0.38, 0.33, 0.29]
+  "values": [0.20, 0.25, 0.30, 0.28, 0.22, 0.35, 0.40, 0.38, 0.33, 0.29],
+  "series": "demo/cpu-burner",
+  "timestamp": 1700000000
 }
 ```
+
+`series` and `timestamp` (unix time of the last value) are optional. They let the service score this forecast against the actual value a later window brings; the KEDA scaler sends both so forecasts for different `ScaledObject`s are never compared with each other's data.
 
 **Response:**
 ```json
@@ -167,13 +171,23 @@ The serving layer is instrumented with `prometheus-fastapi-instrumentator`, whic
 - `http_requests_total` — request count by endpoint and status code
 - `http_request_duration_seconds` — latency histogram
 
+On top of that the service measures its own **forecast quality** without any external store (`serving/quality.py`): every forecast is kept in memory, and when a later `/predict` window carries the value that was forecast, the error is recorded per horizon step:
+
+- `forecast_abs_error{horizon_step}` — histogram of |actual − forecast|
+- `forecast_rolling_mae{horizon_step}` — mean absolute error over the last 100 resolved forecasts (also in `GET /model-info`)
+- `forecast_model_info{model_version,...}` — which version is serving
+
+Memory is bounded (series × pending forecasts × rolling window, all configurable). The scaler's own metrics (`predictive_scaler_*`, see [`scaler/README.md`](scaler/README.md)) show observed vs predicted vs reported demand per `ScaledObject`.
+
+**Dashboards as code.** `monitoring/dashboards/*.json` is the source; `python monitoring/render.py` validates the JSON (panel grid, unique ids, every PromQL metric name checked against what the code exports) and renders the Grafana ConfigMap into `monitoring/grafana.yaml`. CI runs it with `--check`.
+
+**Alerts and runbooks.** `monitoring/prometheus-rules.yaml`: `ForecastDriftHigh` (rolling MAE above threshold for 30 min), `ScalerFallbackRate` (over half of decisions on observed demand for 15 min), `ScalerPrometheusErrors` (KEDA is applying the fallback), plus the availability, latency and model-health SLOs. Each alert's `runbook_url` points to `docs/runbooks/<Alert>.md`, and CI fails if the file is missing.
+
 This matters for two reasons beyond standard uptime monitoring:
 
 1. **Prediction latency is a hard constraint.** If this service sits in a scaling control loop, a slow response delays the scaling decision. A latency regression in the inference path should be treated the same as a latency regression in a critical API.
 
 2. **Request rate reflects controller behavior.** Sudden drops or spikes in `/predict` call rate indicate upstream changes (autoscaler reconfiguration, controller failures). The metric acts as a proxy for control plane health.
-
-In a production deployment, the Grafana dashboard would include alerting rules on p99 latency and error rate.
 
 ---
 
@@ -265,10 +279,9 @@ MLflow provides the model versioning and stage promotion semantics needed to saf
 These are known simplifications, not omissions:
 
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
-- **No drift alerting yet.** Retraining runs on a schedule (`k8s/retrain-cronjob.yaml`), but nothing yet compares live forecasts with what actually happened, so a model that degrades between runs is not flagged.
+- **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
 - **Autoscaling not yet benchmarked in a cluster.** The KEDA external scaler is implemented and tested (unit tests plus gRPC tests through the generated client), and checked end-to-end against the real forecast service, but there is no measured comparison with a reactive HPA yet.
 - **Short, noisy history.** One month of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
-- **No persistent Grafana dashboards.** Dashboard definitions are not committed to the repository. In a real system, dashboards would be version-controlled and provisioned via ConfigMap.
 - **Local Kubernetes only.** Manifests use NodePort and Minikube-specific image loading. This is appropriate for local development; production would use `Ingress`, image registries, and namespace RBAC.
 
 ---
@@ -312,8 +325,8 @@ Run the demo workload under a daily traffic pattern twice — once with a CPU-ba
 **Additional signals**  
 Add memory utilisation and request queue depth as input features. CPU alone is a weak proxy for capacity need in memory-bound or I/O-bound workloads.
 
-**Model drift alerting**  
-Compare rolling prediction error against a baseline. A Prometheus alert on prediction MAE regression triggers retraining — making degradation observable before it affects scaling decisions.
+**Alert-triggered retraining**  
+`ForecastDriftHigh` already measures the regression; the next step is to let it start the retraining job (Alertmanager webhook → `kubectl create job`) instead of waiting for the nightly run.
 
 **GPU workload support**  
 The training code is device-agnostic (`device = 'cuda' if available`). For GPU inference workloads, the same forecasting pattern applies with different metric sources. The serving infrastructure does not change.
@@ -403,7 +416,7 @@ open http://192.168.49.2:30300
 vuna/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml               # Lint → tests → image builds → helm lint pipeline
+│       └── ci.yml               # Lint → tests → dashboards check → image builds → helm lint
 ├── training/                    # Retraining pipeline: candidates, level-tracking gate, MLflow aliases
 │   ├── forecast_training/       # data, features (shared contract), models, registry, CLI
 │   ├── tests/                   # unit + end-to-end against a SQLite MLflow registry
@@ -428,6 +441,7 @@ vuna/
 │           └── serviceaccount.yaml
 ├── serving/
 │   ├── app.py                   # FastAPI inference service
+│   ├── quality.py               # forecast error tracking (forecast_abs_error / forecast_rolling_mae)
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── notebooks/
@@ -440,11 +454,14 @@ vuna/
 │   └── retrain-cronjob.yaml     # Nightly retraining job
 ├── monitoring/
 │   ├── prometheus-config.yaml   # Prometheus ConfigMap + Deployment + Service
-│   ├── prometheus-rules.yaml    # Alerting rules (availability + latency SLOs)
-│   ├── grafana.yaml             # Grafana + provisioned datasources + dashboard
+│   ├── prometheus-rules.yaml    # Alerting rules: SLOs, forecast drift, scaler fallbacks
+│   ├── dashboards/              # Grafana dashboards (source of truth, JSON)
+│   ├── render.py                # validates dashboards + rules, renders the ConfigMap
+│   ├── grafana.yaml             # Grafana + datasources + generated dashboards ConfigMap
 │   └── loki.yaml                # Loki log aggregation
 ├── docs/
-│   └── ROADMAP.md               # Done / next stages with briefs for each
+│   ├── ROADMAP.md               # Done / next stages with briefs for each
+│   └── runbooks/                # one page per alert
 ├── ARCHITECTURE.md
 └── README.md
 ```
