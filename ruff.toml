@@ -1,0 +1,4 @@
+target-version = "py311"
+
+# Generated gRPC stubs (see scaler/gen_proto.sh); checked for drift in CI instead.
+extend-exclude = ["scaler/predictive_scaler/*_pb2*.py"]

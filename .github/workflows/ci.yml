@@ -20,8 +20,8 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.4.4
 
-      - name: Lint serving/
-        run: ruff check serving/
+      - name: Lint serving/, scaler/ and demo/
+        run: ruff check serving/ scaler/ demo/
 
   test-serving:
     name: Unit tests
@@ -44,10 +44,42 @@ jobs:
           MLFLOW_HTTP_REQUEST_TIMEOUT: "3"
           MLFLOW_TRACKING_URI: "http://127.0.0.1:1"
 
-  build-image:
-    name: Build Docker image
+  test-scaler:
+    name: Scaler tests
     runs-on: ubuntu-latest
     needs: lint-python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r scaler/requirements-dev.txt
+
+      - name: Generated gRPC stubs are up to date
+        run: |
+          scaler/gen_proto.sh
+          git diff --exit-code -- scaler/predictive_scaler/ \
+            || (echo "::error::Stubs are stale: run scaler/gen_proto.sh and commit" && exit 1)
+
+      - name: Run tests
+        run: pytest scaler/tests/ -v --timeout=30
+
+  build-image:
+    name: Build ${{ matrix.name }} image
+    runs-on: ubuntu-latest
+    needs: lint-python
+    strategy:
+      matrix:
+        include:
+          - name: forecast-serving
+            context: ./serving
+          - name: predictive-scaler
+            context: ./scaler
+          - name: cpu-burner
+            context: ./demo/cpu-burner
     steps:
       - uses: actions/checkout@v4
 
@@ -57,12 +89,12 @@ jobs:
       - name: Build (no push)
         uses: docker/build-push-action@v5
         with:
-          context: ./serving
+          context: ${{ matrix.context }}
           push: false
-          tags: forecast-serving:${{ github.sha }}
-          # Layer cache via GitHub Actions cache backend
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ matrix.name }}:${{ github.sha }}
+          # Layer cache via GitHub Actions cache backend, one scope per image
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
   helm-lint:
     name: Helm lint
@@ -74,21 +106,23 @@ jobs:
         with:
           version: "3.14.4"
 
-      - name: Lint Helm chart
-        run: helm lint helm/forecast-serving/
+      - name: Lint Helm charts
+        run: helm lint helm/forecast-serving/ helm/predictive-scaler/
 
       - name: Helm template (dry-run)
         run: |
-          helm template forecast-serving helm/forecast-serving/ \
-            --set image.tag=ci-${{ github.sha }} \
-            --debug
+          for chart in forecast-serving predictive-scaler; do
+            helm template "$chart" "helm/$chart/" \
+              --set image.tag=ci-${{ github.sha }} \
+              --debug > /dev/null
+          done
 
   # Placeholder job — shows the intended CD path without implementing it
   # In a real cluster, this would use ArgoCD image updater or a Helm upgrade action.
   deploy-check:
     name: Deployment readiness check
     runs-on: ubuntu-latest
-    needs: [build-image, helm-lint]
+    needs: [test-serving, test-scaler, build-image, helm-lint]
     steps:
       - name: All checks passed
         run: echo "Image built and Helm chart validated. Ready for deployment."

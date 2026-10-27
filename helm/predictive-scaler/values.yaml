@@ -1,0 +1,61 @@
+# Default values for predictive-scaler.
+#
+# The scaler is stateless: everything workload-specific (PromQL query, target,
+# forecast URL) lives in each ScaledObject's trigger metadata, so one
+# deployment serves any number of ScaledObjects. See demo/scaledobject.yaml.
+
+replicaCount: 1
+
+image:
+  repository: predictive-scaler
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9100"
+  prometheus.io/path: "/metrics"
+
+service:
+  type: ClusterIP
+  grpcPort: 6000      # KEDA dials <service>.<namespace>:6000 (scalerAddress)
+  metricsPort: 9100
+
+logLevel: INFO
+
+# Interval between pushes for `external-push` triggers (StreamIsActive).
+streamIntervalSeconds: 15
+
+# Pure Python with small HTTP calls; a decision every few seconds per
+# ScaledObject costs next to nothing.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+# Native gRPC probes (Kubernetes >= 1.24) against the standard health service.
+livenessProbe:
+  grpc:
+    port: 6000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  grpc:
+    port: 6000
+    service: externalscaler.ExternalScaler
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
