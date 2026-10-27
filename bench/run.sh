@@ -48,8 +48,10 @@ k() { kubectl -n "$NAMESPACE" "$@"; }
 helm_set() {   # helm_set key=value ...
   local args=()
   for kv in "$@"; do args+=(--set "$kv"); done
+  # no --wait: forecast-serving is unready until the warm-up model is trained
   helm upgrade "$RELEASE" helm/predictive-stack -n "$NAMESPACE" --reuse-values "${args[@]}" \
-    --wait --timeout 10m >/dev/null
+    --timeout 10m >/dev/null
+  k rollout status deploy/cpu-burner --timeout=300s >/dev/null
 }
 
 load_phase() {   # load_phase <name> <days>

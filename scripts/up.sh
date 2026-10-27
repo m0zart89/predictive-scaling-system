@@ -103,7 +103,8 @@ helm dependency build helm/predictive-stack >/dev/null
 
 # Phase 1: everything except the ScaledObject — KEDA's CRDs come from the
 # KEDA subchart's templates, so a ScaledObject in the same install would fail
-# validation before the CRDs exist.
+# validation before the CRDs exist. No `helm --wait`: forecast-serving stays
+# unready (503 on /ready) until a model is loaded, which happens later.
 log "Installing release '$RELEASE' in namespace '$NAMESPACE'"
 # shellcheck disable=SC2086
 helm upgrade --install "$RELEASE" helm/predictive-stack \
@@ -114,7 +115,17 @@ helm upgrade --install "$RELEASE" helm/predictive-stack \
   --set demo.maxReplicas="$MAX_REPLICAS" \
   --set demo.predictive.stepSeconds="$STEP_SECONDS" \
   $HELM_EXTRA \
-  --wait --timeout 15m
+  --timeout 10m >/dev/null
+
+log "Waiting for the platform components"
+for d in mlflow prometheus grafana predictive-scaler cpu-burner \
+         keda-operator keda-operator-metrics-apiserver keda-admission-webhooks; do
+  kubectl -n "$NAMESPACE" rollout status "deployment/$d" --timeout=600s >/dev/null \
+    || { kubectl -n "$NAMESPACE" get pods; kubectl -n "$NAMESPACE" describe "deployment/$d" | tail -20; die "$d did not become ready"; }
+done
+# forecast-serving is alive (not ready) until a model is loaded
+kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Running pod \
+  -l app.kubernetes.io/name=forecast-serving --timeout=300s >/dev/null
 
 # ── 5. first model ─────────────────────────────────────────────────────────────
 if [ "$TRAIN" = "1" ]; then
@@ -129,7 +140,7 @@ helm upgrade "$RELEASE" helm/predictive-stack -n "$NAMESPACE" --reuse-values \
   --set demo.scaling="$DEMO_SCALING" \
   --set training.bootstrap.enabled="$([ "$TRAIN" = "1" ] && echo true || echo false)" \
   $HELM_EXTRA \
-  --wait --timeout 10m >/dev/null
+  --timeout 10m >/dev/null
 
 if [ "$TRAIN" = "1" ]; then
   job=$(kubectl -n "$NAMESPACE" get jobs -l app=train-bootstrap -o jsonpath='{.items[-1:].metadata.name}')
@@ -139,6 +150,8 @@ if [ "$TRAIN" = "1" ]; then
     die "training job failed"
   fi
   kubectl -n "$NAMESPACE" logs "job/$job" -c train | tail -5
+  log "Waiting for forecast-serving to load the model"
+  kubectl -n "$NAMESPACE" rollout status deployment/forecast-serving --timeout=300s >/dev/null
 fi
 
 # ── 6. smoke tests ─────────────────────────────────────────────────────────────
