@@ -304,6 +304,8 @@ Other properties:
 
 ## Future Work
 
+Stage-by-stage plan with ready-to-run briefs: [docs/ROADMAP.md](docs/ROADMAP.md).
+
 **Predictive vs reactive benchmark**  
 Run the demo workload under a daily traffic pattern twice — once with a CPU-based HPA, once with the predictive scaler — and compare p95 latency during ramps and idle replica-minutes. This is what turns the prototype into evidence. (The KEDA external scaler it relies on is implemented in `scaler/`.)
 
@@ -441,6 +443,8 @@ vuna/
 │   ├── prometheus-rules.yaml    # Alerting rules (availability + latency SLOs)
 │   ├── grafana.yaml             # Grafana + provisioned datasources + dashboard
 │   └── loki.yaml                # Loki log aggregation
+├── docs/
+│   └── ROADMAP.md               # Done / next stages with briefs for each
 ├── ARCHITECTURE.md
 └── README.md
 ```
