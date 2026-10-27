@@ -32,7 +32,9 @@ spec:
             - --host=0.0.0.0
             - --port=5000
             - --backend-store-uri=sqlite:////mlflow/mlflow.db
-            - --default-artifact-root=mlflow-artifacts://192.168.49.2:30500
+            # Clients upload artifacts through the server: mlflow-artifacts:/
+            # resolves against whatever tracking URI the client uses.
+            - --default-artifact-root=mlflow-artifacts:/
             - --serve-artifacts
             - --artifacts-destination=/mlflow/artifacts
           ports:
@@ -50,10 +52,9 @@ kind: Service
 metadata:
   name: mlflow
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: mlflow
   ports:
     - port: 5000
       targetPort: 5000
-      nodePort: 30500

@@ -282,7 +282,7 @@ These are known simplifications, not omissions:
 - **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
 - **Autoscaling not yet benchmarked in a cluster.** The KEDA external scaler is implemented and tested (unit tests plus gRPC tests through the generated client), and checked end-to-end against the real forecast service, but there is no measured comparison with a reactive HPA yet.
 - **Short, noisy history.** One month of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
-- **Local Kubernetes only.** Manifests use NodePort and Minikube-specific image loading. This is appropriate for local development; production would use `Ingress`, image registries, and namespace RBAC.
+- **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 
 ---
 
@@ -335,88 +335,61 @@ The training code is device-agnostic (`device = 'cuda' if available`). For GPU i
 
 ## Quick Start
 
-### Option A — Helm (recommended)
+Everything runs on a local [kind](https://kind.sigs.k8s.io/) cluster from one script — the same script CI runs ([`.github/workflows/e2e.yml`](.github/workflows/e2e.yml)). Needs `docker`, `kind`, `kubectl`, `helm`, `curl`.
 
 ```bash
-minikube start
-kubectl apply -f mlflow/k8s.yaml
-
-eval $(minikube docker-env)
-docker build -t cpu-serving:latest serving/
-
-# Deploy observability stack
-kubectl apply -f monitoring/prometheus-rules.yaml
-kubectl apply -f monitoring/prometheus-config.yaml
-kubectl apply -f monitoring/loki.yaml
-kubectl apply -f monitoring/grafana.yaml
-
-# Deploy serving via Helm
-helm install forecast-serving helm/forecast-serving/ \
-  --set image.tag=latest \
-  --set mlflow.trackingUri=http://mlflow:5000
-
-kubectl get pods
+./scripts/up.sh
 ```
 
-### Option B — raw manifests (local dev)
+What it does: creates the cluster (with ingress-nginx and metrics-server), builds the four images and loads them into kind, installs the [`helm/predictive-stack`](helm/predictive-stack/) umbrella chart (MLflow, Prometheus, Grafana, forecast-serving, predictive-scaler, KEDA, the demo workload with its `ScaledObject`, the retraining CronJob), trains the first model from `notebooks/data-jan-2022.json` in-cluster and calls `/reload`, then smoke-tests `/predict` and the scaler's gRPC API. About 10 minutes on a laptop.
+
+Then:
+
+| | |
+|---|---|
+| Grafana (admin/admin) | http://grafana.localhost |
+| Prometheus | http://prometheus.localhost |
+| MLflow | http://mlflow.localhost |
+| Forecast API | http://forecast.localhost/docs |
+
+`*.localhost` resolves to the cluster's ingress on Linux (systemd-resolved) and in browsers; elsewhere add the four hosts to `/etc/hosts` as `127.0.0.1`, or set `DOMAIN=127.0.0.1.nip.io`.
 
 ```bash
-minikube start
-kubectl apply -f mlflow/k8s.yaml
-eval $(minikube docker-env)
-docker build -t cpu-serving:latest serving/
-kubectl apply -f k8s/serving.yaml
-kubectl apply -f monitoring/prometheus-rules.yaml
-kubectl apply -f monitoring/prometheus-config.yaml
-kubectl apply -f monitoring/loki.yaml
-kubectl apply -f monitoring/grafana.yaml
-kubectl get pods
-```
-
-**Train a model and register it to MLflow** (sets the `@champion` alias):
-```bash
-pip install -r training/requirements.txt
-MLFLOW_TRACKING_URI=http://192.168.49.2:30500 PYTHONPATH=training \
-  python -m forecast_training --export notebooks/data-jan-2022.json \
-    --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z
-```
-Nightly retraining from live Prometheus: build `training/` into the cluster and apply `k8s/retrain-cronjob.yaml`.
-The notebook (`notebooks/project.ipynb`) remains as the exploration record; models it promotes to the `Production` stage are still served when no `@champion` alias exists.
-
-**Load model into the running service:**
-```bash
-curl -X POST http://192.168.49.2:30800/reload
-```
-
-**Test:**
-```bash
-# Health check
-curl http://192.168.49.2:30800/health
-
 # Inference
-curl -X POST http://192.168.49.2:30800/predict \
-  -H 'Content-Type: application/json' \
+curl -X POST http://forecast.localhost/predict -H 'Content-Type: application/json' \
   -d '{"values":[0.2,0.25,0.3,0.28,0.22,0.35,0.4,0.38,0.33,0.29]}'
 
-# MLflow UI
-open http://192.168.49.2:30500
-
-# Prometheus
-open http://192.168.49.2:30900
-
-# Grafana (admin/admin) — Prometheus + Loki datasources pre-provisioned
-open http://192.168.49.2:30300
+# Watch the demo scale (see demo/README.md for load generation)
+kubectl -n predictive get hpa,scaledobject,pods -w
+kubectl -n predictive logs deploy/predictive-scaler -f
 ```
+
+Knobs (environment variables of `up.sh`): `IMAGE_TAG` (`dev` builds locally; a commit sha pulls the images CI published to GHCR), `STEP_SECONDS=30` to compress time so the forecast window fills in 5 minutes instead of 50, `DEMO_SCALING=hpa` for the reactive baseline, `TRAIN=0` / `SMOKE=0` to skip steps. Re-running upgrades the release in place; `kind delete cluster --name predictive` removes everything.
+
+### Pieces on their own
+
+- **Images** are published by CI to `ghcr.io/m0zart89/predictive-scaling-system/{forecast-serving,predictive-scaler,cpu-burner,forecast-training}:{<sha>,latest}` on every push to `main`.
+- **Helm charts**: `helm/predictive-stack` installs the whole system (`helm dependency build` first — KEDA is a dependency); `helm/forecast-serving` and `helm/predictive-scaler` work standalone.
+- **Raw manifests** (`mlflow/k8s.yaml`, `k8s/serving.yaml`, `monitoring/*.yaml`, `demo/*.yaml`) are the `kubectl apply` alternative for the serving stack; they expect the GHCR images and a cluster that can pull them.
+- **Train a model** from anywhere with access to MLflow:
+  ```bash
+  pip install -r training/requirements.txt
+  MLFLOW_TRACKING_URI=http://mlflow.localhost PYTHONPATH=training \
+    python -m forecast_training --export notebooks/data-jan-2022.json \
+      --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z --reload-url http://forecast.localhost
+  ```
+  The notebook (`notebooks/project.ipynb`) remains as the exploration record; models it promotes to the `Production` stage are still served when no `@champion` alias exists.
 
 ---
 
 ## Project Structure
 
 ```
-vuna/
+predictive-scaling-system/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml               # Lint → tests → dashboards check → image builds → helm lint
+│       ├── ci.yml               # Lint → tests → dashboards check → image builds (→ GHCR on main) → helm lint
+│       └── e2e.yml              # up.sh on kind, 10 min of load, scaling assertions
 ├── training/                    # Retraining pipeline: candidates, level-tracking gate, MLflow aliases
 │   ├── forecast_training/       # data, features (shared contract), models, registry, CLI
 │   ├── tests/                   # unit + end-to-end against a SQLite MLflow registry
@@ -427,7 +400,12 @@ vuna/
 │   ├── gen_proto.sh             # regenerate gRPC stubs from externalscaler.proto
 │   └── Dockerfile
 ├── demo/                        # cpu-burner workload + ScaledObject + walkthrough
+├── scripts/
+│   ├── up.sh                    # kind cluster → helm install → train → smoke tests
+│   ├── e2e.sh                   # load + verify scaling (used by e2e.yml)
+│   └── kind-config.yaml         # ingress ports, node image
 ├── helm/
+│   ├── predictive-stack/        # umbrella chart: the whole system, KEDA as a dependency
 │   ├── predictive-scaler/       # Helm chart for the scaler
 │   └── forecast-serving/        # Helm chart (production deployment path)
 │       ├── Chart.yaml
@@ -450,8 +428,8 @@ vuna/
 ├── mlflow/
 │   └── k8s.yaml                 # Deployment + PVC + Service
 ├── k8s/
-│   ├── serving.yaml             # Raw manifests (local dev alternative to Helm)
-│   └── retrain-cronjob.yaml     # Nightly retraining job
+│   ├── serving.yaml             # Raw manifests (kubectl alternative to Helm)
+│   └── retrain-cronjob.yaml     # Nightly retraining job (raw-manifest variant)
 ├── monitoring/
 │   ├── prometheus-config.yaml   # Prometheus ConfigMap + Deployment + Service
 │   ├── prometheus-rules.yaml    # Alerting rules: SLOs, forecast drift, scaler fallbacks

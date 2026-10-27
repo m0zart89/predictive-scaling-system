@@ -2,9 +2,7 @@
 # compare with the @champion model on data it has not seen, move the alias if
 # the new model is better, then tell forecast-serving to reload.
 #
-# Build the image into the cluster first:
-#   eval $(minikube docker-env) && docker build -t forecast-training:latest training/
-# Run once by hand:
+# Raw-manifest variant of the CronJob in helm/predictive-stack. Run once by hand:
 #   kubectl create job --from=cronjob/forecast-retrain retrain-manual
 apiVersion: batch/v1
 kind: CronJob
@@ -37,7 +35,7 @@ spec:
               type: RuntimeDefault
           containers:
             - name: train
-              image: forecast-training:latest
+              image: ghcr.io/m0zart89/predictive-scaling-system/forecast-training:latest
               imagePullPolicy: IfNotPresent
               env:
                 - name: MLFLOW_TRACKING_URI

@@ -1,5 +1,5 @@
 # Demo workload scaled by the predictive scaler (see scaledobject.yaml).
-# Build the image into the cluster first: see demo/README.md.
+# Raw-manifest variant of demo.* in helm/predictive-stack.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: cpu-burner
-          image: cpu-burner:latest
+          image: ghcr.io/m0zart89/predictive-scaling-system/cpu-burner:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
