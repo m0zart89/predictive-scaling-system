@@ -2,7 +2,7 @@
 #
 # The scaler is stateless: everything workload-specific (PromQL query, target,
 # forecast URL) lives in each ScaledObject's trigger metadata, so one
-# deployment serves any number of ScaledObjects. See demo/scaledobject.yaml.
+# deployment serves any number of ScaledObjects. See helm/predictive-stack/templates/demo.yaml.
 
 replicaCount: 1
 

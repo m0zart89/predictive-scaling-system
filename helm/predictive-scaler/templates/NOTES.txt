@@ -9,4 +9,4 @@ Metrics (observed / predicted / reported demand per ScaledObject):
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "predictive-scaler.fullname" . }} {{ .Values.service.metricsPort }}
   curl -s localhost:{{ .Values.service.metricsPort }}/metrics | grep predictive_scaler_
 
-Example ScaledObject: demo/scaledobject.yaml in the repository.
+Example ScaledObject: helm/predictive-stack/templates/demo.yaml in the repository.

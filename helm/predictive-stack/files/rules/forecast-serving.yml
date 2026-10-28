@@ -119,7 +119,7 @@ groups:
             Rolling MAE for horizon step {{ $labels.horizon_step }} has been above
             0.25 for 30 minutes. The model no longer tracks the workload:
             check the Model quality dashboard, compare with the champion's
-            holdout RMSE in MLflow, and retrain (k8s/retrain-cronjob.yaml).
+            holdout RMSE in MLflow, and retrain (the forecast-retrain CronJob).
 
   # ── Predictive scaler ────────────────────────────────────────────────────
   - name: predictive-scaler
