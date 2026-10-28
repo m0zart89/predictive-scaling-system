@@ -1,0 +1,68 @@
+# Load-generator Job for one benchmark phase. Rendered with envsubst by
+# bench/run.sh: PHASE, NAMESPACE, IMAGE, DAYS, DAY_SECONDS, WORK_MS, THINK_MS.
+# The script comes from the bench-load ConfigMap (bench/load.py); the image is
+# cpu-burner's (python + prometheus-client). Prometheus scrapes the pod, so
+# client-side latency and errors land next to the scaler's own metrics.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-load-${PHASE}
+  namespace: ${NAMESPACE}
+  labels:
+    app: bench-load
+    bench-phase: "${PHASE}"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: bench-load
+        bench-phase: "${PHASE}"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: load
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/bench/load.py"]
+          env:
+            - name: TARGET
+              value: http://cpu-burner:8080
+            - name: DAYS
+              value: "${DAYS}"
+            - name: DAY_SECONDS
+              value: "${DAY_SECONDS}"
+            - name: WORK_MS
+              value: "${WORK_MS}"
+            - name: THINK_MS
+              value: "${THINK_MS}"
+          ports:
+            - name: metrics
+              containerPort: 8000
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: script
+              mountPath: /bench
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: bench-load

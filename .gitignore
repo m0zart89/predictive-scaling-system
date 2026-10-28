@@ -23,3 +23,7 @@
 # MLflow local artifacts (populated at runtime, not versioned)
 /mlflow-artifacts/
 mlruns/
+
+# Helm dependency downloads (helm dependency build)
+helm/*/charts/
+helm/*/Chart.lock

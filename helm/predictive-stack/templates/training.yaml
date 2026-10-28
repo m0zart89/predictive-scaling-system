@@ -1,0 +1,148 @@
+{{- $t := .Values.training }}
+{{- $image := include "predictive-stack.image" (dict "image" $t.image "global" .Values.global) }}
+{{- if $t.cronjob.enabled }}
+# Nightly retraining: pull the last N days from Prometheus, train candidates,
+# compare with the @champion model on data it has not seen, move the alias if
+# the new model is better, then tell forecast-serving to reload.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: forecast-retrain
+  labels:
+    app: forecast-retrain
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $t.cronjob.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app: forecast-retrain
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: train
+              image: {{ $image | quote }}
+              imagePullPolicy: {{ $t.image.pullPolicy }}
+              env:
+                - name: MLFLOW_TRACKING_URI
+                  value: http://mlflow:5000
+                - name: TRAIN_PROMETHEUS_URL
+                  value: http://prometheus:9090
+                # Model units: the scaler feeds the model demand / capacity, so the
+                # model must be trained on exactly that series.
+                - name: TRAIN_QUERY
+                  value: {{ $t.cronjob.query | default (printf "(%s) / %s" .Values.demo.query .Values.demo.predictive.capacity) | quote }}
+                - name: TRAIN_DAYS
+                  value: {{ $t.cronjob.days | quote }}
+                - name: TRAIN_STEP_SECONDS
+                  value: {{ $t.cronjob.stepSeconds | quote }}
+                - name: TRAIN_TIME_STEPS
+                  value: {{ $t.cronjob.timeSteps | quote }}
+                - name: TRAIN_HORIZON
+                  value: {{ $t.cronjob.horizon | quote }}
+                - name: TRAIN_MIN_IMPROVEMENT
+                  value: {{ $t.cronjob.minImprovement | quote }}
+                - name: MODEL_NAME
+                  value: cpu-forecasting
+                - name: MODEL_ALIAS
+                  value: champion
+                - name: SERVING_RELOAD_URL
+                  value: http://forecast-serving:8080
+              resources:
+                {{- toYaml $t.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+{{- end }}
+{{- if $t.bootstrap.enabled }}
+---
+# One-off: train the first champion from a saved Prometheus export mounted
+# from a ConfigMap, then reload forecast-serving. Named by release revision so
+# `helm upgrade --set training.bootstrap.enabled=true` can run it again.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-bootstrap-{{ .Release.Revision }}
+  labels:
+    app: train-bootstrap
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: train-bootstrap
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-mlflow
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://mlflow:5000/health >/dev/null 2>&1; do echo waiting for mlflow; sleep 3; done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: train
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ $t.image.pullPolicy }}
+          args:
+            - --export=/data/{{ $t.bootstrap.file }}
+            {{- with $t.bootstrap.exclude }}
+            - --exclude={{ . }}
+            {{- end }}
+            - --candidates={{ $t.bootstrap.candidates }}
+            - --step-seconds={{ $t.bootstrap.stepSeconds }}
+            - --time-steps={{ $t.bootstrap.timeSteps }}
+            - --horizon={{ $t.bootstrap.horizon }}
+            - --reload-url=http://forecast-serving:8080
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow:5000
+            - name: MODEL_NAME
+              value: cpu-forecasting
+            - name: MODEL_ALIAS
+              value: champion
+          resources:
+            {{- toYaml $t.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+      volumes:
+        - name: data
+          configMap:
+            name: {{ $t.bootstrap.configMap }}
+{{- end }}

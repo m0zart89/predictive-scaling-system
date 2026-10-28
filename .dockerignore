@@ -1,0 +1,7 @@
+# Root build context, used by serving/Dockerfile: send only what it copies.
+*
+!serving/requirements.txt
+!serving/app.py
+!serving/quality.py
+!training/forecast_training/__init__.py
+!training/forecast_training/features.py

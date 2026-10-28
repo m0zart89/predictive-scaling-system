@@ -1,0 +1,30 @@
+predictive-stack {{ .Chart.Version }} is installed in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.ingress.enabled }}
+
+With ingress-nginx and the kind config from scripts/kind-config.yaml:
+
+  Grafana      http://{{ .Values.ingress.hosts.grafana }}.{{ .Values.ingress.domain }}      (admin / {{ .Values.grafana.adminPassword }})
+  Prometheus   http://{{ .Values.ingress.hosts.prometheus }}.{{ .Values.ingress.domain }}
+  MLflow       http://{{ .Values.ingress.hosts.mlflow }}.{{ .Values.ingress.domain }}
+  Forecast API http://{{ .Values.ingress.hosts.forecast }}.{{ .Values.ingress.domain }}/docs
+{{- end }}
+
+Model: forecast-serving loads models:/cpu-forecasting@champion from MLflow.
+On a fresh cluster there is none yet — train one:
+
+  kubectl -n {{ .Release.Namespace }} create configmap train-data --from-file=notebooks/data-jan-2022.json
+  helm upgrade {{ .Release.Name }} helm/predictive-stack -n {{ .Release.Namespace }} --reuse-values \
+    --set training.bootstrap.enabled=true
+
+Demo workload scaling (demo.scaling): {{ .Values.demo.scaling }}
+  predictive  KEDA ScaledObject through the predictive scaler (set after KEDA's CRDs exist)
+  hpa         plain CPU HPA (needs metrics-server)
+
+  helm upgrade {{ .Release.Name }} helm/predictive-stack -n {{ .Release.Namespace }} --reuse-values \
+    --set demo.scaling=predictive
+
+Watch it:
+
+  kubectl -n {{ .Release.Namespace }} get hpa,scaledobject,pods -w
+  kubectl -n {{ .Release.Namespace }} logs deploy/predictive-scaler -f

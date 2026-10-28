@@ -20,8 +20,8 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.4.4
 
-      - name: Lint serving/, scaler/, training/, demo/ and tests/
-        run: ruff check serving/ scaler/ training/ demo/ tests/
+      - name: Lint serving/, scaler/, training/, demo/, monitoring/ and tests/
+        run: ruff check serving/ scaler/ training/ demo/ monitoring/ tests/
 
   test-serving:
     name: Unit tests
@@ -35,7 +35,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r serving/requirements.txt pytest httpx pytest-timeout
+        # tests/test_training_serving.py also imports training/ (same pins)
+        run: pip install -r serving/requirements.txt -r training/requirements.txt pytest httpx pytest-timeout pyyaml
 
       - name: Run tests
         run: pytest tests/ -v --timeout=30
@@ -89,32 +90,83 @@ jobs:
     name: Build ${{ matrix.name }} image
     runs-on: ubuntu-latest
     needs: lint-python
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
+          # serving builds from the root: it copies training/forecast_training/features.py
           - name: forecast-serving
-            context: ./serving
+            context: .
+            file: ./serving/Dockerfile
           - name: predictive-scaler
             context: ./scaler
+            file: ./scaler/Dockerfile
           - name: cpu-burner
             context: ./demo/cpu-burner
+            file: ./demo/cpu-burner/Dockerfile
           - name: forecast-training
             context: ./training
+            file: ./training/Dockerfile
+    env:
+      # Images are published to GHCR under the repository:
+      #   ghcr.io/<owner>/predictive-scaling-system/<name>:{<sha>,latest}
+      # Pull requests only build (no credentials for forks); pushes to main push.
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build (no push)
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.name }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=raw,value=latest,enable=${{ env.PUSH == 'true' }}
+
+      - name: Build${{ env.PUSH == 'true' && ' and push' || '' }}
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.context }}
-          push: false
-          tags: ${{ matrix.name }}:${{ github.sha }}
+          file: ${{ matrix.file }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           # Layer cache via GitHub Actions cache backend, one scope per image
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  monitoring:
+    name: Dashboards and alert rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyYAML
+        run: pip install pyyaml==6.0.1
+
+      # Validates monitoring/dashboards/*.json and the alert rules (structure,
+      # metric and label names against the code, a runbook per alert) and fails
+      # if the copies in helm/predictive-stack/files/ were not re-synced.
+      - name: Validate dashboards, rules and runbooks
+        run: python monitoring/render.py --check
 
   helm-lint:
     name: Helm lint
@@ -124,25 +176,40 @@ jobs:
 
       - uses: azure/setup-helm@v4
         with:
-          version: "3.14.4"
+          version: "3.22.1"
+
+      - name: Resolve umbrella chart dependencies (KEDA)
+        run: |
+          helm repo add kedacore https://kedacore.github.io/charts
+          helm dependency build helm/predictive-stack
 
       - name: Lint Helm charts
-        run: helm lint helm/forecast-serving/ helm/predictive-scaler/
+        run: |
+          helm lint helm/forecast-serving/ helm/predictive-scaler/
+          helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
+          helm lint helm/predictive-stack/ --set demo.scaling=hpa
 
       - name: Helm template (dry-run)
         run: |
           for chart in forecast-serving predictive-scaler; do
-            helm template "$chart" "helm/$chart/" \
-              --set image.tag=ci-${{ github.sha }} \
-              --debug > /dev/null
+            helm template "$chart" "helm/$chart/" --set image.tag=ci-${{ github.sha }} --debug > /dev/null
           done
+          helm template predictive helm/predictive-stack/ -n predictive \
+            --set global.imageTag=ci-${{ github.sha }} --set demo.scaling=predictive \
+            --set training.bootstrap.enabled=true > /tmp/stack.yaml
+          # the umbrella chart must carry the same dashboards and rules as monitoring/
+          grep -q 'forecast_rolling_mae' /tmp/stack.yaml
+          grep -q 'alert: ForecastDriftHigh' /tmp/stack.yaml
+          grep -q 'kind: ScaledObject' /tmp/stack.yaml
+          # the CronJob trains on what the scaler feeds the model: demand / capacity
+          grep -Fq '[1m]))) / 2.5"' /tmp/stack.yaml
 
   # Placeholder job — shows the intended CD path without implementing it
   # In a real cluster, this would use ArgoCD image updater or a Helm upgrade action.
   deploy-check:
     name: Deployment readiness check
     runs-on: ubuntu-latest
-    needs: [test-serving, test-training, test-scaler, build-image, helm-lint]
+    needs: [test-serving, test-training, test-scaler, build-image, helm-lint, monitoring]
     steps:
       - name: All checks passed
         run: echo "Image built and Helm chart validated. Ready for deployment."

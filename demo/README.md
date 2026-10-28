@@ -15,54 +15,39 @@ reads its total CPU demand from Prometheus, asks `forecast-serving` for the
 next interval and reports `max(forecast, observed)` to KEDA, which sets
 `replicas = ceil(demand / 0.35 cores)`.
 
-## Prerequisites
-
-The forecasting stack from the main [Quick Start](../README.md#quick-start)
-running in the `default` namespace (MLflow, Prometheus, forecast-serving via
-Helm, with a model loaded). Re-apply `monitoring/prometheus-config.yaml` if
-it was deployed before this demo existed: it adds the pod-discovery job that
-scrapes the `demo` and `keda` namespaces.
-
 ## Run
 
+The whole stack, demo included, comes up with one command (see the main
+[Quick Start](../README.md#quick-start)):
+
 ```bash
-# 1. KEDA
-helm repo add kedacore https://kedacore.github.io/charts
-helm install keda kedacore/keda -n keda --create-namespace
+STEP_SECONDS=30 ./scripts/up.sh      # 30 s steps: the forecast window fills in 5 min
+```
 
-# 2. Images (Minikube's Docker daemon)
-eval $(minikube docker-env)
-docker build -t predictive-scaler:latest scaler/
-docker build -t cpu-burner:latest demo/cpu-burner/
+Then put load on the workload:
 
-# 3. Scaler (same namespace as KEDA; the ScaledObject points at it)
-helm install predictive-scaler helm/predictive-scaler/ -n keda
-
-# 4. Workload + ScaledObject
-kubectl create namespace demo
-kubectl apply -f demo/cpu-burner.yaml
-kubectl apply -f demo/scaledobject.yaml
-
-# 5. Load
-kubectl -n demo run load --rm -it --image=busybox --restart=Never -- \
+```bash
+kubectl -n predictive run load --rm -it --image=busybox:1.36 --restart=Never -- \
   sh -c 'while true; do wget -q -O- "http://cpu-burner:8080/work?ms=100" >/dev/null; done'
 ```
 
-If you installed the serving chart via raw manifests (Option B), change
-`forecastServiceURL` in `scaledobject.yaml` to
-`http://cpu-serving.default.svc.cluster.local:8080`.
+`scripts/e2e.sh` does the same with a ramp for 10 minutes and checks that the
+scaler's decisions came from forecasts and that the HPA changed replicas.
+
+The Deployment, Service and ScaledObject live in
+`helm/predictive-stack/templates/demo.yaml` (`demo.scaling=predictive`); the
+trigger metadata is documented in [scaler/README.md](../scaler/README.md).
 
 ## Watch it
 
 ```bash
-kubectl -n demo get hpa,scaledobject,pods -w
+kubectl -n predictive get hpa,scaledobject,pods -w
 
 # What the scaler decided and why
-kubectl -n keda logs deploy/predictive-scaler -f
+kubectl -n predictive logs deploy/predictive-scaler -f
 
-# Observed vs predicted vs reported demand, as Prometheus sees it
-kubectl -n keda port-forward svc/predictive-scaler 9100
-curl -s localhost:9100/metrics | grep -E 'predictive_scaler_(observed|predicted|reported)_demand'
+# Observed vs predicted vs reported demand, desired replicas, fallback rate
+open http://grafana.localhost/d/predictive-scaling
 ```
 
 ## Timing

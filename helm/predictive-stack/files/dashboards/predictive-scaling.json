@@ -1,0 +1,425 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Reported is what KEDA scales on: max(forecast, observed) in mode=max.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "predictive_scaler_observed_demand{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}",
+          "legendFormat": "{{namespace}}/{{scaledobject}} observed",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "predictive_scaler_predicted_demand{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}",
+          "legendFormat": "{{namespace}}/{{scaledobject}} predicted",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "predictive_scaler_reported_demand{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}",
+          "legendFormat": "{{namespace}}/{{scaledobject}} reported",
+          "refId": "C"
+        }
+      ],
+      "title": "Demand: observed / predicted / reported",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "ceil(reported / targetValue) before min/max bounds, next to the pods Prometheus can scrape.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 2,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "predictive_scaler_desired_replicas{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}",
+          "legendFormat": "{{namespace}}/{{scaledobject}} desired",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count by (namespace, app) (up{namespace=~\"$namespace\", app!=\"\"} == 1)",
+          "legendFormat": "{{namespace}}/{{app}} scraped pods",
+          "refId": "B"
+        }
+      ],
+      "title": "Desired replicas",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Share of decisions that fell back to reactive scaling. ScalerFallbackRate alerts above 50% for 15 min.",
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      },
+      "id": 3,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (namespace, scaledobject) (rate(predictive_scaler_decisions_total{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\", source=\"observed\"}[5m])) / sum by (namespace, scaledobject) (rate(predictive_scaler_decisions_total{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}[5m]))",
+          "legendFormat": "{{namespace}}/{{scaledobject}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Fallback rate (decisions on observed demand)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 30,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (namespace, scaledobject, source) (rate(predictive_scaler_decisions_total{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}[5m]))",
+          "legendFormat": "{{namespace}}/{{scaledobject}} {{source}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Decisions by source",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      },
+      "id": 5,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(predictive_scaler_forecast_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(predictive_scaler_forecast_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(predictive_scaler_forecast_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "title": "Forecast latency (scaler \u2192 forecast-serving)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "id": 6,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (namespace, scaledobject, reason) (rate(predictive_scaler_forecast_failures_total{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}[5m]))",
+          "legendFormat": "{{namespace}}/{{scaledobject}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Forecast failures by reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Non-zero means KEDA is applying the ScaledObject fallback (ScalerPrometheusErrors).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "id": 7,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (namespace, scaledobject) (rate(predictive_scaler_prometheus_failures_total{namespace=~\"$namespace\", scaledobject=~\"$scaledobject\"}[5m]))",
+          "legendFormat": "{{namespace}}/{{scaledobject}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Prometheus query failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "id": 8,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (method, code) (rate(predictive_scaler_grpc_requests_total[5m]))",
+          "legendFormat": "{{method}} {{code}}",
+          "refId": "A"
+        }
+      ],
+      "title": "gRPC calls from KEDA",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "predictive-scaling",
+    "keda"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(predictive_scaler_reported_demand, namespace)",
+        "includeAll": true,
+        "label": "namespace",
+        "multi": true,
+        "name": "namespace",
+        "query": {
+          "query": "label_values(predictive_scaler_reported_demand, namespace)",
+          "refId": "var"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(predictive_scaler_reported_demand{namespace=~\"$namespace\"}, scaledobject)",
+        "includeAll": true,
+        "label": "scaledobject",
+        "multi": true,
+        "name": "scaledobject",
+        "query": {
+          "query": "label_values(predictive_scaler_reported_demand{namespace=~\"$namespace\"}, scaledobject)",
+          "refId": "var"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Predictive scaling",
+  "uid": "predictive-scaling",
+  "version": 1
+}

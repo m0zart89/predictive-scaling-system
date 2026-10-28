@@ -13,5 +13,5 @@ COPY forecast_training/ forecast_training/
 
 USER 10001
 
-# Configuration comes from env (see k8s/retrain-cronjob.yaml) or CLI flags.
+# Configuration comes from env (see the CronJob in helm/predictive-stack) or CLI flags.
 ENTRYPOINT ["python", "-m", "forecast_training"]

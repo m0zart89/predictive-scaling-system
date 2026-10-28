@@ -185,3 +185,14 @@ def test_max_aggregation_scales_for_the_peak_of_the_horizon(metrics):
     d = eng.decide(NS, NAME, make_config(mode="forecast", forecastAggregation="max"))
     assert d.predicted == pytest.approx(0.9)
     assert "max of 3 step(s)" in d.reason
+
+
+def test_forecast_call_carries_series_key_and_window_time(metrics):
+    fc = FakeForecast(lambda v: 0.9)
+    prom = FakePrometheus(WINDOW)
+    eng = engine_with(metrics, prom, fc)
+    eng.decide(NS, NAME, make_config())
+    assert fc.kwargs["series"] == f"{NS}/{NAME}"
+    # the last sample's own time, so serving can match the actual later
+    assert fc.kwargs["timestamp"] == pytest.approx(FakePrometheus.NOW, abs=1e-6)
+    assert fc.kwargs["step_seconds"] == 300

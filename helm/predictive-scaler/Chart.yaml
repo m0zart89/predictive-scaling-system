@@ -5,7 +5,7 @@ description: >
   Reads recent demand from Prometheus, asks forecast-serving for the next
   interval and reports the result to KEDA as an external metric.
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.2.0"
 keywords:
   - keda

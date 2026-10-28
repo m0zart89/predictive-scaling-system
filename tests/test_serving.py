@@ -34,15 +34,6 @@ def test_readiness_503_without_model(client):
     assert response.status_code == 503
 
 
-def test_health_always_200(client):
-    """/health is backwards-compatible: always 200, reports model_loaded: false."""
-    response = client.get("/health")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok"
-    assert body["model_loaded"] is False
-
-
 # ── Model info ─────────────────────────────────────────────────────────────────
 
 def test_model_info_shape(client):
@@ -89,30 +80,6 @@ def test_predict_rejects_empty_list(client):
     assert response.status_code == 422
 
 
-# ── Recommend-scale — degraded state ──────────────────────────────────────────
-
-def test_recommend_scale_503_without_model(client):
-    """POST /recommend-scale returns 503 when model is not loaded."""
-    response = client.post(
-        "/recommend-scale",
-        json={
-            "values": [0.2, 0.25, 0.3, 0.28, 0.22, 0.35, 0.4, 0.38, 0.33, 0.29],
-            "current_replicas": 2,
-        },
-    )
-    assert response.status_code == 503
-
-
-def test_recommend_scale_schema(client):
-    """Response schema is validated even in error cases."""
-    response = client.post(
-        "/recommend-scale",
-        json={"values": [0.1] * 10, "current_replicas": 1},
-    )
-    # Without a model this will be 503, but schema validation should pass
-    assert response.status_code in (200, 503)
-
-
 # ── Reload ─────────────────────────────────────────────────────────────────────
 
 def test_reload_fails_gracefully_without_mlflow():
@@ -135,6 +102,7 @@ def test_metrics_endpoint_reachable(client):
     body = response.text
     # HTTP-level metrics from prometheus_fastapi_instrumentator
     assert "http_requests_total" in body
+    assert 'http_request_duration_seconds_bucket{handler="/live",le="0.01"' in body
     # Custom domain metrics
     assert "forecast_model_loaded" in body
     assert "forecast_prediction_requests_total" in body

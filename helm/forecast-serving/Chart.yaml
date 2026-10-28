@@ -5,7 +5,7 @@ description: >
   Exposes a REST API for predicting CPU utilization,
   intended as a decision-support component for autoscalers and capacity tools.
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "latest"
 keywords:
   - mlops

@@ -1,0 +1,75 @@
+name: e2e
+
+# Brings the whole stack up on a kind cluster with scripts/up.sh, loads the
+# demo workload for 10 minutes with the scaler on a 30-second step (so the
+# forecast window fills in 5 minutes) and checks that scaling decisions came
+# from forecasts and that the HPA changed the replica count.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.33.0
+  HELM_VERSION: "3.22.1"
+
+jobs:
+  kind:
+    name: kind e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kind
+        run: |
+          curl -sSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          kind version
+          kubectl version --client
+
+      - name: Bring the stack up (build images, install, train, smoke-test)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          BUILD_IMAGES: "1"
+          STEP_SECONDS: "30"
+          MAX_REPLICAS: "5"
+        run: ./scripts/up.sh
+
+      - name: Load for 10 minutes and verify scaling
+        env:
+          LOAD_SECONDS: "600"
+          RAMP_AT: "180"
+          OUT_DIR: e2e-artifacts
+        run: ./scripts/e2e.sh
+
+      - name: Describe cluster state on failure
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          kubectl get pods -A -o wide | tee e2e-artifacts/pods-all.txt
+          kubectl -n predictive describe pods > e2e-artifacts/describe-pods.txt 2>&1 || true
+          kubectl -n predictive get events --sort-by=.lastTimestamp > e2e-artifacts/events.txt 2>&1 || true
+          for d in predictive-scaler forecast-serving cpu-burner mlflow prometheus grafana keda-operator; do
+            kubectl -n predictive logs "deploy/$d" --all-containers=true --tail=500 > "e2e-artifacts/$d.log" 2>&1 || true
+          done
+          kubectl -n predictive logs -l app=train-bootstrap --all-containers=true --tail=500 > e2e-artifacts/train-bootstrap.log 2>&1 || true
+
+      - name: Upload logs and metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ github.sha }}
+          path: e2e-artifacts/
+          if-no-files-found: warn

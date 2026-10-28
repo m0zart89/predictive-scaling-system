@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class PrometheusError(RuntimeError):
@@ -37,12 +37,20 @@ def _read_json(req: urllib.request.Request, timeout: float) -> dict:
 class PrometheusClient:
     def fetch_window(self, address: str, query: str, points: int, step_seconds: int,
                      timeout: float, now: Optional[float] = None) -> List[float]:
+        """Values of fetch_series (kept for callers that do not need timestamps)."""
+        return self.fetch_series(address, query, points, step_seconds, timeout, now)[1]
+
+    def fetch_series(self, address: str, query: str, points: int, step_seconds: int,
+                     timeout: float, now: Optional[float] = None) -> Tuple[List[float], List[float]]:
         """
-        Return up to `points` most recent samples of `query`, oldest first.
+        Return (timestamps, values) of up to `points` most recent samples of
+        `query`, oldest first — the trailing run of consecutive finite samples
+        exactly `step_seconds` apart. A gap (missing scrape, NaN from a division
+        by zero) shortens the window instead of hiding a hole from the model;
+        the engine then scales on observed demand until the window refills.
 
         The query must resolve to exactly one series — aggregate it in PromQL
         (sum/avg) so the scaler never has to guess how to combine series.
-        Non-finite samples (NaN from division by zero, etc.) are dropped.
         """
         end = time.time() if now is None else now
         # [end - points*step, end] yields points+1 samples, so one missing sample
@@ -74,27 +82,46 @@ class PrometheusClient:
                 "(e.g. wrap it in sum(...))"
             )
         if not result:
-            return []
+            return [], []
 
+        timestamps: List[float] = []
         values: List[float] = []
-        for _, raw in result[0].get("values", []):
+        for ts, raw in result[0].get("values", []):
             try:
                 v = float(raw)
             except (TypeError, ValueError):
+                v = math.nan
+            if not math.isfinite(v):
+                timestamps, values = [], []          # a hole: start the run again
                 continue
-            if math.isfinite(v):
-                values.append(v)
-        return values[-points:]
+            if timestamps and abs(float(ts) - timestamps[-1] - step_seconds) > 1:
+                timestamps, values = [], []          # samples not step_seconds apart
+            timestamps.append(float(ts))
+            values.append(v)
+        return timestamps[-points:], values[-points:]
 
 
 class ForecastClient:
-    def predict(self, base_url: str, values: List[float], timeout: float) -> List[float]:
+    def predict(self, base_url: str, values: List[float], timeout: float,
+                series: Optional[str] = None, timestamp: Optional[float] = None,
+                step_seconds: Optional[int] = None) -> List[float]:
         """
         Call POST /predict and return the forecast for each step of the model's
         horizon (model space). Models with a single-step horizon, and services
         that predate multi-step forecasts, yield a one-element list.
+
+        `series`, `timestamp` (unix time of the last sample) and `step_seconds`
+        (their spacing) let the service score this forecast against the actual
+        values a later window carries; older services ignore them.
         """
-        payload = json.dumps({"values": values}).encode("utf-8")
+        body_out: dict = {"values": values}
+        if series:
+            body_out["series"] = series
+        if timestamp is not None:
+            body_out["timestamp"] = timestamp
+        if step_seconds is not None:
+            body_out["step_seconds"] = step_seconds
+        payload = json.dumps(body_out).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/predict",
             data=payload,

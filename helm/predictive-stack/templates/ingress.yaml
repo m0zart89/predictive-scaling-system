@@ -1,0 +1,66 @@
+{{- if .Values.ingress.enabled }}
+{{- $i := .Values.ingress }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: predictive-stack
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+  {{- with $i.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $i.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    {{- if .Values.grafana.enabled }}
+    - host: {{ printf "%s.%s" $i.hosts.grafana $i.domain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+    {{- end }}
+    {{- if .Values.prometheus.enabled }}
+    - host: {{ printf "%s.%s" $i.hosts.prometheus $i.domain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090
+    {{- end }}
+    {{- if .Values.mlflow.enabled }}
+    - host: {{ printf "%s.%s" $i.hosts.mlflow $i.domain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mlflow
+                port:
+                  number: 5000
+    {{- end }}
+    {{- if (index .Values "forecast-serving").enabled }}
+    - host: {{ printf "%s.%s" $i.hosts.forecast $i.domain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: forecast-serving
+                port:
+                  number: 8080
+    {{- end }}
+{{- end }}

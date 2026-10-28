@@ -1,0 +1,162 @@
+{{- if .Values.demo.enabled }}
+{{- $demo := .Values.demo }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-burner
+  labels:
+    app: cpu-burner
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  {{- if eq $demo.scaling "none" }}
+  replicas: {{ $demo.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: cpu-burner
+  template:
+    metadata:
+      labels:
+        app: cpu-burner
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: cpu-burner
+          image: {{ include "predictive-stack.image" (dict "image" $demo.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ $demo.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            {{- toYaml $demo.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cpu-burner
+  labels:
+    app: cpu-burner
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: cpu-burner
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- if eq $demo.scaling "predictive" }}
+---
+# Scales cpu-burner on forecast CPU demand through the predictive scaler:
+#   desiredReplicas = ceil(reportedDemand / targetValue),
+#   reportedDemand  = max(forecast, observed) in cores (mode=max).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cpu-burner
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: cpu-burner
+  minReplicaCount: {{ $demo.minReplicas }}
+  maxReplicaCount: {{ $demo.maxReplicas }}
+  pollingInterval: {{ $demo.predictive.pollingInterval }}
+  cooldownPeriod: {{ $demo.predictive.cooldownPeriod }}
+  # Used when the scaler returns an error (Prometheus down, no samples):
+  # hold a safe replica count instead of guessing.
+  fallback:
+    failureThreshold: {{ $demo.predictive.fallback.failureThreshold }}
+    replicas: {{ $demo.predictive.fallback.replicas }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: {{ $demo.predictive.scaleDownStabilizationSeconds }}
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    - type: external
+      metricType: AverageValue
+      metadata:
+        scalerAddress: predictive-scaler.{{ .Release.Namespace }}.svc.cluster.local:6000
+        prometheusServerAddress: http://prometheus.{{ .Release.Namespace }}.svc.cluster.local:9090
+        # Total demand in cores; independent of replica count.
+        query: {{ $demo.query | quote }}
+        forecastServiceURL: http://forecast-serving.{{ .Release.Namespace }}.svc.cluster.local:8080
+        targetValue: {{ $demo.predictive.targetValue | quote }}
+        capacity: {{ $demo.predictive.capacity | quote }}
+        timeSteps: {{ $demo.predictive.timeSteps | quote }}
+        stepSeconds: {{ $demo.predictive.stepSeconds | quote }}
+        mode: {{ $demo.predictive.mode }}
+        forecastAggregation: {{ $demo.predictive.forecastAggregation }}
+        activationValue: "0"
+        cacheSeconds: {{ $demo.predictive.cacheSeconds | quote }}
+        timeoutSeconds: {{ $demo.predictive.timeoutSeconds | quote }}
+{{- else if eq $demo.scaling "hpa" }}
+---
+# Reactive baseline: a plain CPU HPA (needs metrics-server in the cluster).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cpu-burner
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cpu-burner
+  minReplicas: {{ $demo.minReplicas }}
+  maxReplicas: {{ $demo.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $demo.hpa.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: {{ $demo.hpa.scaleDownStabilizationSeconds }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+{{- else if ne $demo.scaling "none" }}
+{{- fail (printf "demo.scaling must be none, predictive or hpa, got %q" $demo.scaling) }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,167 @@
+# predictive-stack: the whole system in one release.
+#
+#   helm dependency build helm/predictive-stack
+#   helm upgrade --install predictive helm/predictive-stack -n predictive --create-namespace
+#
+# scripts/up.sh does this on a kind cluster, trains a model and runs smoke
+# tests. Everything lives in the release namespace; Prometheus discovers pods
+# there only (namespace-scoped RBAC).
+
+global:
+  # Tag for the four project images (forecast-serving, predictive-scaler,
+  # cpu-burner, forecast-training). CI publishes <sha> and latest to GHCR.
+  imageTag: latest
+
+# ── subcharts ──────────────────────────────────────────────────────────────────
+
+forecast-serving:
+  enabled: true
+  fullnameOverride: forecast-serving
+  mlflow:
+    trackingUri: http://mlflow:5000
+
+predictive-scaler:
+  enabled: true
+  fullnameOverride: predictive-scaler
+
+keda:
+  enabled: true
+  # KEDA's own charts default to 1 CPU limits per component; kind and CI
+  # runners are small.
+  resources:
+    operator:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    metricServer:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    webhooks:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {cpu: 200m, memory: 256Mi}
+
+# ── platform components (templates/) ──────────────────────────────────────────
+
+mlflow:
+  enabled: true
+  image: ghcr.io/mlflow/mlflow:v2.11.1
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: ""        # "" = the cluster default (kind: local-path)
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+prometheus:
+  enabled: true
+  image: prom/prometheus:v2.51.0
+  scrapeInterval: 15s
+  evaluationInterval: 30s
+  retention: 7d
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+grafana:
+  enabled: true
+  image: grafana/grafana:10.4.2
+  adminPassword: admin
+  anonymous: true
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+# One Ingress with a host per component: <name>.<domain>. With the kind
+# config in scripts/kind-config.yaml and ingress-nginx, *.localhost resolves
+# to the cluster from the host machine.
+ingress:
+  enabled: true
+  className: nginx
+  domain: localhost
+  annotations: {}
+  hosts:
+    grafana: grafana
+    prometheus: prometheus
+    mlflow: mlflow
+    forecast: forecast
+
+# ── demo workload ──────────────────────────────────────────────────────────────
+
+demo:
+  enabled: true
+  # Total demand of the workload in cores, independent of replica count. Used
+  # by the ScaledObject (scaling) and the retraining CronJob (training data),
+  # so the model is fed exactly the series it was trained on.
+  query: sum(rate(process_cpu_seconds_total{app="cpu-burner"}[1m]))
+  image:
+    repository: ghcr.io/m0zart89/predictive-scaling-system/cpu-burner
+    tag: ""               # "" = global.imageTag
+    pullPolicy: IfNotPresent
+  replicas: 1
+  # One Python process saturates at ~1 core; 500m keeps the maths simple:
+  # a replica at 70% of its request carries 0.35 cores (targetValue).
+  resources:
+    requests: {cpu: 500m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 128Mi}
+  # none       just the Deployment (first install, before KEDA's CRDs exist)
+  # predictive KEDA ScaledObject on the predictive scaler (needs KEDA installed)
+  # hpa        plain autoscaling/v2 HPA on CPU (needs metrics-server) — the
+  #            reactive baseline for the benchmark
+  scaling: none
+  minReplicas: 1
+  maxReplicas: 10
+  hpa:
+    targetCPUUtilizationPercentage: 70
+    scaleDownStabilizationSeconds: 300
+  predictive:
+    # Cores one replica should carry: 70% of its 500m request.
+    targetValue: "0.35"
+    # model input = demand / capacity; keeps 10 x 500m inside the training range
+    capacity: "2.5"
+    timeSteps: "10"
+    stepSeconds: "300"    # "30" compresses time for demos and CI
+    mode: max
+    forecastAggregation: max
+    cacheSeconds: "15"
+    timeoutSeconds: "3"
+    pollingInterval: 15
+    cooldownPeriod: 300
+    scaleDownStabilizationSeconds: 300
+    fallback:
+      failureThreshold: 3
+      replicas: 4
+
+# ── retraining ─────────────────────────────────────────────────────────────────
+
+training:
+  image:
+    repository: ghcr.io/m0zart89/predictive-scaling-system/forecast-training
+    tag: ""               # "" = global.imageTag
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {cpu: "2", memory: 1Gi}
+  # Nightly: last N days of the demand query from Prometheus.
+  cronjob:
+    enabled: true
+    schedule: "17 3 * * *"
+    # "" = (demo.query) / demo.predictive.capacity: the series the scaler
+    # feeds the model. Set explicitly only together with a matching capacity.
+    query: ""
+    days: "14"
+    stepSeconds: "300"
+    timeSteps: "10"
+    horizon: "6"
+    minImprovement: "0.02"
+  # One-off Job that trains from a saved Prometheus export in a ConfigMap
+  # (kubectl create configmap train-data --from-file=notebooks/data-jan-2022.json)
+  # and reloads forecast-serving. scripts/up.sh enables it on a fresh cluster.
+  bootstrap:
+    enabled: false
+    configMap: train-data
+    file: data-jan-2022.json
+    exclude: "2022-01-17T00:00:00Z/2022-01-17T08:00:00Z"
+    candidates: "hgb_delta"
+    stepSeconds: "300"
+    timeSteps: "10"
+    horizon: "6"

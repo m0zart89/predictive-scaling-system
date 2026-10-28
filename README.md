@@ -15,106 +15,70 @@ This system demonstrates how predictive signals can be used to improve both perf
 
 ## System Overview
 
-Kubernetes autoscalers (HPA, VPA, KEDA) operate reactively: they observe a metric crossing a threshold and then trigger a scaling event. For workloads with predictable patterns — scheduled batch jobs, business-hours traffic, recurring ETL pipelines — this means the scaling action always lags the load by at least one scrape-and-react cycle. The result is latency spikes at ramp-up and wasted capacity during predictable quiet periods.
+Kubernetes autoscalers (HPA, KEDA) are reactive: they see a metric cross a threshold and then add pods, so for workloads with a predictable pattern — business-hours traffic, scheduled batches — scaling always lags the load by at least one scrape-and-react cycle. The result is latency at every ramp-up and idle capacity during every predictable quiet period.
 
-This system is a prototype for a different approach: expose a forecasting API that infrastructure controllers can query ahead of time to anticipate load rather than react to it. A scheduler or autoscaler calls `POST /predict` with recent observations, receives a predicted CPU utilization value for the next interval, and uses that to make a proactive scaling decision.
-
-The design goal is not to build a better autoscaler. It is to demonstrate the integration point: how a trained ML model becomes a queryable infrastructure service that fits into an existing Kubernetes control plane.
+This project closes that gap end to end: a forecasting service turns recent observations into a multi-step forecast, a KEDA external scaler turns the forecast into a replica count, a retraining pipeline keeps the model honest, and the forecast's own error is measured in production. Everything deploys with one Helm chart and one script on a kind cluster, and a benchmark workflow measures what the forecast buys against a plain CPU HPA.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       Kubernetes Cluster                     │
-│                                                              │
-│  ┌─────────────┐    ┌─────────────────────┐    ┌──────────┐  │
-│  │   MLflow    │◄───│  forecast-serving   │───►│Prometheus│  │
-│  │             │    │                     │    │          │  │
-│  │  Tracking   │    │  POST /predict      │    │ scrapes  │  │
-│  │  Registry   │    │  POST /reload       │    │ /metrics │  │
-│  │  Artifacts  │    │  GET  /health       │    └────┬─────┘  │
-│  └─────────────┘    └─────────────────────┘         │        │
-│        ▲                                      ┌──────▼─────┐ │
-│        │                                      │  Grafana   │ │
-│  ┌─────┴──────────────┐                       └────────────┘ │
-│  │  Training Pipeline  │                                     │
-│  │  (Jupyter notebook) │                                     │
-│  └─────────────────────┘                                     │
-└──────────────────────────────────────────────────────────────┘
-
-External clients (autoscaler, scheduler, capacity tool)
-        │
-        └──► POST /predict  →  forecast-serving  →  MLflow model
+┌───────────────────────────────────────────────────────────────────────────────┐
+│ namespace predictive (helm/predictive-stack)                                  │
+│                                                                               │
+│  cpu-burner pods ──/metrics──► Prometheus ◄──── scrapes ─── forecast-serving   │
+│       ▲                          │   ▲                            │  scaler    │
+│       │ replicas                 │   │ rules → alerts → runbooks  │            │
+│      HPA ◄── KEDA ◄── gRPC ── predictive-scaler ◄── query_range ──┘            │
+│   (managed by KEDA)   GetMetrics      │                                       │
+│                                       │ POST /predict {values, series, ts}    │
+│                                       ▼                                       │
+│                               forecast-serving ◄── models:/cpu-forecasting@champion
+│                                 │ ▲ POST /reload                │             │
+│                       /metrics  │ └── forecast-training (CronJob) ─► MLflow    │
+│                                 ▼                                             │
+│                              Grafana: Predictive scaling · Model quality      │
+└───────────────────────────────────────────────────────────────────────────────┘
+      Ingress: grafana | prometheus | mlflow | forecast .localhost
 ```
 
 ### Data flow
 
-1. **Training:** A Jupyter notebook loads raw CPU metrics (Prometheus export format), engineers sliding-window features, trains and evaluates multiple model families, and logs all runs to MLflow — parameters, metrics, and artifacts.
-2. **Registration:** The best-performing model is promoted to `Production` in the MLflow Model Registry. The preprocessing scaler is stored as a co-located artifact.
-3. **Serving:** The inference service loads the `Production` model from MLflow on startup. It exposes a REST endpoint that any infrastructure component can call.
-4. **Observability:** The serving pod exposes a `/metrics` endpoint. Prometheus scrapes it on a 15-second interval. Grafana visualises request rate, prediction latency, and error rate.
-5. **Model updates:** Retraining produces a new MLflow run. Promoting the new version to `Production` and calling `POST /reload` on the serving pod hot-swaps the model — no pod restart, no downtime.
+1. **Scaling (every KEDA poll).** The scaler reads the last `timeSteps` samples of the workload's demand from Prometheus, normalises them, calls `POST /predict`, and reports `max(forecast over the horizon, observed)` to KEDA. KEDA's HPA sets `replicas = ceil(reported / targetValue)`.
+2. **Model quality (every forecast horizon).** forecast-serving keeps its recent forecasts in memory; when a later window carries the value it forecast, it records the error per horizon step. `ForecastDriftHigh` fires when the rolling MAE stays high.
+3. **Retraining (nightly).** The CronJob pulls recent history from Prometheus, trains four candidates, applies the level-tracking gate, compares the winner with the current champion on data neither has seen, moves the `@champion` alias in MLflow and calls `/reload`.
+4. **Deployment.** CI publishes four images to GHCR; `scripts/up.sh` installs the chart on kind, trains the first model in-cluster and smoke-tests the REST and gRPC APIs; `e2e.yml` adds ten minutes of load with assertions.
+
+A fuller treatment, with the decisions table: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
 ## Components
 
-### Training Pipeline (`notebooks/`)
+### Retraining pipeline (`training/`)
 
-A notebook-based pipeline that covers EDA, feature engineering, model training, evaluation, and MLflow logging. Eight model families are trained and compared on the same train/test split. All runs are tracked: hyperparameters, RMSE, artifacts. The notebook's final cell registers the best sklearn model to the MLflow Model Registry.
+`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`), scores them on a chronological holdout and registers the winner with its scaler and `forecast_meta.json`. Promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
 
-This is intentionally simple — the goal is demonstrating the MLflow integration contract, not building a sophisticated training system.
+### Model registry (MLflow)
 
-### Model Registry (MLflow)
+Versioned models with a `@champion` alias the pipeline moves atomically; artifacts are served through the MLflow server (no shared volume). The serving layer loads `models:/cpu-forecasting@champion` and falls back to the legacy `Production` stage, so notebook-registered models still work.
 
-Deployed as a Kubernetes `Deployment` with a `PersistentVolumeClaim` backing the artifact store and SQLite metadata backend. Provides:
+### Inference service (`serving/`)
 
-- Experiment tracking across all training runs
-- Versioned model storage with stage transitions (`None → Staging → Production`)
-- Artifact co-location: the model and its preprocessing scaler are stored together under the same run
+A stateless FastAPI service: validates the window, applies the stored scaler and the model's feature/target transform, returns the whole horizon, hot-swaps the model on `/reload` without a restart, and scores its own past forecasts (`serving/quality.py`). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve.
 
-The serving layer depends on MLflow at startup. The model URI is `models:/cpu-forecasting/Production` — the serving service never references a specific run ID directly.
+### Predictive scaler (`scaler/`)
 
-### Inference Service (`serving/`)
-
-A stateless FastAPI application. Its role in the system is to translate a sequence of recent infrastructure observations into a scalar forecast that a controller can act on. It handles:
-
-- Loading the `Production` model and scaler from MLflow at startup
-- Input validation and preprocessing (inverse-scaling on output so consumers work in original units)
-- Structured JSON responses with model provenance metadata
-- Prometheus metrics via `prometheus-fastapi-instrumentator`
-- Hot reload without pod restart (`POST /reload`)
-
-Because the service is stateless and all state lives in MLflow, horizontal scaling is straightforward: add replicas, each pod loads the model independently.
+A KEDA external scaler (gRPC). Each `ScaledObject` carries its own PromQL query, target per replica, `capacity` (units conversion) and forecast settings in trigger metadata, so one deployment serves any number of workloads. Failure policy, metrics and metadata reference: [scaler/README.md](scaler/README.md).
 
 ### Observability (`monitoring/`)
 
-Prometheus is configured to scrape the serving pod via static config and pod annotations (`prometheus.io/scrape: "true"`). Collected metrics include HTTP request count by endpoint, request duration histograms, and standard Python process metrics.
+Prometheus discovers annotated pods in the namespace; alert rules cover availability, latency, model health, forecast drift and scaler fallbacks, each with a runbook in `docs/runbooks/`; three Grafana dashboards are provisioned from `monitoring/dashboards/` and validated in CI.
 
-Grafana is deployed alongside Prometheus. In a production system, the dashboards would include prediction latency SLOs, error rate alerts, and model version tracking. Here the stack is deployed and functional; dashboard definitions are not committed.
+### Benchmark (`bench/`)
 
----
-
-## Inference Service
-
-### Who calls it
-
-In a real integration, `/predict` would be called by:
-
-- A **KEDA external scaler** — KEDA supports custom scalers that query arbitrary HTTP endpoints; the scaler would send recent observations and use the prediction to compute a target replica count
-- A **custom HPA adapter** — Kubernetes' External Metrics API allows HPA to scale on arbitrary metrics; a bridge service could call `/predict` and expose the result as a custom metric
-- A **capacity planning tool** — batch queries over historical windows to backtest how much earlier scaling could have triggered
-- A **scheduler sidecar** — deciding whether to defer a batch job based on predicted headroom
-
-### Design assumptions
-
-The service assumes:
-- Observations arrive at fixed 5-minute intervals
-- The caller provides the last 10 values in raw (unscaled) form
-- The caller is responsible for buffering and windowing; the service is stateless per request
-- The forecast horizon is one step (5 minutes); multi-step forecasting would require a different model
+A compressed-day load generator and a workflow that runs the same day under a CPU HPA and under the predictive scaler, then writes [docs/benchmark.md](docs/benchmark.md). Method and caveats: [bench/README.md](bench/README.md).
 
 ---
 
@@ -122,41 +86,49 @@ The service assumes:
 
 ### `POST /predict`
 
-Accepts the last N CPU utilization values (where N matches `TIME_STEPS`, default 10). Returns the predicted value for the next interval.
+Takes the last `time_steps` values of the series (raw units, `step_seconds` apart — both in `GET /model-info`) and returns the forecast for every step of the model's horizon.
 
 **Request:**
 ```json
 {
-  "values": [0.20, 0.25, 0.30, 0.28, 0.22, 0.35, 0.40, 0.38, 0.33, 0.29]
+  "values": [0.20, 0.25, 0.30, 0.28, 0.22, 0.35, 0.40, 0.38, 0.33, 0.29],
+  "series": "predictive/cpu-burner",
+  "timestamp": 1700000000,
+  "step_seconds": 300
 }
 ```
+
+`series`, `timestamp` (unix time of the last value) and `step_seconds` (their spacing, when it differs from the model's) are optional. They let the service score this forecast against the actual value a later window brings; the KEDA scaler sends all three so forecasts for different `ScaledObject`s are never compared with each other's data.
 
 **Response:**
 ```json
 {
   "prediction": 0.2966,
+  "predictions": [0.2966, 0.3102, 0.3187, 0.3140, 0.3055, 0.2990],
+  "step_seconds": 300,
   "model": "cpu-forecasting",
-  "stage": "Production"
+  "stage": "@champion",
+  "model_version": "3"
 }
 ```
 
-The `model` and `stage` fields in the response are intentional: they let the caller verify which model version served the prediction. This matters in environments where multiple model versions may be staged concurrently.
+`prediction` is the first step; `predictions` covers the horizon (one value for notebook-registered models). `stage` and `model_version` say which registry entry served the answer, so a caller can see a model swap between requests.
 
 ### `POST /reload`
 
-Triggers a hot reload of the `Production` model from MLflow. The serving pod acquires the new model in memory without restarting. Designed for the retraining workflow: promote new version in MLflow → call `/reload` → zero-downtime model swap.
+Re-fetches the champion from MLflow and swaps it in memory, atomically with its scaler and metadata. The retraining job calls it after moving the alias. On failure the previous model keeps serving and the call returns 500.
 
-### `GET /health`
+### `GET /model-info`
 
-Returns model load status. Used by Kubernetes readiness and liveness probes. The pod is only marked ready when a model is loaded — preventing traffic from reaching an uninitialized pod.
+Loaded version, run id, `time_steps`, `horizon`, `step_seconds`, feature/target kinds, and the current rolling MAE per horizon step.
 
-```json
-{"status": "ok", "model_loaded": true}
-```
+### `GET /live`, `GET /ready`
+
+Liveness (process up) and readiness (a model is loaded). Split on purpose: a pod waiting for MLflow is alive but not ready, and must not be restarted for it.
 
 ### `GET /metrics`
 
-Prometheus-format metrics endpoint. Exposes HTTP counters, duration histograms, and process metrics. Scraped by Prometheus every 15 seconds.
+Prometheus format: HTTP metrics from `prometheus-fastapi-instrumentator` plus the `forecast_*` metrics below.
 
 ---
 
@@ -167,13 +139,23 @@ The serving layer is instrumented with `prometheus-fastapi-instrumentator`, whic
 - `http_requests_total` — request count by endpoint and status code
 - `http_request_duration_seconds` — latency histogram
 
+On top of that the service measures its own **forecast quality** without any external store (`serving/quality.py`): every forecast is kept in memory, and when a later `/predict` window carries the value that was forecast, the error is recorded per horizon step:
+
+- `forecast_abs_error{horizon_step}` — histogram of |actual − forecast|
+- `forecast_rolling_mae{horizon_step}` — mean absolute error over the last 100 resolved forecasts (also in `GET /model-info`)
+- `forecast_model_info{model_version,...}` — which version is serving
+
+Memory is bounded (series × pending forecasts × rolling window, all configurable). The scaler's own metrics (`predictive_scaler_*`, see [`scaler/README.md`](scaler/README.md)) show observed vs predicted vs reported demand per `ScaledObject`.
+
+**Dashboards and rules as code.** `monitoring/dashboards/*.json` and `monitoring/prometheus-rules.yaml` are the sources; `python monitoring/render.py` validates them (panel grid, unique ids, every PromQL metric and label name checked against what the code exports, a runbook for every alert) and syncs them into the Helm chart's ConfigMaps. CI runs it with `--check`.
+
+**Alerts and runbooks.** `monitoring/prometheus-rules.yaml`: `ForecastDriftHigh` (rolling MAE above threshold for 30 min), `ScalerFallbackRate` (over half of decisions on observed demand for 15 min), `ScalerPrometheusErrors` (KEDA is applying the fallback), plus the availability, latency and model-health SLOs. Each alert's `runbook_url` points to `docs/runbooks/<Alert>.md`, and CI fails if the file is missing.
+
 This matters for two reasons beyond standard uptime monitoring:
 
 1. **Prediction latency is a hard constraint.** If this service sits in a scaling control loop, a slow response delays the scaling decision. A latency regression in the inference path should be treated the same as a latency regression in a critical API.
 
 2. **Request rate reflects controller behavior.** Sudden drops or spikes in `/predict` call rate indicate upstream changes (autoscaler reconfiguration, controller failures). The metric acts as a proxy for control plane health.
-
-In a production deployment, the Grafana dashboard would include alerting rules on p99 latency and error rate.
 
 ---
 
@@ -211,7 +193,7 @@ Prometheus ──query_range (last 10 samples)──► predictive-scaler ──
 - **Forecast adds capacity, never removes it.** In the default `max` mode the scaler reports `max(forecast, observed)`, so the forecast can scale up ahead of load but cannot scale below what is in use right now. `mode: forecast` trusts the model fully.
 - **Degrades to reactive, not to zero.** If forecast-serving is down or the history window is not full yet, the scaler reports observed demand — the workload keeps scaling like a plain HPA. If Prometheus itself fails, it returns a gRPC error and KEDA applies the `ScaledObject`'s `fallback` replicas instead of the scaler inventing a number.
 - **Observable.** Per-`ScaledObject` metrics for observed, predicted and reported demand, desired replicas, fallbacks and forecast latency; native gRPC health probes.
-- **Why not `/recommend-scale`.** That endpoint returns a scale-up/down/hold verdict against thresholds. KEDA needs a number it can divide by a per-replica target, so the scaler calls `/predict` and does the replica arithmetic itself.
+- **Why a number, not a verdict.** An earlier prototype endpoint returned scale-up/down/hold against thresholds. KEDA needs a number it can divide by a per-replica target, so the scaler calls `/predict` and does the replica arithmetic itself; the verdict endpoint was removed.
 
 ### Other integration options
 
@@ -229,7 +211,7 @@ VPA adjusts resource requests/limits, not replica count. For workloads where the
 
 ### Why Random Forest
 
-Eight model families were evaluated on the same holdout period (last 4 days of a 24-day dataset):
+Eight model families were evaluated in the notebook on the same holdout period (the last 20%, about 3 days, of a 15-day dataset: 10–25 January 2022 at 5-minute resolution):
 
 | Model | Test RMSE |
 |---|---|
@@ -242,7 +224,7 @@ Eight model families were evaluated on the same holdout period (last 4 days of a
 
 The baseline uses in-sample hourly averages as predictions — it is a reference point to sanity-check the others, not a deployable model.
 
-Neural networks (RNN, LSTM, GRU) underperform on this dataset. 7,200 training points at 5-minute intervals is not enough for sequence models to learn meaningful temporal structure beyond what the tree-based models capture with a simple sliding window. Random Forest with 10-step lag features achieves better generalisation with no hyperparameter tuning.
+Neural networks (RNN, LSTM, GRU) underperform on this dataset. About 3,500 training windows at 5-minute intervals is not enough for sequence models to learn meaningful temporal structure beyond what the tree-based models capture with a simple sliding window. Random Forest with 10-step lag features achieves better generalisation with no hyperparameter tuning.
 
 The general principle applies beyond this dataset: for short time-series with strong periodicity, classical ML with appropriate feature engineering frequently outperforms deep learning. The right model for the task depends on data volume, not what is currently fashionable.
 
@@ -265,17 +247,17 @@ MLflow provides the model versioning and stage promotion semantics needed to saf
 These are known simplifications, not omissions:
 
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
-- **No drift alerting yet.** Retraining runs on a schedule (`k8s/retrain-cronjob.yaml`), but nothing yet compares live forecasts with what actually happened, so a model that degrades between runs is not flagged.
-- **Autoscaling not yet benchmarked in a cluster.** The KEDA external scaler is implemented and tested (unit tests plus gRPC tests through the generated client), and checked end-to-end against the real forecast service, but there is no measured comparison with a reactive HPA yet.
-- **Short, noisy history.** One month of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
-- **No persistent Grafana dashboards.** Dashboard definitions are not committed to the repository. In a real system, dashboards would be version-controlled and provisioned via ConfigMap.
-- **Local Kubernetes only.** Manifests use NodePort and Minikube-specific image loading. This is appropriate for local development; production would use `Ingress`, image registries, and namespace RBAC.
+- **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
+- **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It is one sample and shows the mechanism, not a capacity figure.
+- **No anticipation before a ramp starts.** The model sees only the last ten samples, so the forecast rises with the ramp, not ahead of it. Time-of-day features are the next step (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+- **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
+- **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 
 ---
 
 ## Retraining Pipeline
 
-The notebook is the exploration record; production models come from [`training/`](training/README.md), run nightly by `k8s/retrain-cronjob.yaml`:
+The notebook is the exploration record; production models come from [`training/`](training/README.md), run nightly by the chart's `forecast-retrain` CronJob:
 
 ```
 Prometheus (14 days) → regularise + fill gaps → train candidates → holdout RMSE
@@ -302,149 +284,130 @@ Other properties:
 - **Registry aliases, not stages.** Serving loads `models:/cpu-forecasting@champion` and falls back to the legacy `Production` stage, so notebook-registered models keep working.
 - **Pinned transitive dependencies.** MLflow 2.11 fails to import with setuptools ≥ 81 and SQLAlchemy 2.1; both are now pinned in serving and training.
 
+## Benchmark Results
+
+Predictive scaler vs a plain CPU HPA, same kind cluster, same compressed day of load with two ramps ([docs/benchmark.md](docs/benchmark.md), method in [bench/README.md](bench/README.md)):
+
+| | Reactive HPA | Predictive | |
+|---|---|---|---|
+| Morning ramp: time to the 3 replicas it needed | 165 s | 60 s | −64% |
+| Morning ramp: p95 latency | 77 ms | 71 ms | −8% |
+| Afternoon ramp, peak, whole day: p95 latency | same | same | |
+| Replica-minutes over the day | 96.75 | 109 | +13% |
+
+What that says, honestly:
+
+- **The forecast helps where capacity has to grow from a low base.** On the morning ramp the predictive scaler had the capacity in place about 100 s sooner and latency during the ramp was lower.
+- **Part of that is not foresight.** The scaler entered the ramp with two replicas instead of one: `forecastAggregation: max` over a noisy night occasionally asked for a second replica, and each request reset the HPA's 300-second scale-down window. The forecast itself rose only once the ramp was visible in the ten-sample window; with no time-of-day features the model extrapolates a ramp that has started, it does not anticipate one that has not.
+- **Where the HPA already holds capacity, there is nothing to win.** Both scalers kept three replicas through the lunch dip, so the afternoon ramp, the peak and the worst minute look the same, and neither run had a request over 500 ms.
+- **It costs.** 13% more replica-minutes, mostly the second replica held overnight.
+
+The setup matters as much as the model: the first run of this benchmark trained the model on raw cores while the scaler fed it `demand / capacity`, and the forecast over-provisioned all night. The CronJob now trains on exactly the series the scaler sends (and CI checks the rendered query).
+
 ## Future Work
 
 Stage-by-stage plan with ready-to-run briefs: [docs/ROADMAP.md](docs/ROADMAP.md).
 
-**Predictive vs reactive benchmark**  
-Run the demo workload under a daily traffic pattern twice — once with a CPU-based HPA, once with the predictive scaler — and compare p95 latency during ramps and idle replica-minutes. This is what turns the prototype into evidence. (The KEDA external scaler it relies on is implemented in `scaler/`.)
-
 **Additional signals**  
 Add memory utilisation and request queue depth as input features. CPU alone is a weak proxy for capacity need in memory-bound or I/O-bound workloads.
 
-**Model drift alerting**  
-Compare rolling prediction error against a baseline. A Prometheus alert on prediction MAE regression triggers retraining — making degradation observable before it affects scaling decisions.
+**GPU workloads**  
+The notebook's sequence models already run on CUDA when it is available; the production pipeline is CPU-only scikit-learn because the data is small. For GPU inference workloads the same pattern applies with a different demand metric (GPU utilisation or queue depth); serving and the scaler do not change.
 
-**GPU workload support**  
-The training code is device-agnostic (`device = 'cuda' if available`). For GPU inference workloads, the same forecasting pattern applies with different metric sources. The serving infrastructure does not change.
+**Alert-triggered retraining**  
+`ForecastDriftHigh` already measures the regression; the next step is to let it start the retraining job (Alertmanager webhook → `kubectl create job`) instead of waiting for the nightly run.
 
 ---
 
 ## Quick Start
 
-### Option A — Helm (recommended)
+Everything runs on a local [kind](https://kind.sigs.k8s.io/) cluster from one script — the same script CI runs ([`.github/workflows/e2e.yml`](.github/workflows/e2e.yml)). Needs `docker`, `kind`, `kubectl`, `helm`, `curl`.
 
 ```bash
-minikube start
-kubectl apply -f mlflow/k8s.yaml
-
-eval $(minikube docker-env)
-docker build -t cpu-serving:latest serving/
-
-# Deploy observability stack
-kubectl apply -f monitoring/prometheus-rules.yaml
-kubectl apply -f monitoring/prometheus-config.yaml
-kubectl apply -f monitoring/loki.yaml
-kubectl apply -f monitoring/grafana.yaml
-
-# Deploy serving via Helm
-helm install forecast-serving helm/forecast-serving/ \
-  --set image.tag=latest \
-  --set mlflow.trackingUri=http://mlflow:5000
-
-kubectl get pods
+./scripts/up.sh
 ```
 
-### Option B — raw manifests (local dev)
+What it does: creates the cluster (with ingress-nginx and metrics-server), builds the four images and loads them into kind, installs the [`helm/predictive-stack`](helm/predictive-stack/) umbrella chart (MLflow, Prometheus, Grafana, forecast-serving, predictive-scaler, KEDA, the demo workload with its `ScaledObject`, the retraining CronJob), trains the first model from `notebooks/data-jan-2022.json` in-cluster and calls `/reload`, then smoke-tests `/predict` and the scaler's gRPC API. About 10 minutes on a laptop.
+
+Then:
+
+| | |
+|---|---|
+| Grafana (admin/admin) | http://grafana.localhost |
+| Prometheus | http://prometheus.localhost |
+| MLflow | http://mlflow.localhost |
+| Forecast API | http://forecast.localhost/docs |
+
+`*.localhost` resolves to the cluster's ingress on Linux (systemd-resolved) and in browsers; elsewhere add the four hosts to `/etc/hosts` as `127.0.0.1`, or set `DOMAIN=127.0.0.1.nip.io`.
 
 ```bash
-minikube start
-kubectl apply -f mlflow/k8s.yaml
-eval $(minikube docker-env)
-docker build -t cpu-serving:latest serving/
-kubectl apply -f k8s/serving.yaml
-kubectl apply -f monitoring/prometheus-rules.yaml
-kubectl apply -f monitoring/prometheus-config.yaml
-kubectl apply -f monitoring/loki.yaml
-kubectl apply -f monitoring/grafana.yaml
-kubectl get pods
-```
-
-**Train a model and register it to MLflow** (sets the `@champion` alias):
-```bash
-pip install -r training/requirements.txt
-MLFLOW_TRACKING_URI=http://192.168.49.2:30500 PYTHONPATH=training \
-  python -m forecast_training --export notebooks/data-jan-2022.json \
-    --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z
-```
-Nightly retraining from live Prometheus: build `training/` into the cluster and apply `k8s/retrain-cronjob.yaml`.
-The notebook (`notebooks/project.ipynb`) remains as the exploration record; models it promotes to the `Production` stage are still served when no `@champion` alias exists.
-
-**Load model into the running service:**
-```bash
-curl -X POST http://192.168.49.2:30800/reload
-```
-
-**Test:**
-```bash
-# Health check
-curl http://192.168.49.2:30800/health
-
 # Inference
-curl -X POST http://192.168.49.2:30800/predict \
-  -H 'Content-Type: application/json' \
+curl -X POST http://forecast.localhost/predict -H 'Content-Type: application/json' \
   -d '{"values":[0.2,0.25,0.3,0.28,0.22,0.35,0.4,0.38,0.33,0.29]}'
 
-# MLflow UI
-open http://192.168.49.2:30500
-
-# Prometheus
-open http://192.168.49.2:30900
-
-# Grafana (admin/admin) — Prometheus + Loki datasources pre-provisioned
-open http://192.168.49.2:30300
+# Watch the demo scale (see demo/README.md for load generation)
+kubectl -n predictive get hpa,scaledobject,pods -w
+kubectl -n predictive logs deploy/predictive-scaler -f
 ```
+
+Knobs (environment variables of `up.sh`): `IMAGE_TAG` (`dev` builds locally; a commit sha pulls the images CI published to GHCR), `STEP_SECONDS=30` to compress time so the forecast window fills in 5 minutes instead of 50, `DEMO_SCALING=hpa` for the reactive baseline, `TRAIN=0` / `SMOKE=0` to skip steps. Re-running upgrades the release in place; `kind delete cluster --name predictive` removes everything.
+
+### Pieces on their own
+
+- **Images** are published by CI to `ghcr.io/m0zart89/predictive-scaling-system/{forecast-serving,predictive-scaler,cpu-burner,forecast-training}:{<sha>,latest}` on every push to `main`.
+- **Helm charts**: `helm/predictive-stack` installs the whole system (`helm dependency build` first — KEDA is a dependency); `helm/forecast-serving` and `helm/predictive-scaler` work standalone.
+- **Plain manifests**: `helm template predictive helm/predictive-stack -n predictive --set demo.scaling=predictive > stack.yaml` renders everything for `kubectl apply` (install KEDA's CRDs first).
+- **Train a model** from anywhere with access to MLflow:
+  ```bash
+  pip install -r training/requirements.txt
+  MLFLOW_TRACKING_URI=http://mlflow.localhost PYTHONPATH=training \
+    python -m forecast_training --export notebooks/data-jan-2022.json \
+      --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z --reload-url http://forecast.localhost
+  ```
+  The notebook (`notebooks/project.ipynb`) remains as the exploration record; models it promotes to the `Production` stage are still served when no `@champion` alias exists.
 
 ---
 
 ## Project Structure
 
 ```
-vuna/
-├── .github/
-│   └── workflows/
-│       └── ci.yml               # Lint → tests → image builds → helm lint pipeline
-├── training/                    # Retraining pipeline: candidates, level-tracking gate, MLflow aliases
-│   ├── forecast_training/       # data, features (shared contract), models, registry, CLI
-│   ├── tests/                   # unit + end-to-end against a SQLite MLflow registry
-│   └── Dockerfile
+predictive-scaling-system/
+├── .github/workflows/
+│   ├── ci.yml                   # lint → tests → dashboards check → images (→ GHCR on main) → helm lint
+│   ├── e2e.yml                  # up.sh on kind, 10 min of load, scaling assertions
+│   └── benchmark.yml            # predictive vs reactive, manual + weekly, commits docs/benchmark.md
+├── serving/                     # FastAPI inference service
+│   ├── app.py                   # /predict, /reload, /model-info, probes
+│   └── quality.py               # forecast error tracking (forecast_abs_error / forecast_rolling_mae)
 ├── scaler/                      # KEDA external scaler (gRPC): Prometheus → /predict → replicas
 │   ├── predictive_scaler/       # config, clients, decision engine, gRPC server, metrics
-│   ├── tests/                   # unit + gRPC tests
-│   ├── gen_proto.sh             # regenerate gRPC stubs from externalscaler.proto
-│   └── Dockerfile
-├── demo/                        # cpu-burner workload + ScaledObject + walkthrough
+│   └── tests/
+├── training/                    # retraining pipeline: candidates, level-tracking gate, MLflow aliases
+│   ├── forecast_training/       # data, features (shared contract), models, registry, CLI
+│   └── tests/
 ├── helm/
-│   ├── predictive-scaler/       # Helm chart for the scaler
-│   └── forecast-serving/        # Helm chart (production deployment path)
-│       ├── Chart.yaml
-│       ├── values.yaml
-│       └── templates/
-│           ├── deployment.yaml
-│           ├── service.yaml
-│           ├── secret.yaml      # MLflow URI stored as K8s Secret
-│           ├── hpa.yaml         # HorizontalPodAutoscaler (opt-in)
-│           ├── ingress.yaml     # Ingress (opt-in)
-│           └── serviceaccount.yaml
-├── serving/
-│   ├── app.py                   # FastAPI inference service
-│   ├── Dockerfile
-│   └── requirements.txt
-├── notebooks/
-│   ├── project.ipynb            # EDA, training, MLflow logging
-│   └── data-jan-2022.json       # Raw Prometheus export (input data)
-├── mlflow/
-│   └── k8s.yaml                 # Deployment + PVC + Service
-├── k8s/
-│   ├── serving.yaml             # Raw manifests (local dev alternative to Helm)
-│   └── retrain-cronjob.yaml     # Nightly retraining job
+│   ├── predictive-stack/        # umbrella chart: the whole system, KEDA as a dependency
+│   │   └── files/               # dashboards and rules synced from monitoring/ by render.py
+│   ├── forecast-serving/        # standalone chart for the service
+│   └── predictive-scaler/       # standalone chart for the scaler
+├── scripts/
+│   ├── up.sh                    # kind cluster → helm install → train → smoke tests
+│   ├── e2e.sh                   # load + verify scaling (used by e2e.yml)
+│   └── kind-config.yaml
+├── bench/                       # load generator, run.sh, collect.py, report.py
 ├── monitoring/
-│   ├── prometheus-config.yaml   # Prometheus ConfigMap + Deployment + Service
-│   ├── prometheus-rules.yaml    # Alerting rules (availability + latency SLOs)
-│   ├── grafana.yaml             # Grafana + provisioned datasources + dashboard
-│   └── loki.yaml                # Loki log aggregation
+│   ├── dashboards/              # Grafana dashboards (source of truth, JSON)
+│   ├── prometheus-rules.yaml    # alerting rules (source of truth)
+│   └── render.py                # validates dashboards + rules, syncs them into the chart
+├── demo/                        # cpu-burner workload (image) and walkthrough
 ├── docs/
-│   └── ROADMAP.md               # Done / next stages with briefs for each
+│   ├── ROADMAP.md               # stages: done and briefs
+│   ├── benchmark.md             # generated by benchmark.yml
+│   ├── pitch.md                 # the project in nine sentences
+│   └── runbooks/                # one page per alert
+├── notebooks/                   # exploration record + the January 2022 export
+├── tests/                       # serving, training↔serving contract, monitoring, bench
 ├── ARCHITECTURE.md
+├── CHANGELOG.md
 └── README.md
 ```
