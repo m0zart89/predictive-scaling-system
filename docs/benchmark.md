@@ -28,4 +28,5 @@ Same kind cluster, same cpu-burner workload (500m CPU per replica, up to 4 repli
 
 - *Time to N replicas* runs from the moment the simulated clock enters the ramp until N cpu-burner pods are running, where N is the smaller of the two runs' peaks inside the ramp (0 s: already there). The HPA reacts to CPU already above target; the predictive scaler reports `max(forecast, observed)`, so it can only be earlier when the forecast rises before the observed demand does, or when it never scaled down.
 - *Replica-minutes* are the cost side: a scaler that is early but over-provisions pays here.
+- The chart's *desired* line is the scaler's `ceil(reported / targetValue)`. The HPA KEDA manages ignores changes within its 10% tolerance, so desired can sit one above the running count without anything being unschedulable.
 - Both runs share one small node (the CI runner), so absolute latencies are noisy; the comparison between runs is the point, and it is one sample. The weekly run keeps the history in the workflow artifacts.

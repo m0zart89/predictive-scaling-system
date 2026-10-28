@@ -250,6 +250,9 @@ def markdown(a: dict, b: dict, runs: Sequence[dict], png: Optional[str]) -> str:
         "scaler reports `max(forecast, observed)`, so it can only be earlier when the forecast "
         "rises before the observed demand does, or when it never scaled down.",
         "- *Replica-minutes* are the cost side: a scaler that is early but over-provisions pays here.",
+        "- The chart's *desired* line is the scaler's `ceil(reported / targetValue)`. The HPA KEDA "
+        "manages ignores changes within its 10% tolerance, so desired can sit one above the "
+        "running count without anything being unschedulable.",
         "- Both runs share one small node (the CI runner), so absolute latencies are noisy; the "
         "comparison between runs is the point, and it is one sample. The weekly run keeps the "
         "history in the workflow artifacts.",

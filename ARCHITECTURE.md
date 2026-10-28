@@ -154,7 +154,7 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 
 Two runs of the same compressed day on the same cluster — a CPU HPA at 70% and the predictive scaler with `mode=max`, `forecastAggregation=max` — compared on p95 latency during the ramps, the share of slow requests, replica-minutes and time to first scale-up. The method and caveats are in [bench/README.md](bench/README.md); the latest numbers in [docs/benchmark.md](docs/benchmark.md).
 
-The honest frame: on a periodic pattern the forecast can only help at the ramps, and only if the window already shows the ramp starting. On flat load the two scalers behave identically; on an unprecedented spike the delta model follows but cannot anticipate.
+Result of the run in the repository: on the morning ramp the predictive scaler had the needed capacity about 100 s sooner (60 s vs 165 s) and p95 during the ramp was 8% lower; on the afternoon ramp and at peak there was no difference, because the HPA had not scaled down over the lunch dip; the cost was 13% more replica-minutes. Part of the morning gain came from a replica the predictive run held overnight (noise through `forecastAggregation: max` resetting the scale-down window), and the forecast rose only once the ramp was visible in its window. That is the frame to read it in: with a ten-sample window and no time-of-day features the model follows a ramp quickly, it does not see one coming.
 
 ---
 

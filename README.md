@@ -248,7 +248,8 @@ These are known simplifications, not omissions:
 
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
 - **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
-- **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It shows the mechanism, not a capacity figure.
+- **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It is one sample and shows the mechanism, not a capacity figure.
+- **No anticipation before a ramp starts.** The model sees only the last ten samples, so the forecast rises with the ramp, not ahead of it. Time-of-day features are the next step (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 - **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
 - **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 
@@ -282,6 +283,26 @@ Other properties:
 - **Fair champion comparison.** Each registered version is tagged with `data_end_ts`; the next run compares against it only on windows after that point (and keeps the champion if there are too few), because a model always looks best on data it was fitted to.
 - **Registry aliases, not stages.** Serving loads `models:/cpu-forecasting@champion` and falls back to the legacy `Production` stage, so notebook-registered models keep working.
 - **Pinned transitive dependencies.** MLflow 2.11 fails to import with setuptools ≥ 81 and SQLAlchemy 2.1; both are now pinned in serving and training.
+
+## Benchmark Results
+
+Predictive scaler vs a plain CPU HPA, same kind cluster, same compressed day of load with two ramps ([docs/benchmark.md](docs/benchmark.md), method in [bench/README.md](bench/README.md)):
+
+| | Reactive HPA | Predictive | |
+|---|---|---|---|
+| Morning ramp: time to the 3 replicas it needed | 165 s | 60 s | −64% |
+| Morning ramp: p95 latency | 77 ms | 71 ms | −8% |
+| Afternoon ramp, peak, whole day: p95 latency | same | same | |
+| Replica-minutes over the day | 96.75 | 109 | +13% |
+
+What that says, honestly:
+
+- **The forecast helps where capacity has to grow from a low base.** On the morning ramp the predictive scaler had the capacity in place about 100 s sooner and latency during the ramp was lower.
+- **Part of that is not foresight.** The scaler entered the ramp with two replicas instead of one: `forecastAggregation: max` over a noisy night occasionally asked for a second replica, and each request reset the HPA's 300-second scale-down window. The forecast itself rose only once the ramp was visible in the ten-sample window; with no time-of-day features the model extrapolates a ramp that has started, it does not anticipate one that has not.
+- **Where the HPA already holds capacity, there is nothing to win.** Both scalers kept three replicas through the lunch dip, so the afternoon ramp, the peak and the worst minute look the same, and neither run had a request over 500 ms.
+- **It costs.** 13% more replica-minutes, mostly the second replica held overnight.
+
+The setup matters as much as the model: the first run of this benchmark trained the model on raw cores while the scaler fed it `demand / capacity`, and the forecast over-provisioned all night. The CronJob now trains on exactly the series the scaler sends (and CI checks the rendered query).
 
 ## Future Work
 
