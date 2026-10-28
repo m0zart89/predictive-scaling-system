@@ -201,6 +201,8 @@ jobs:
           grep -q 'forecast_rolling_mae' /tmp/stack.yaml
           grep -q 'alert: ForecastDriftHigh' /tmp/stack.yaml
           grep -q 'kind: ScaledObject' /tmp/stack.yaml
+          # the CronJob trains on what the scaler feeds the model: demand / capacity
+          grep -Fq '[1m]))) / 2.5"' /tmp/stack.yaml
 
   # Placeholder job — shows the intended CD path without implementing it
   # In a real cluster, this would use ArgoCD image updater or a Helm upgrade action.

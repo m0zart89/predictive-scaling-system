@@ -68,7 +68,7 @@ jobs:
           BUILD_IMAGES: "1"
           STEP_SECONDS: "30"
           DEMO_SCALING: none
-          MAX_REPLICAS: "6"
+          MAX_REPLICAS: "4"
           TRAIN: "0"
           SMOKE: "0"
         run: ./scripts/up.sh
@@ -79,7 +79,7 @@ jobs:
           DAY_SECONDS: ${{ github.event.inputs.day_seconds || '2400' }}
           WARMUP_DAYS: ${{ github.event.inputs.warmup_days || '2' }}
           STEP_SECONDS: "30"
-          MAX_REPLICAS: "6"
+          MAX_REPLICAS: "4"
           OUT_DIR: bench-results
         run: ./bench/run.sh
 

@@ -17,7 +17,7 @@ Prometheus that feeds the scaler records what the clients experienced:
   bench_sim_hour                            simulated hour of day (0-24), to locate the ramps
 
 Environment: TARGET (http://cpu-burner:8080), DAY_SECONDS (2400), DAYS (1),
-WORK_MS (50), THINK_MS (100), METRICS_PORT (8000).
+WORK_MS (25), THINK_MS (100), METRICS_PORT (8000).
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 TARGET = os.getenv("TARGET", "http://cpu-burner:8080")
 DAY_SECONDS = float(os.getenv("DAY_SECONDS", "2400"))
 DAYS = float(os.getenv("DAYS", "1"))
-WORK_MS = int(os.getenv("WORK_MS", "50"))
+WORK_MS = int(os.getenv("WORK_MS", "25"))
 THINK_MS = int(os.getenv("THINK_MS", "100"))
 TIMEOUT = float(os.getenv("TIMEOUT_SECONDS", "10"))
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))

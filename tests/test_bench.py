@@ -74,9 +74,15 @@ def test_summary_metrics(tmp_path):
     assert s["error_share"] == pytest.approx(0.01)
     assert s["mean_latency"] == pytest.approx(0.15)
     assert s["replicas_max"] == 4
-    # replicas = ceil(clients / 2) lagged by 120 s: the ramp reaches 3 clients 60 s in,
-    # so the first scale-up lands 180 s after the ramp starts (±1 sample of 15 s)
-    assert s["ramps"][0]["time_to_scale_up"] == pytest.approx(180, abs=15)
+    # replicas = ceil(clients / 2) lagged by 120 s; ramp 1 (1 → 6 clients) needs 3
+    # replicas, reached when the lagged client count hits 5
+    loaded = report.load(str(path))
+    s = report.summarize(loaded, [report.ramp_need([loaded], 0), report.ramp_need([loaded], 1)])
+    assert s["ramps"][0]["need"] == 3
+    assert s["ramps"][0]["replicas_at_start"] == 1
+    # clients round to 5 at 1.4 h into the 2 h ramp = 140 s (100 s per simulated hour),
+    # plus the 120 s lag → 260 s, seen at the next 15 s sample
+    assert s["ramps"][0]["time_to_capacity"] == pytest.approx(260, abs=15)
     assert s["ramps"][0]["p95_max"] > s["p95_day_mean"]
     assert s["replica_minutes"] == pytest.approx(sum(v for _, v in run["series"]["replicas"]) * 15 / 60)
     assert s["forecast_decisions"] == pytest.approx(2.0 * (2400 // 15))
@@ -91,10 +97,24 @@ def test_report_markdown_compares_runs(tmp_path):
     assert report.main([str(pa), str(pb), "--out", str(out), "--no-png"]) == 0
     text = out.read_text()
     assert "| Metric | A: reactive HPA | B: predictive | B vs A |" in text
-    assert "time to first scale-up" in text and "better" in text
-    sa, sb = report.summarize(report.load(str(pa))), report.summarize(report.load(str(pb)))
-    assert sb["ramps"][0]["time_to_scale_up"] < sa["ramps"][0]["time_to_scale_up"]
+    assert "better" in text
+    runs = [report.load(str(pa)), report.load(str(pb))]
+    needs = [report.ramp_need(runs, i) for i in range(2)]
+    sa, sb = report.summarize(runs[0], needs), report.summarize(runs[1], needs)
+    assert sb["ramps"][0]["time_to_capacity"] < sa["ramps"][0]["time_to_capacity"]
     assert sb["p95_ramp_mean"] < sa["p95_ramp_mean"]
+    assert "replicas running at its start" in text and "time to 3 replicas" in text
+    assert " of 1000 |" in text                      # counts are whole numbers
+
+
+def test_capacity_already_there_is_zero_and_missing_fallbacks_are_zero():
+    replicas = [(0.0, 4.0), (15.0, 4.0)]
+    assert report.time_to_capacity(replicas, 0.0, 3) == 0.0
+    assert report.time_to_capacity(replicas, 0.0, 5) is None
+    run = synthetic("predictive")
+    del run["series"]["observed_decisions"]
+    run["series"] = {k: [(t, v) for t, v in s] for k, s in run["series"].items()}
+    assert report.summarize(run)["observed_decisions"] == 0.0
 
 
 def test_delta_wording():

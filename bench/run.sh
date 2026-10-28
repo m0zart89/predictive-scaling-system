@@ -16,8 +16,10 @@
 #   DAY_SECONDS                    length of one compressed day (default: 2400 = 40 min)
 #   WARMUP_DAYS                    days of warm-up load to train on (default: 2)
 #   STEP_SECONDS                   scaler / training step        (default: 30)
-#   MAX_REPLICAS                   demo.maxReplicas              (default: 6)
-#   WORK_MS, THINK_MS              per-request CPU work and think time (50 / 100)
+#   MAX_REPLICAS                   demo.maxReplicas              (default: 4 — what a 4-vCPU
+#                                  runner fits next to the platform at 500m per pod)
+#   WORK_MS, THINK_MS              per-request CPU work and think time (25 / 100); peak
+#                                  demand must fit MAX_REPLICAS or both runs just saturate
 #   OUT_DIR                        results directory             (default: bench-results)
 #   REPORT_MD, PNG_DIR             report outputs (docs/benchmark.md, docs/benchmark)
 #   SKIP_WARMUP=1                  reuse an existing champion (shorter manual runs)
@@ -33,8 +35,8 @@ REGISTRY=${REGISTRY:-ghcr.io/m0zart89/predictive-scaling-system}
 DAY_SECONDS=${DAY_SECONDS:-2400}
 WARMUP_DAYS=${WARMUP_DAYS:-2}
 STEP_SECONDS=${STEP_SECONDS:-30}
-MAX_REPLICAS=${MAX_REPLICAS:-6}
-WORK_MS=${WORK_MS:-50}
+MAX_REPLICAS=${MAX_REPLICAS:-4}
+WORK_MS=${WORK_MS:-25}
 THINK_MS=${THINK_MS:-100}
 OUT_DIR=${OUT_DIR:-bench-results}
 REPORT_MD=${REPORT_MD:-docs/benchmark.md}

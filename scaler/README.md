@@ -17,7 +17,7 @@ result to KEDA as an external metric. KEDA's HPA then sets
 | `query` | yes | — | PromQL returning **one** series of total demand (aggregate with `sum`) |
 | `forecastServiceURL` | yes | — | forecast-serving base URL |
 | `targetValue` | yes | — | demand one replica should carry, in the query's unit |
-| `capacity` | no | `1` | model input = demand / capacity; pick it so the workload's range fits the model's training range |
+| `capacity` | no | `1` | model input = demand / capacity. The model must be trained on the same series divided by the same capacity (the chart's CronJob does this); for a model trained on another workload, pick it so this workload's range fits the training range |
 | `timeSteps` | no | `10` | samples per forecast; must match `time_steps` in forecast-serving's `GET /model-info` |
 | `stepSeconds` | no | `300` | spacing of samples; must match the model's `step_seconds` (`/model-info`), 300 for models trained on 5-minute data |
 | `mode` | no | `max` | `max`: report max(forecast, observed). `forecast`: report the forecast alone |

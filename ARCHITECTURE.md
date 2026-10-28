@@ -130,7 +130,7 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 
 - **Window and spacing are the model's.** Callers must send exactly `time_steps` values at `step_seconds` spacing (both in `GET /model-info`); the scaler's `timeSteps`/`stepSeconds` must match. Time can be compressed (the demo and benchmark use 30-second samples with a model trained on 30-second samples, or on 5-minute samples for a quick look), but then the horizon is compressed too.
 - **Lead time = horizon × step.** Six steps of 5 minutes give 30 minutes with `forecastAggregation: max`; the forecast cannot see further than that, and a step-change the window has not started to show is not forecastable.
-- **Units.** The model works in its training units; `capacity` in the trigger converts workload demand into them. A wrong `capacity` makes forecasts and the drift threshold meaningless.
+- **Units.** The model works in its training units; `capacity` in the trigger converts workload demand into them, and the chart's CronJob trains on `demand / capacity` so the two always agree. A model trained in other units is silently wrong: the first benchmark run trained on raw cores while the scaler divided by 2.5, and the forecast over-provisioned all night. The drift threshold is in the same model units.
 - **One replica of everything** in the chart: MLflow on SQLite, Prometheus on `emptyDir`, single serving and scaler pods. Correct for a prototype and CI; production needs external stores and replicas.
 - **Latency.** Inference is sub-millisecond; the scaler's per-request timeout (3 s) and cache (15 s) bound the control loop's cost.
 

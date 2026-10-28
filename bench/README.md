@@ -25,8 +25,9 @@ run A: CPU HPA 70%, one day   ──► reset ──►   run B: predictive scal
 (`DAY_SECONDS=2400`, so one simulated hour is 100 s): a quiet night, a sharp
 ramp from 06:00 to 08:00, a lunch dip, a second ramp at 13:00, an evening
 decline. The pattern is the number of concurrent clients (1 → 7); each client
-calls `cpu-burner /work?ms=50` back to back with 100 ms of think time, so
-offered CPU demand is proportional to the client count. The generator runs as
+calls `cpu-burner /work?ms=25` back to back with 100 ms of think time, so
+offered CPU demand is proportional to the client count. At the peak that is
+about 1.2 cores: four replicas carry it below target, one replica cannot. The generator runs as
 a Job inside the cluster with the cpu-burner image and exposes `bench_*`
 metrics that Prometheus scrapes alongside the scaler's own.
 
@@ -36,7 +37,7 @@ horizon looks 3 minutes (1.8 simulated hours) ahead.
 
 ## What is compared
 
-Both runs use the same Deployment (500m CPU per replica, max 6 replicas), the
+Both runs use the same Deployment (500m CPU per replica, max 4 replicas), the
 same per-replica target (70% CPU for the HPA, 0.35 cores for the scaler), the
 same scale-down stabilisation (300 s) and the same load. Only the scaler
 differs:
@@ -53,13 +54,14 @@ Metrics ([`report.py`](report.py)):
   exports, so a late start does not shift them);
 - **requests slower than 500 ms** and client timeouts over the day;
 - **replica-minutes** — the integral of running pods, the cost of being early;
-- **time to first scale-up** — from the start of each ramp to the first
-  increase in running pods.
+- **per ramp**: replicas running when it starts, time until the run had the
+  capacity the ramp needed (the smaller of the two runs' peaks inside it), and
+  p95 latency inside it.
 
 ## Run it yourself
 
 ```bash
-TRAIN=0 SMOKE=0 STEP_SECONDS=30 DEMO_SCALING=none MAX_REPLICAS=6 ./scripts/up.sh
+TRAIN=0 SMOKE=0 STEP_SECONDS=30 DEMO_SCALING=none MAX_REPLICAS=4 ./scripts/up.sh
 pip install matplotlib
 ./bench/run.sh                       # ~3 h with the default 40-minute day
 DAY_SECONDS=600 WARMUP_DAYS=2 ./bench/run.sh    # a 10-minute day for a quick look
@@ -73,7 +75,13 @@ report is written to `docs/benchmark.md`.
 - One small node for everything (in CI, a 4-vCPU runner): the load generator,
   the workload, Prometheus, KEDA and the forecast service compete for CPU, so
   absolute latencies are noisy and the comparison is between two runs on the
-  same box, not a capacity measurement.
+  same box, not a capacity measurement. The node fits four cpu-burner pods at
+  500m next to the platform, hence `MAX_REPLICAS=4` and a load whose peak fits
+  in four: with more demand than the node can schedule, both runs saturate at
+  the same ceiling and the scaler no longer matters.
+- The model must be trained in the units the scaler feeds it
+  (`demand / capacity`). The chart's CronJob does this; the first benchmark
+  run predates that fix, trained on raw cores and over-provisioned all night.
 - The model is trained on two compressed days of the same pattern it is then
   judged on. That is the benchmark's point (a recurring daily pattern), but it
   is the best case for the forecast.

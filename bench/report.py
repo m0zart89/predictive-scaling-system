@@ -12,7 +12,9 @@ Prometheus scraped; see bench/collect.py):
   windows of the load profile) and over the whole day;
 * share of requests slower than 500 ms, and client errors (timeouts);
 * replica-minutes: the integral of running cpu-burner pods;
-* time from the start of each ramp to the first scale-up.
+* for each ramp: replicas running when it starts, and the time until the
+  run had the capacity the ramp needed (the smaller of the two runs' peak
+  replica count inside the ramp, so both can reach it; 0 s = already there).
 
 The ramps are located from bench_sim_hour, not from wall-clock offsets, so a
 late-starting load Job does not shift them. The charts put both runs on one
@@ -76,14 +78,34 @@ def mean(xs: Sequence[float]) -> Optional[float]:
     return sum(xs) / len(xs) if xs else None
 
 
-def time_to_first_scale_up(replicas: Series, ramp_start: float, limit: float = 1800) -> Optional[float]:
-    base = value_at(replicas, ramp_start)
-    if base is None:
+def time_to_capacity(replicas: Series, ramp_start: float, need: float,
+                     limit: float = 1800) -> Optional[float]:
+    """Seconds from ramp_start until `need` replicas were running (0 if already)."""
+    if need is None:
         return None
+    at_start = value_at(replicas, ramp_start)
+    if at_start is not None and at_start >= need:
+        return 0.0
     for ts, v in replicas:
-        if ramp_start <= ts <= ramp_start + limit and v > base:
+        if ramp_start <= ts <= ramp_start + limit and v >= need:
             return ts - ramp_start
     return None
+
+
+def ramp_need(runs: Sequence[dict], ramp_index: int, tail: float = 120) -> Optional[float]:
+    """Replicas a ramp needed: the smaller of the runs' peaks inside it (plus `tail` s)."""
+    peaks = []
+    for run in runs:
+        s = run["series"]
+        windows = ramp_windows(s.get("sim_hour", []))
+        if ramp_index >= len(windows):
+            return None
+        _, a, b = windows[ramp_index]
+        inside = within(s.get("replicas", []), a, b + tail)
+        if not inside:
+            return None
+        peaks.append(max(inside))
+    return min(peaks) if peaks else None
 
 
 def replica_minutes(replicas: Series, step: float) -> Optional[float]:
@@ -92,17 +114,19 @@ def replica_minutes(replicas: Series, step: float) -> Optional[float]:
     return sum(v for _, v in replicas) * step / 60
 
 
-def summarize(run: dict) -> dict:
+def summarize(run: dict, needs: Sequence[Optional[float]] = ()) -> dict:
     s, totals, step = run["series"], run["totals"], run.get("step", 15)
     windows = ramp_windows(s.get("sim_hour", []))
     ramp_p95 = [v for _, a, b in windows for v in within(s.get("p95", []), a, b)]
     ramps = []
-    for h0, a, b in windows:
+    for i, (h0, a, b) in enumerate(windows):
         p95 = within(s.get("p95", []), a, b)
+        need = needs[i] if i < len(needs) else None
         ramps.append({
             "hour": h0, "start": a, "end": b,
             "p95_mean": mean(p95), "p95_max": max(p95) if p95 else None,
-            "time_to_scale_up": time_to_first_scale_up(s.get("replicas", []), a),
+            "need": need,
+            "time_to_capacity": time_to_capacity(s.get("replicas", []), a, need),
             "replicas_at_start": value_at(s.get("replicas", []), a),
         })
     req = totals.get("requests") or 0
@@ -121,13 +145,19 @@ def summarize(run: dict) -> dict:
         "p95_ramp_max": max(ramp_p95) if ramp_p95 else None,
         "replica_minutes": replica_minutes(s.get("replicas", []), step),
         "replicas_max": max((v for _, v in s.get("replicas", [])), default=None),
-        "forecast_decisions": (s["forecast_decisions"][-1][1] - s["forecast_decisions"][0][1])
-        if s.get("forecast_decisions") else None,
-        "observed_decisions": (s["observed_decisions"][-1][1] - s["observed_decisions"][0][1])
-        if s.get("observed_decisions") else None,
+        "forecast_decisions": _counter_increase(s.get("forecast_decisions")),
+        # a counter series that never appeared means the scaler never fell back
+        "observed_decisions": _counter_increase(s.get("observed_decisions"))
+        if s.get("observed_decisions") or not s.get("forecast_decisions") else 0.0,
         "rolling_mae_step1": s["rolling_mae_step1"][-1][1] if s.get("rolling_mae_step1") else None,
         "ramps": ramps,
     }
+
+
+def _counter_increase(series: Optional[Series]) -> Optional[float]:
+    if not series:
+        return None
+    return series[-1][1] - series[0][1]
 
 
 # ── formatting ─────────────────────────────────────────────────────────────────
@@ -184,17 +214,24 @@ def markdown(a: dict, b: dict, runs: Sequence[dict], png: Optional[str]) -> str:
         f"{fmt(b['p95_day_mean'], 'ms')} |{delta(a['p95_day_mean'], b['p95_day_mean'])} |",
         f"| Requests slower than 500 ms | {fmt(a['slow_share'], '%')} | {fmt(b['slow_share'], '%')} |"
         f"{delta(a['slow_share'], b['slow_share'])} |",
-        f"| Client errors (timeouts) | {fmt(a['errors'])} of {fmt(a['requests'])} | "
-        f"{fmt(b['errors'])} of {fmt(b['requests'])} | |",
+        f"| Client errors (timeouts) | {fmt(round(a['errors']))} of {fmt(round(a['requests']))} | "
+        f"{fmt(round(b['errors']))} of {fmt(round(b['requests']))} | |",
         f"| Replica-minutes | {fmt(a['replica_minutes'])} | {fmt(b['replica_minutes'])} |"
         f"{delta(a['replica_minutes'], b['replica_minutes'])} |",
         f"| Peak replicas | {fmt(a['replicas_max'])} | {fmt(b['replicas_max'])} | |",
     ]
     for i, (ra, rb) in enumerate(zip(a["ramps"], b["ramps"])):
+        label = f"Ramp {i + 1} ({ra['hour']:02.0f}:00)"
         lines.append(
-            f"| Ramp {i + 1} ({ra['hour']:04.1f}h): time to first scale-up | "
-            f"{fmt(ra['time_to_scale_up'], 's', 0)} | {fmt(rb['time_to_scale_up'], 's', 0)} |"
-            f"{delta(ra['time_to_scale_up'], rb['time_to_scale_up'])} |")
+            f"| {label}: replicas running at its start | {fmt(ra['replicas_at_start'])} | "
+            f"{fmt(rb['replicas_at_start'])} | |")
+        lines.append(
+            f"| {label}: time to {fmt(ra['need'])} replicas | "
+            f"{fmt(ra['time_to_capacity'], 's', 0)} | {fmt(rb['time_to_capacity'], 's', 0)} |"
+            f"{delta(ra['time_to_capacity'], rb['time_to_capacity'])} |")
+        lines.append(
+            f"| {label}: p95 latency (mean of 1-min p95) | {fmt(ra['p95_mean'], 'ms')} | "
+            f"{fmt(rb['p95_mean'], 'ms')} |{delta(ra['p95_mean'], rb['p95_mean'])} |")
     if b.get("forecast_decisions") is not None:
         lines.append(f"| Scaler decisions from forecast / observed (run B) | — | "
                      f"{fmt(b['forecast_decisions'])} / {fmt(b['observed_decisions'])} | |")
@@ -207,10 +244,11 @@ def markdown(a: dict, b: dict, runs: Sequence[dict], png: Optional[str]) -> str:
     lines += [
         "## Reading the numbers",
         "",
-        "- *Time to first scale-up* is measured from the moment the simulated clock enters the "
-        "ramp to the first increase in running cpu-burner pods. The HPA reacts to CPU already "
-        "above target; the predictive scaler reports `max(forecast, observed)`, so it can only be "
-        "earlier when the model's forecast rises before the observed demand does.",
+        "- *Time to N replicas* runs from the moment the simulated clock enters the ramp until N "
+        "cpu-burner pods are running, where N is the smaller of the two runs' peaks inside the "
+        "ramp (0 s: already there). The HPA reacts to CPU already above target; the predictive "
+        "scaler reports `max(forecast, observed)`, so it can only be earlier when the forecast "
+        "rises before the observed demand does, or when it never scaled down.",
         "- *Replica-minutes* are the cost side: a scaler that is early but over-provisions pays here.",
         "- Both runs share one small node (the CI runner), so absolute latencies are noisy; the "
         "comparison between runs is the point, and it is one sample. The weekly run keeps the "
@@ -274,7 +312,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     runs = [load(args.hpa), load(args.predictive)]
-    a, b = summarize(runs[0]), summarize(runs[1])
+    needs = [ramp_need(runs, i) for i in range(len(RAMPS))]
+    a, b = summarize(runs[0], needs), summarize(runs[1], needs)
     png_rel = None
     if not args.no_png:
         png_path = os.path.join(args.png_dir, "benchmark.png")
