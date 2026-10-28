@@ -96,14 +96,19 @@ jobs:
     strategy:
       matrix:
         include:
+          # serving builds from the root: it copies training/forecast_training/features.py
           - name: forecast-serving
-            context: ./serving
+            context: .
+            file: ./serving/Dockerfile
           - name: predictive-scaler
             context: ./scaler
+            file: ./scaler/Dockerfile
           - name: cpu-burner
             context: ./demo/cpu-burner
+            file: ./demo/cpu-burner/Dockerfile
           - name: forecast-training
             context: ./training
+            file: ./training/Dockerfile
     env:
       # Images are published to GHCR under the repository:
       #   ghcr.io/<owner>/predictive-scaling-system/<name>:{<sha>,latest}
@@ -136,6 +141,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

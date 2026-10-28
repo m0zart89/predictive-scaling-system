@@ -81,12 +81,14 @@ if ! kubectl -n kube-system get deployment metrics-server -o jsonpath='{.spec.te
 fi
 
 # ── 2. images ──────────────────────────────────────────────────────────────────
-IMAGES="forecast-serving:serving predictive-scaler:scaler cpu-burner:demo/cpu-burner forecast-training:training"
+# name:context:dockerfile — serving builds from the root (shares training's features.py)
+IMAGES="forecast-serving:.:serving/Dockerfile predictive-scaler:scaler:scaler/Dockerfile
+        cpu-burner:demo/cpu-burner:demo/cpu-burner/Dockerfile forecast-training:training:training/Dockerfile"
 if [ "$BUILD_IMAGES" = "1" ]; then
   for entry in $IMAGES; do
-    name=${entry%%:*}; context=${entry#*:}
-    log "Building $REGISTRY/$name:$IMAGE_TAG from $context/"
-    docker build -q -t "$REGISTRY/$name:$IMAGE_TAG" "$context/" >/dev/null
+    IFS=: read -r name context dockerfile <<< "$entry"
+    log "Building $REGISTRY/$name:$IMAGE_TAG from $context/ ($dockerfile)"
+    docker build -q -f "$dockerfile" -t "$REGISTRY/$name:$IMAGE_TAG" "$context" >/dev/null
     kind load docker-image --name "$CLUSTER_NAME" "$REGISTRY/$name:$IMAGE_TAG"
   done
 else

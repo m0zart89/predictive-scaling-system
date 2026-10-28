@@ -70,9 +70,11 @@ A registered version has three artifacts:
 - `forecast_meta.json` — `time_steps`, `horizon`, `step_seconds`,
   `features` (`window` | `anchored`), `target` (`level` | `delta`)
 
-`forecast_training/features.py` and `serving/app.py` implement the same
-transforms; `tests/test_training_serving.py` at the repo root checks that a
-registered model serves exactly the forecast the pipeline computed, and that
+`forecast_training/features.py` is the single implementation of the
+transforms: the serving image copies it (`serving/Dockerfile` builds from the
+repository root), so keep it free of dependencies beyond numpy.
+`tests/test_training_serving.py` at the repo root checks that a registered
+model serves exactly the forecast the pipeline computed, and that
 notebook-registered models (no meta, `Production` stage) still load.
 
 ## Tests

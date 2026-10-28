@@ -20,6 +20,7 @@ import mlflow.sklearn
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
+from forecast_training.features import FEATURE_KINDS, TARGET_KINDS, build_features, from_target
 from quality import ForecastTracker
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -84,14 +85,13 @@ TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_M
                           mae_window=FORECAST_MAE_WINDOW)
 
 # ── Model state ────────────────────────────────────────────────────────────────
-# How to turn a window into model features and outputs back into values.
-# Must match training/forecast_training/features.py (tests/test_training_serving.py
-# checks that both sides agree). Models without a forecast_meta.json artifact
-# were registered by the notebook: TIME_STEPS scaled values in, one value out.
+# How a window becomes model features and outputs become values is shared with
+# the training pipeline (forecast_training.features, copied into the image), so
+# both sides apply the same transform by construction. Models without a
+# forecast_meta.json artifact were registered by the notebook: TIME_STEPS
+# scaled values in, one value out.
 LEGACY_FORECAST_META = {"time_steps": TIME_STEPS, "horizon": 1, "step_seconds": 300,
                         "features": "window", "target": "level"}
-FEATURE_KINDS = ("window", "anchored")
-TARGET_KINDS = ("level", "delta")
 
 
 @dataclass(frozen=True)
@@ -107,24 +107,12 @@ class Bundle:
         """Raw window → forecast for each step of the model's horizon (raw units)."""
         arr    = np.array(values, dtype=float).reshape(-1, 1)
         scaled = self.scaler.transform(arr).reshape(1, -1)
-        out    = np.asarray(self.model.predict(_features(scaled, self.meta["features"])), dtype=float)
-        out    = out.reshape(1, -1)
-        if self.meta["target"] == "delta":
-            out = out + scaled[:, -1:]
+        out    = self.model.predict(build_features(scaled, self.meta["features"]))
+        out    = from_target(scaled, out, self.meta["target"])
         return [float(v) for v in self.scaler.inverse_transform(out.reshape(-1, 1)).ravel()]
 
 
 _bundle: Optional[Bundle] = None
-
-
-def _features(scaled: np.ndarray, kind: str) -> np.ndarray:
-    """scaled: (1, time_steps). 'anchored' = window relative to its last value, plus that value."""
-    if kind == "window":
-        return scaled
-    if kind == "anchored":
-        last = scaled[:, -1:]
-        return np.hstack([scaled[:, :-1] - last, last])
-    raise ValueError(f"unknown feature kind {kind!r}")
 
 
 def _resolve_version(client: MlflowClient):

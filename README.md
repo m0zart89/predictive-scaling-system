@@ -211,7 +211,7 @@ VPA adjusts resource requests/limits, not replica count. For workloads where the
 
 ### Why Random Forest
 
-Eight model families were evaluated on the same holdout period (last 4 days of a 24-day dataset):
+Eight model families were evaluated in the notebook on the same holdout period (the last 20%, about 3 days, of a 15-day dataset: 10–25 January 2022 at 5-minute resolution):
 
 | Model | Test RMSE |
 |---|---|
@@ -224,7 +224,7 @@ Eight model families were evaluated on the same holdout period (last 4 days of a
 
 The baseline uses in-sample hourly averages as predictions — it is a reference point to sanity-check the others, not a deployable model.
 
-Neural networks (RNN, LSTM, GRU) underperform on this dataset. 7,200 training points at 5-minute intervals is not enough for sequence models to learn meaningful temporal structure beyond what the tree-based models capture with a simple sliding window. Random Forest with 10-step lag features achieves better generalisation with no hyperparameter tuning.
+Neural networks (RNN, LSTM, GRU) underperform on this dataset. About 3,500 training windows at 5-minute intervals is not enough for sequence models to learn meaningful temporal structure beyond what the tree-based models capture with a simple sliding window. Random Forest with 10-step lag features achieves better generalisation with no hyperparameter tuning.
 
 The general principle applies beyond this dataset: for short time-series with strong periodicity, classical ML with appropriate feature engineering frequently outperforms deep learning. The right model for the task depends on data volume, not what is currently fashionable.
 
@@ -249,7 +249,7 @@ These are known simplifications, not omissions:
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
 - **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
 - **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It shows the mechanism, not a capacity figure.
-- **Short, noisy history.** One month of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
+- **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
 - **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 
 ---
@@ -289,6 +289,9 @@ Stage-by-stage plan with ready-to-run briefs: [docs/ROADMAP.md](docs/ROADMAP.md)
 
 **Additional signals**  
 Add memory utilisation and request queue depth as input features. CPU alone is a weak proxy for capacity need in memory-bound or I/O-bound workloads.
+
+**GPU workloads**  
+The notebook's sequence models already run on CUDA when it is available; the production pipeline is CPU-only scikit-learn because the data is small. For GPU inference workloads the same pattern applies with a different demand metric (GPU utilisation or queue depth); serving and the scaler do not change.
 
 **Alert-triggered retraining**  
 `ForecastDriftHigh` already measures the regression; the next step is to let it start the retraining job (Alertmanager webhook → `kubectl create job`) instead of waiting for the nightly run.
