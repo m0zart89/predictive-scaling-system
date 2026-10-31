@@ -53,18 +53,19 @@ def parse_wikimedia(body: dict) -> List[Point]:
 
 def wikipedia_pageviews(article: str, days: int = 30, project: str = "en.wikipedia",
                         end: datetime | None = None, timeout: float = 60.0) -> List[Point]:
-    """Hourly views of one article over the last `days` (ending yesterday by default)."""
-    end = (end or datetime.now(timezone.utc)).replace(minute=0, second=0, microsecond=0)
-    end -= timedelta(days=1)                         # today's hours are not final yet
-    start = end - timedelta(days=days)
+    """Hourly views of one article over the last `days` whole days (ending yesterday)."""
+    today = (end or datetime.now(timezone.utc)).replace(hour=0, minute=0, second=0, microsecond=0)
+    last = today - timedelta(hours=1)                # yesterday 23:00; today is not final yet
+    first = today - timedelta(days=days)             # 00:00, `days` days ago
     url = "/".join([WIKIMEDIA, project, "all-access", "user", urllib.parse.quote(article, safe=""),
-                    "hourly", start.strftime("%Y%m%d%H"), end.strftime("%Y%m%d%H")])
+                    "hourly", first.strftime("%Y%m%d%H"), last.strftime("%Y%m%d%H")])
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             return parse_wikimedia(json.load(resp))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Wikimedia API returned HTTP {exc.code} for {url}") from exc
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"Wikimedia API returned HTTP {exc.code} for {url}: {detail}") from exc
 
 
 def csv_series(path: str, ts_col, value_col, aggregate: str = "sum", ts_offset: int = 0,
