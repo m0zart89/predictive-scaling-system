@@ -3,6 +3,12 @@
 Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 `main`; `v1.0.0` is the first release where every stage is in.
 
+## Unreleased
+
+- **arm64 images.** CI builds the four project images for `linux/amd64` and
+  `linux/arm64` (QEMU on the runner) and publishes them as one multi-arch
+  manifest per tag, so a Raspberry Pi cluster pulls them as is.
+
 ## v1.1.0 — after the audit (PR #5)
 
 - **Time-of-day features.** `hgb_delta_tod` / `rf_delta_tod` add sin/cos of
