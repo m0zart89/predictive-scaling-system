@@ -189,6 +189,7 @@ jobs:
           helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
           helm lint helm/predictive-stack/ --set demo.scaling=hpa
           helm lint helm/predictive-stack/ -f helm/predictive-stack/values-pilot.yaml
+          helm lint helm/forecast-serving/ --set reloadToken=secret-for-lint
           helm lint helm/predictive-stack/ -f helm/predictive-stack/ci/workloads-values.yaml
 
       - name: Helm template (dry-run)
@@ -211,6 +212,10 @@ jobs:
           test "$(grep -c 'kind: ScaledObject' /tmp/workloads.yaml)" = 2
           grep -Fq 'container=\"worker\"}[2m]))) / 1"' /tmp/workloads.yaml
           grep -q 'stepSeconds: "60"' /tmp/workloads.yaml
+          # the reload token reaches both the service and the training jobs
+          test "$(grep -c 'name: forecast-reload-token' /tmp/stack.yaml)" -ge 4
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
           # no workload and no demo must fail loudly, not render a CronJob without a query
           if helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /dev/null 2>&1; then
             echo "::error::expected the chart to refuse a release with nothing to train on"; exit 1
