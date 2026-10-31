@@ -15,6 +15,7 @@ history of this file.
 | 4 | **Portable deployment**: images on GHCR, `helm/predictive-stack` umbrella chart (KEDA as a dependency, Ingress, namespace RBAC), `scripts/up.sh` on kind, e2e workflow with scaling assertions | `helm/predictive-stack/`, `scripts/`, `.github/workflows/e2e.yml` — PR #4 |
 | 5 | **Benchmark** predictive scaler vs CPU HPA on a compressed day with sharp ramps: p95 during ramps, slow requests, replica-minutes, time to first scale-up | `bench/`, `docs/benchmark.md`, `.github/workflows/benchmark.yml` — PR #4 |
 | 6 | **Polish**: review fixes, one implementation of the feature transforms, one deployment path, ARCHITECTURE decisions table, CHANGELOG, pitch | `ARCHITECTURE.md`, `CHANGELOG.md`, `docs/pitch.md` — PR #4 |
+| 7 | **After the audit (v1.1)**: time-of-day features, Prometheus on a volume + pilot profile, `workloads` in the chart, `/reload` token + NetworkPolicy, drift threshold from the model's holdout error, real traces (Wikipedia, CSV) | `training/`, `helm/predictive-stack/`, `.github/workflows/traces.yml` — PR #5 |
 
 ## Next
 
@@ -26,9 +27,11 @@ Candidates for a next stage, roughly by value:
 
 - **Alert-driven retraining.** `ForecastDriftHigh` → Alertmanager webhook →
   `kubectl create job --from=cronjob/forecast-retrain`.
-- **Real workload traces** (Alibaba cluster-trace-v2018, Google ClusterData2019,
-  Azure Public Dataset) to show the approach beyond the synthetic demo; needs
-  a converter to a single regular demand series.
+- **One model per workload.** Today one release trains one model
+  (`training.workload`); services with different patterns need separate
+  releases or per-workload models and aliases.
+- **Day-of-week features** once there are two or more weeks of history
+  (the weekly pattern is visible in the Wikipedia traces).
 
 ## Deferred ideas
 

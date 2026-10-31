@@ -3,6 +3,30 @@
 Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 `main`; `v1.0.0` is the first release where every stage is in.
 
+## v1.1.0 — after the audit (PR #5)
+
+- **Time-of-day features.** `hgb_delta_tod` / `rf_delta_tod` add sin/cos of
+  the last sample's phase in the seasonal cycle (`period_seconds`); serving
+  evaluates it for the request's timestamp. On the synthetic daily pattern
+  the timed model beats the same model without the phase at the 30-minute
+  horizon.
+- **Pilot readiness.** Prometheus on a PersistentVolume with 30-day
+  retention; `values-pilot.yaml`; README section on running it on your own
+  cluster.
+- **Workloads.** `.Values.workloads` renders one ScaledObject per service
+  through the template the demo uses; the CronJob trains on
+  `training.workload`'s series divided by its capacity. A release with
+  nothing to train on installs without the CronJob.
+- **Reload auth.** `/reload` requires `X-Reload-Token`; the chart generates
+  the token once and shares it with the training jobs. Optional
+  NetworkPolicy for forecast-serving.
+- **Drift threshold from the model.** Each version is tagged with its
+  per-step holdout MAE, serving exports it, `ForecastDriftHigh` fires at
+  twice it (fixed 0.25 only without a baseline).
+- **Real traces.** `forecast_training.traces` converts Wikimedia page views
+  and timestamp/value CSVs (Alibaba and the like); `traces.yml` trains on
+  three articles weekly and fails unless a candidate beats persistence.
+
 ## v1.0.0 — stages 3–6 (PR #4)
 
 ### Stage 6 — polish
