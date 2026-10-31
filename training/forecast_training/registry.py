@@ -58,6 +58,7 @@ class TrainConfig:
     time_steps: int = 10
     horizon: int = 6
     step_seconds: int = 300
+    period_seconds: int = 86400      # seasonal cycle for time-of-day features
     test_fraction: float = 0.2
     min_tracking: float = 0.5
     min_improvement: float = 0.0
@@ -139,13 +140,15 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
         mlflow.log_params({
             "source": source, "n_points": len(values), "filled_points": filled_points,
             "time_steps": cfg.time_steps, "horizon": cfg.horizon,
-            "step_seconds": cfg.step_seconds, "test_fraction": cfg.test_fraction,
+            "step_seconds": cfg.step_seconds, "period_seconds": cfg.period_seconds,
+            "test_fraction": cfg.test_fraction,
             "min_tracking": cfg.min_tracking, "min_improvement": cfg.min_improvement,
             "candidates": ",".join(cfg.candidates),
         })
 
         results, split = train_and_select(values, cfg.time_steps, cfg.horizon, cfg.step_seconds,
-                                          cfg.test_fraction, cfg.min_tracking, candidates)
+                                          cfg.test_fraction, cfg.min_tracking, candidates,
+                                          timestamps, cfg.period_seconds)
         for r in results:
             with mlflow.start_run(run_name=r.candidate.name, nested=True):
                 mlflow.log_params({**r.candidate.params, "features": r.candidate.features,
@@ -165,13 +168,18 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
 
         if outcome.promoted and not cfg.dry_run:
             final = (fit_bundle(values, best.candidate, cfg.time_steps, cfg.horizon,
-                                cfg.step_seconds) if cfg.refit else best.bundle)
+                                cfg.step_seconds, timestamps, cfg.period_seconds)
+                     if cfg.refit else best.bundle)
             fitted_until = len(values) if cfg.refit else split
             _log_bundle(final)
             mv = mlflow.register_model(f"runs:/{parent.info.run_id}/model", cfg.model_name)
             client.set_registered_model_alias(cfg.model_name, cfg.alias, mv.version)
             tags = {"candidate": best.candidate.name, "horizon": cfg.horizon,
                     "holdout_rmse": f"{best.score.rmse:.6f}",
+                    # per-step holdout MAE: serving exports it so the drift alert
+                    # compares the live rolling MAE with what the model achieved
+                    **{f"holdout_mae_step_{i}": f"{v:.6f}"
+                       for i, v in enumerate(best.score.mae_by_step, start=1)},
                     "level_tracking": f"{best.tracking:.3f}"}
             if timestamps is not None:
                 # last point the registered model was fitted on; the next run
@@ -205,7 +213,7 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
                                    f"rmse {best.score.rmse:.4f}", metrics=metrics)
 
     champ_bundle, champ_version, champ_tags = champ
-    champ_tracking = level_tracking(champ_bundle, values, split)
+    champ_tracking = level_tracking(champ_bundle, values, split, timestamps)
     metrics["champion_level_tracking"] = champ_tracking
     if champ_tracking < cfg.min_tracking:
         return Outcome("promoted", f"champion v{champ_version} fails level tracking "
@@ -228,8 +236,8 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
                                         f"champion v{champ_version}; need {cfg.min_fresh_windows} "
                                         f"for a fair comparison", metrics=metrics)
 
-    champ_rmse = evaluate_bundle(champ_bundle, values, compare_from, steps).rmse
-    new_rmse = evaluate_bundle(best.bundle, values, compare_from, steps).rmse
+    champ_rmse = evaluate_bundle(champ_bundle, values, compare_from, steps, timestamps).rmse
+    new_rmse = evaluate_bundle(best.bundle, values, compare_from, steps, timestamps).rmse
     metrics.update({"champion_rmse": champ_rmse, "winner_rmse_common_steps": new_rmse})
     vs = (f"v{champ_version} rmse {champ_rmse:.4f} vs {best.candidate.name} {new_rmse:.4f} "
           f"over {steps} step(s), {fresh} fresh windows{note}")
@@ -238,9 +246,12 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
     return Outcome("kept_champion", vs, metrics=metrics)
 
 
-def reload_serving(url: str, timeout: float = 30.0) -> bool:
-    """Ask forecast-serving to load the new champion. Failure is logged, not raised."""
-    req = urllib.request.Request(f"{url.rstrip('/')}/reload", data=b"", method="POST")
+def reload_serving(url: str, timeout: float = 30.0, token: Optional[str] = None) -> bool:
+    """Ask forecast-serving to load the new champion. Failure is logged, not raised.
+    `token` goes into X-Reload-Token (forecast-serving's RELOAD_TOKEN)."""
+    headers = {"X-Reload-Token": token} if token else {}
+    req = urllib.request.Request(f"{url.rstrip('/')}/reload", data=b"", method="POST",
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             log.info("serving reloaded: %s", resp.read().decode()[:200])

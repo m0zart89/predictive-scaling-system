@@ -1,0 +1,37 @@
+{{- if .Values.security.networkPolicy.enabled }}
+# Only the scaler, the training jobs, Prometheus and the ingress controller
+# may talk to forecast-serving; everything else in the cluster is refused.
+# Needs a CNI that enforces NetworkPolicy (kind's default kindnet does not).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forecast-serving
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: forecast-serving
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: predictive-scaler
+        - podSelector:
+            matchLabels:
+              app: forecast-retrain
+        - podSelector:
+            matchLabels:
+              app: train-bootstrap
+        - podSelector:
+            matchLabels:
+              app: prometheus
+        {{- with .Values.security.networkPolicy.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - port: 8080
+{{- end }}

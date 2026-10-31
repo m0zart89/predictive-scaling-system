@@ -200,3 +200,74 @@ def test_compressed_time_windows_are_scored_at_their_own_spacing(registry, servi
                                    "step_seconds": 30})
     info = serving.get("/model-info").json()
     assert info["rolling_mae"] == {"1": pytest.approx(abs(0.7 - first["prediction"]), abs=1e-6)}
+
+
+def test_time_of_day_model_serves_the_pipeline_forecast_for_the_given_timestamp(registry, serving):
+    ts, values = demand()
+    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta_tod"]), "test",
+                       timestamps=ts)
+    assert out.promoted
+    serving_app.load_model()
+    info = serving.get("/model-info").json()
+    assert info["features"] == "anchored_tod" and info["period_seconds"] == 86400
+
+    from mlflow.tracking import MlflowClient
+    bundle, _, _ = load_champion(MlflowClient(), "cpu-forecasting", "champion")
+    window = [float(v) for v in values[-10:]]
+    for t in (int(ts[-1]), int(ts[-1]) + 6 * 3600):
+        body = serving.post("/predict", json={"values": window, "timestamp": t}).json()
+        np.testing.assert_allclose(body["predictions"], bundle.predict(window, [t])[0], rtol=1e-9)
+    morning = serving.post("/predict", json={"values": window, "timestamp": int(ts[-1])}).json()
+    evening = serving.post("/predict", json={"values": window, "timestamp": int(ts[-1]) + 6 * 3600}).json()
+    assert morning["predictions"] != evening["predictions"]   # the hour matters now
+    assert serving.post("/predict", json={"values": window}).status_code == 200   # defaults to now
+
+
+def test_reload_requires_the_token_when_one_is_configured(registry, serving, monkeypatch):
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    monkeypatch.setattr(serving_app, "RELOAD_TOKEN", "s3cret")
+    client = TestClient(serving_app.app, raise_server_exceptions=False)
+    assert client.post("/reload").status_code == 401
+    assert client.post("/reload", headers={"X-Reload-Token": "wrong"}).status_code == 401
+    assert client.get("/ready").status_code == 503          # nothing was loaded by the refusals
+    assert client.post("/reload", headers={"X-Reload-Token": "s3cret"}).status_code == 200
+    assert client.get("/ready").status_code == 200
+
+    # the training side sends the header the service expects
+    seen = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        seen["token"] = req.get_header("X-reload-token")
+        return Resp()
+
+    from forecast_training import registry as reg
+    monkeypatch.setattr(reg.urllib.request, "urlopen", fake_urlopen)
+    assert reg.reload_serving("http://forecast-serving:8080", token="s3cret") is True
+    assert seen["token"] == "s3cret"
+
+
+def test_serving_exports_the_models_holdout_mae_for_the_drift_alert(registry, serving):
+    from prometheus_client import REGISTRY
+
+    ts, values = demand()
+    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta"]), "test", timestamps=ts)
+    from mlflow.tracking import MlflowClient
+    tags = MlflowClient().get_model_version("cpu-forecasting", out.version).tags
+    assert {"holdout_mae_step_1", "holdout_mae_step_2", "holdout_mae_step_3"} <= set(tags)
+
+    serving_app.load_model()
+    for step in (1, 2, 3):
+        got = REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": str(step)})
+        assert got == pytest.approx(float(tags[f"holdout_mae_step_{step}"]))
+    assert REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": "4"}) is None

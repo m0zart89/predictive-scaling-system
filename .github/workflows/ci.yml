@@ -188,9 +188,13 @@ jobs:
           helm lint helm/forecast-serving/ helm/predictive-scaler/
           helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
           helm lint helm/predictive-stack/ --set demo.scaling=hpa
+          helm lint helm/predictive-stack/ -f helm/predictive-stack/values-pilot.yaml
+          helm lint helm/forecast-serving/ --set reloadToken=secret-for-lint
+          helm lint helm/predictive-stack/ -f helm/predictive-stack/ci/workloads-values.yaml
 
       - name: Helm template (dry-run)
         run: |
+          set -x
           for chart in forecast-serving predictive-scaler; do
             helm template "$chart" "helm/$chart/" --set image.tag=ci-${{ github.sha }} --debug > /dev/null
           done
@@ -200,9 +204,26 @@ jobs:
           # the umbrella chart must carry the same dashboards and rules as monitoring/
           grep -q 'forecast_rolling_mae' /tmp/stack.yaml
           grep -q 'alert: ForecastDriftHigh' /tmp/stack.yaml
-          grep -q 'kind: ScaledObject' /tmp/stack.yaml
+          # anchored: KEDA's CRD mentions the kind too (indented)
+          grep -q '^kind: ScaledObject$' /tmp/stack.yaml
           # the CronJob trains on what the scaler feeds the model: demand / capacity
           grep -Fq '[1m]))) / 2.5"' /tmp/stack.yaml
+          # workloads: one ScaledObject each, the model trained on training.workload
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/ci/workloads-values.yaml > /tmp/workloads.yaml
+          test "$(grep -c '^kind: ScaledObject$' /tmp/workloads.yaml)" = 2
+          grep -Fq 'container=\"worker\"}[2m]))) / 1"' /tmp/workloads.yaml
+          grep -q 'stepSeconds: "60"' /tmp/workloads.yaml
+          # the reload token reaches both the service and the training jobs
+          test "$(grep -c 'name: forecast-reload-token' /tmp/stack.yaml)" -ge 4
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
+          # nothing to train on yet (pilot before its workloads are added): no CronJob,
+          # no broken query — the release must still install so KEDA's CRDs land
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /tmp/empty.yaml
+          if grep -q '^kind: CronJob$' /tmp/empty.yaml; then
+            echo "::error::a CronJob was rendered with nothing to train on"; exit 1
+          fi
 
   # Placeholder job — shows the intended CD path without implementing it
   # In a real cluster, this would use ArgoCD image updater or a Helm upgrade action.

@@ -58,7 +58,7 @@ A fuller treatment, with the decisions table: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ### Retraining pipeline (`training/`)
 
-`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`), scores them on a chronological holdout and registers the winner with its scaler and `forecast_meta.json`. Promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
+`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`, and `hgb_delta_tod` / `rf_delta_tod` with the time of day as a feature), scores them on a chronological holdout and registers the winner with its scaler and `forecast_meta.json`. Promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
 
 ### Model registry (MLflow)
 
@@ -249,7 +249,7 @@ These are known simplifications, not omissions:
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
 - **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
 - **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It is one sample and shows the mechanism, not a capacity figure.
-- **No anticipation before a ramp starts.** The model sees only the last ten samples, so the forecast rises with the ramp, not ahead of it. Time-of-day features are the next step (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+- **Anticipation depends on the clock.** The `_tod` candidates add the phase of the day to the window, so the model can move before a daily ramp is visible; it still cannot foresee a ramp that is not periodic, and it needs a few days of history to learn the pattern.
 - **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
 - **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 
@@ -290,19 +290,22 @@ Predictive scaler vs a plain CPU HPA, same kind cluster, same compressed day of 
 
 | | Reactive HPA | Predictive | |
 |---|---|---|---|
-| Morning ramp: time to the 3 replicas it needed | 165 s | 60 s | −64% |
-| Morning ramp: p95 latency | 77 ms | 71 ms | −8% |
+| Morning ramp: time to the 3 replicas it needed | 180 s | 105 s | −42% |
+| Morning ramp: p95 latency | 76 ms | 75 ms | −2% |
 | Afternoon ramp, peak, whole day: p95 latency | same | same | |
-| Replica-minutes over the day | 96.75 | 109 | +13% |
+| Replica-minutes over the day | 96.75 | 107.75 | +11% |
 
-What that says, honestly:
+Two runs so far, one with the plain delta model (v1.0: 60 s vs 165 s, p95 −8%, replica-minutes +13%) and one with the time-of-day model above (v1.1). What they say, honestly:
 
-- **The forecast helps where capacity has to grow from a low base.** On the morning ramp the predictive scaler had the capacity in place about 100 s sooner and latency during the ramp was lower.
-- **Part of that is not foresight.** The scaler entered the ramp with two replicas instead of one: `forecastAggregation: max` over a noisy night occasionally asked for a second replica, and each request reset the HPA's 300-second scale-down window. The forecast itself rose only once the ramp was visible in the ten-sample window; with no time-of-day features the model extrapolates a ramp that has started, it does not anticipate one that has not.
+- **The forecast helps where capacity has to grow from a low base.** On the morning ramp the predictive scaler had the capacity in place 75–105 s sooner. Latency during the ramp was lower by 2–8%; with pods that start in a second there is little latency to save.
+- **Part of that is not foresight.** In both runs the scaler entered the ramp with two replicas instead of one: `forecastAggregation: max` over a noisy night occasionally asked for a second replica, and each request reset the HPA's 300-second scale-down window.
+- **Time-of-day features did not change the outcome here.** The v1.1 model knows the phase of the compressed day, yet its lead over the HPA was no larger than the plain model's. Two warm-up days give it 160 samples to learn the phase from, and the scaler acts only through the HPA, whose own tolerance and stabilisation set the floor. One sample per configuration; the weekly run accumulates more.
 - **Where the HPA already holds capacity, there is nothing to win.** Both scalers kept three replicas through the lunch dip, so the afternoon ramp, the peak and the worst minute look the same, and neither run had a request over 500 ms.
-- **It costs.** 13% more replica-minutes, mostly the second replica held overnight.
+- **It costs.** 11–13% more replica-minutes, mostly the second replica held overnight.
 
 The setup matters as much as the model: the first run of this benchmark trained the model on raw cores while the scaler fed it `demand / capacity`, and the forecast over-provisioned all night. The CronJob now trains on exactly the series the scaler sends (and CI checks the rendered query).
+
+**On real traffic.** The same pipeline, unchanged, on hourly Wikipedia page views (three languages, 30 days, weekly in CI): the delta models beat persistence by 76–85% six hours out, the level-tracking gate rejects the best-RMSE model on one series because it cannot follow new levels, and the time-of-day features add nothing when the window already spans a day. Tables and reasoning: [docs/traces.md](docs/traces.md).
 
 ## Future Work
 
@@ -351,6 +354,29 @@ kubectl -n predictive logs deploy/predictive-scaler -f
 ```
 
 Knobs (environment variables of `up.sh`): `IMAGE_TAG` (`dev` builds locally; a commit sha pulls the images CI published to GHCR), `STEP_SECONDS=30` to compress time so the forecast window fills in 5 minutes instead of 50, `DEMO_SCALING=hpa` for the reactive baseline, `TRAIN=0` / `SMOKE=0` to skip steps. Re-running upgrades the release in place; `kind delete cluster --name predictive` removes everything.
+
+### Pilot on your own cluster
+
+The same chart, without the demo, scaling your services ([`helm/predictive-stack/values-pilot.yaml`](helm/predictive-stack/values-pilot.yaml)):
+
+```bash
+helm dependency build helm/predictive-stack
+helm upgrade --install predictive helm/predictive-stack -n predictive --create-namespace \
+  -f helm/predictive-stack/values-pilot.yaml --set global.imageTag=latest
+# KEDA's CRDs exist now; add your services as workloads
+cat > my-workloads.yaml <<'YAML'
+workloads:
+  - name: api
+    deployment: api
+    query: sum(rate(container_cpu_usage_seconds_total{namespace="predictive", container="api"}[2m]))
+    targetValue: "0.7"     # demand one replica should carry, in the query's units
+    capacity: "4"          # model input = demand / capacity
+    maxReplicas: 20
+YAML
+helm upgrade predictive helm/predictive-stack -n predictive --reuse-values -f my-workloads.yaml
+```
+
+Each entry becomes a `ScaledObject`; the nightly CronJob trains the model on the first entry's series divided by its `capacity`, so scaler and model always agree on units. Until the first training run there is no champion and the scaler scales on observed demand; `kubectl -n predictive create job --from=cronjob/forecast-retrain retrain-now` starts one as soon as there is a day of history. Prometheus keeps 30 days on a PersistentVolume, which is what the time-of-day features need.
 
 ### Pieces on their own
 
@@ -403,6 +429,7 @@ predictive-scaling-system/
 ├── docs/
 │   ├── ROADMAP.md               # stages: done and briefs
 │   ├── benchmark.md             # generated by benchmark.yml
+│   ├── traces.md                # the pipeline on Wikipedia traffic (traces.yml)
 │   ├── pitch.md                 # the project in nine sentences
 │   └── runbooks/                # one page per alert
 ├── notebooks/                   # exploration record + the January 2022 export

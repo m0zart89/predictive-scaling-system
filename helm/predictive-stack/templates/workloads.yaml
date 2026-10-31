@@ -1,0 +1,10 @@
+{{- /*
+One ScaledObject per entry of .Values.workloads (see values.yaml). KEDA's
+CRDs come from the KEDA subchart's templates, so on a fresh cluster install
+once without workloads, then upgrade with them (scripts/up.sh does the same
+two-phase install for the demo).
+*/ -}}
+{{- range $w := .Values.workloads }}
+---
+{{ include "predictive-stack.scaledobject" (dict "root" $ "w" $w) }}
+{{- end }}

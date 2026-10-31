@@ -1,0 +1,18 @@
+# helm lint / template fixture: two workloads, the model trained on the second.
+demo:
+  enabled: false
+workloads:
+  - name: api
+    deployment: api
+    query: sum(rate(container_cpu_usage_seconds_total{container="api"}[2m]))
+    targetValue: "0.7"
+    capacity: "4"
+    maxReplicas: 20
+  - name: worker
+    deployment: worker
+    query: sum(rate(container_cpu_usage_seconds_total{container="worker"}[2m]))
+    targetValue: "0.5"
+    minReplicas: 2
+    stepSeconds: "60"
+training:
+  workload: worker

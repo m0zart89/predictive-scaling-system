@@ -52,9 +52,9 @@ def test_meta_validation_and_roundtrip():
 @pytest.mark.parametrize("name", list(BY_NAME))
 @pytest.mark.parametrize("horizon", [1, 4])
 def test_every_candidate_fits_and_predicts_the_horizon(series, name, horizon):
-    _, values = series
-    b = fit_bundle(values[:1500], BY_NAME[name], 10, horizon, 300)
-    out = b.predict(values[1500:1510])
+    ts, values = series
+    b = fit_bundle(values[:1500], BY_NAME[name], 10, horizon, 300, ts[:1500])
+    out = b.predict(values[1500:1510], ts[1509:1510])
     assert out.shape == (1, horizon)
     assert np.all(np.isfinite(out))
 
@@ -102,3 +102,23 @@ def test_score_limits_steps():
     p = np.array([[1.0, 2.0, 4.0]])
     assert score(y, p).rmse_by_step == [0.0, 1.0, 3.0]
     assert score(y, p, steps=2).rmse == pytest.approx(0.5)
+
+
+def test_time_of_day_candidate_anticipates_the_daily_ramp(series):
+    """With the phase of the day as a feature, the 30-minute-ahead forecast on a
+    daily pattern beats the same model without it: it knows the ramp is coming."""
+    from forecast_training.model import CANDIDATES, train_and_select
+
+    ts, values = series
+    by_name = {c.name: c for c in CANDIDATES}
+    results, split = train_and_select(values, 10, 6, 300, 0.2, 0.5,
+                                      [by_name["hgb_delta"], by_name["hgb_delta_tod"]], ts)
+    rmse = {r.candidate.name: r.score.rmse for r in results}
+    assert rmse["hgb_delta_tod"] < rmse["hgb_delta"]
+    assert all(r.eligible for r in results)            # still follows new levels
+    tod = next(r for r in results if r.candidate.name == "hgb_delta_tod")
+    assert tod.bundle.meta.features == "anchored_tod" and tod.bundle.meta.period_seconds == 86400
+    # timed candidates need timestamps; without them they are skipped, not crashed
+    results2, _ = train_and_select(values, 10, 6, 300, 0.2, 0.5,
+                                   [by_name["hgb_delta"], by_name["hgb_delta_tod"]])
+    assert [r.candidate.name for r in results2] == ["hgb_delta"]

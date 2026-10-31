@@ -63,6 +63,15 @@ autoscaling:
 mlflow:
   trackingUri: "http://mlflow:5000"
 
+# POST /reload requires this value in the X-Reload-Token header. Either set
+# reloadToken (stored in this chart's Secret) or point reloadTokenSecret at an
+# existing Secret (the predictive-stack umbrella generates one and shares it
+# with the training jobs). Both empty: /reload is open — local runs only.
+reloadToken: ""
+reloadTokenSecret:
+  name: ""
+  key: RELOAD_TOKEN
+
 model:
   name: "cpu-forecasting"
   # Registry alias moved by the retraining job (training/).

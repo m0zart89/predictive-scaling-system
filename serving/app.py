@@ -1,3 +1,4 @@
+import hmac
 import json
 import math
 import os
@@ -5,13 +6,14 @@ import pickle
 import logging
 import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 from prometheus_client import Counter, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator, metrics
@@ -42,6 +44,10 @@ FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
 # cluster has no champion until the first training run; this picks it up
 # without anyone having to call /reload.
 MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "30"))
+# When set, POST /reload requires the same value in the X-Reload-Token header
+# (the chart generates one and hands it to the training jobs). Empty: open,
+# for local runs only.
+RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -79,6 +85,12 @@ MODEL_INFO = Gauge(
     "Loaded model, as labels (always 1); lets dashboards show which version served",
     ["model_name", "model_version", "model_stage", "run_id", "horizon"],
 )
+MODEL_HOLDOUT_MAE = Gauge(
+    "forecast_model_holdout_mae",
+    "Holdout MAE the loaded model achieved in training, by horizon step (from the registry "
+    "version's tags); the drift alert compares forecast_rolling_mae with it",
+    ["horizon_step"],
+)
 # Scores past forecasts against the actual values that later windows carry:
 # forecast_abs_error / forecast_rolling_mae, both by horizon step.
 TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_MAX_PENDING,
@@ -91,7 +103,7 @@ TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_M
 # forecast_meta.json artifact were registered by the notebook: TIME_STEPS
 # scaled values in, one value out.
 LEGACY_FORECAST_META = {"time_steps": TIME_STEPS, "horizon": 1, "step_seconds": 300,
-                        "features": "window", "target": "level"}
+                        "features": "window", "target": "level", "period_seconds": 86400}
 
 
 @dataclass(frozen=True)
@@ -103,11 +115,15 @@ class Bundle:
     meta: Dict[str, object]       # forecast_meta.json merged over the legacy defaults
     info: Dict[str, str]          # operational metadata (version, run_id, loaded_at)
 
-    def forecast(self, values: List[float]) -> List[float]:
-        """Raw window → forecast for each step of the model's horizon (raw units)."""
+    def forecast(self, values: List[float], timestamp: Optional[float] = None) -> List[float]:
+        """Raw window → forecast for each step of the model's horizon (raw units).
+        `timestamp`: unix time of the last value, used by time-of-day features
+        (defaults to now, which is right for a caller sending live windows)."""
         arr    = np.array(values, dtype=float).reshape(-1, 1)
         scaled = self.scaler.transform(arr).reshape(1, -1)
-        out    = self.model.predict(build_features(scaled, self.meta["features"]))
+        last_ts = np.array([timestamp if timestamp is not None else time.time()])
+        out    = self.model.predict(build_features(scaled, self.meta["features"], last_ts,
+                                                   int(self.meta.get("period_seconds", 86400))))
         out    = from_target(scaled, out, self.meta["target"])
         return [float(v) for v in self.scaler.inverse_transform(out.reshape(-1, 1)).ravel()]
 
@@ -183,6 +199,13 @@ def load_model() -> None:
     MODEL_INFO.clear()   # one series only: drop the previous version's labels
     MODEL_INFO.labels(model_name=MODEL_NAME, model_version=version, model_stage=selector,
                       run_id=run_id, horizon=str(loaded_meta["horizon"])).set(1)
+    MODEL_HOLDOUT_MAE.clear()
+    for key, raw in (v.tags or {}).items():
+        if key.startswith("holdout_mae_step_"):
+            try:
+                MODEL_HOLDOUT_MAE.labels(horizon_step=key.rsplit("_", 1)[1]).set(float(raw))
+            except ValueError:
+                log.warning("ignoring tag %s=%r on %s v%s", key, raw, MODEL_NAME, version)
     MODEL_RELOADS.labels(result="success").inc()
     log.info(
         "Model loaded: name=%s %s version=%s run_id=%s time_steps=%s horizon=%s target=%s",
@@ -352,6 +375,7 @@ def model_info():
         "step_seconds": meta["step_seconds"],
         "features":     meta["features"],
         "target":       meta["target"],
+        "period_seconds": meta.get("period_seconds", 86400),
         "rolling_mae":  {str(k): round(v, 6) for k, v in sorted(TRACKER.snapshot().items())},
         **(b.info if b is not None else {}),
     }
@@ -387,7 +411,7 @@ def predict(req: PredictRequest):
     PREDICTION_REQUESTS.inc()
 
     try:
-        predictions = b.forecast(req.values)
+        predictions = b.forecast(req.values, req.timestamp)
     except Exception as exc:
         PREDICTION_FAILURES.labels(reason="inference").inc()
         log.exception("Inference failed: %s", exc)
@@ -415,13 +439,17 @@ def predict(req: PredictRequest):
 
 
 @app.post("/reload", tags=["operations"], summary="Hot-reload model from MLflow")
-def reload():
+def reload(x_reload_token: Optional[str] = Header(default=None)):
     """
     Re-fetch the model from MLflow (MODEL_ALIAS, falling back to MODEL_STAGE)
     without restarting the pod. The retraining job calls this after moving the alias.
     Returns the new model metadata on success. On failure the previously loaded
-    model, if any, keeps serving.
+    model, if any, keeps serving. With RELOAD_TOKEN set, the X-Reload-Token
+    header must match.
     """
+    if RELOAD_TOKEN and not hmac.compare_digest(x_reload_token or "", RELOAD_TOKEN):
+        log.warning("POST /reload rejected: missing or wrong X-Reload-Token")
+        raise HTTPException(status_code=401, detail="X-Reload-Token header missing or wrong")
     log.info("Model reload triggered via POST /reload")
     try:
         load_model()
