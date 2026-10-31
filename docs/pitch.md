@@ -19,12 +19,14 @@ single script brings up on kind, with an e2e test and a benchmark in GitHub
 Actions.
 
 **Result.** In a benchmark against a plain CPU HPA on a compressed day of
-traffic, the predictive scaler had the morning ramp's capacity in place in
-60 s instead of 165 s and cut p95 latency during that ramp by 8%, at the cost
-of 13% more replica-minutes. On the afternoon ramp and at peak it made no
-difference, because the HPA had kept its capacity, and the forecast follows a
-ramp rather than anticipating it; time-of-day features are the measured next
-step. The first benchmark run also caught a real units bug between training
+traffic, the predictive scaler had the morning ramp's capacity in place
+75–105 s sooner (60 s vs 165 s, then 105 s vs 180 s with time-of-day
+features) and cut p95 latency during that ramp by 2–8%, at the cost of
+11–13% more replica-minutes. On the afternoon ramp and at peak it made no
+difference, because the HPA had kept its capacity. On real hourly Wikipedia
+traffic the same pipeline beats persistence by 76–85% six hours out, and its
+level-tracking gate rejected a best-RMSE model that could not follow new
+levels. The first benchmark run also caught a real units bug between training
 and scaling, which is now checked in CI.
 
 ---
@@ -48,9 +50,12 @@ Prometheus, запрашивает прогноз на 30 минут у FastAPI-
 одним скриптом на kind, с e2e-тестом и бенчмарком в GitHub Actions.
 
 **Результат.** В бенчмарке против обычного HPA по CPU на сжатом дне трафика
-предиктивный скейлер набрал нужную для утренней рампы ёмкость за 60 с вместо
-165 с и снизил p95 на этой рампе на 8% ценой 13% лишних replica-minutes. На
-дневной рампе и на пике разницы не было: HPA сохранил ёмкость, а прогноз
-следует за начавшейся рампой, а не предвосхищает её — следующий измеренный
-шаг это признаки времени суток. Первый же прогон бенчмарка поймал реальную
-ошибку единиц между обучением и скейлингом, теперь она проверяется в CI.
+предиктивный скейлер набирал нужную для утренней рампы ёмкость на 75–105 с
+раньше (60 с против 165 с, затем 105 с против 180 с с признаками времени
+суток) и снижал p95 на этой рампе на 2–8% ценой 11–13% лишних
+replica-minutes. На дневной рампе и на пике разницы не было: HPA сохранил
+ёмкость. На реальном почасовом трафике Википедии тот же пайплайн бьёт
+persistence на 76–85% на шесть часов вперёд, а проверка слежения за уровнем
+отклонила модель с лучшим RMSE, не умеющую следовать новым уровням. Первый
+же прогон бенчмарка поймал реальную ошибку единиц между обучением и
+скейлингом, теперь она проверяется в CI.
