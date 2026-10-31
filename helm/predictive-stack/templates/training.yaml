@@ -51,6 +51,8 @@ spec:
                   value: {{ $t.cronjob.days | quote }}
                 - name: TRAIN_STEP_SECONDS
                   value: {{ $t.cronjob.stepSeconds | quote }}
+                - name: TRAIN_PERIOD_SECONDS
+                  value: {{ $t.cronjob.periodSeconds | quote }}
                 - name: TRAIN_TIME_STEPS
                   value: {{ $t.cronjob.timeSteps | quote }}
                 - name: TRAIN_HORIZON

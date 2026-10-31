@@ -93,7 +93,7 @@ if [ "$SKIP_WARMUP" != "1" ]; then
   log "training on the warm-up data (${STEP_SECONDS}s step)"
   days=$(python3 -c "print($WARMUP_DAYS * $DAY_SECONDS / 86400 + 0.002)")
   helm_set training.cronjob.stepSeconds="$STEP_SECONDS" training.cronjob.days="$days" \
-    training.cronjob.minImprovement=0
+    training.cronjob.periodSeconds="$DAY_SECONDS" training.cronjob.minImprovement=0
   k delete job bench-train --ignore-not-found >/dev/null
   k create job bench-train --from=cronjob/forecast-retrain >/dev/null
   k wait --for=condition=complete job/bench-train --timeout=20m >/dev/null \

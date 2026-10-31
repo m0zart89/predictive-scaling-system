@@ -42,8 +42,15 @@ summary on stdout says what happened:
 | `rf_delta` | window relative to last value, plus last value | change from last value | |
 | `hgb_delta` | same | same | gradient boosting, one model per horizon step |
 | `ridge_delta` | same | same | linear baseline |
+| `hgb_delta_tod` | anchored + sin/cos of the seasonal phase | same | knows what time it is: can move before a daily ramp shows in the window |
+| `rf_delta_tod` | same | same | |
 
-All predict the whole horizon (default 6 steps = 30 min).
+All predict the whole horizon (default 6 steps = 30 min). The `_tod`
+candidates need timestamps (both sources provide them) and a seasonal cycle:
+`--period-seconds`, 86400 for real days, the compressed day length when time
+is compressed as in the benchmark. The scaler sends the last sample's
+timestamp with every `/predict`, so serving evaluates the phase for the right
+instant.
 
 ## Promotion rules
 
@@ -68,7 +75,8 @@ A registered version has three artifacts:
   `requirements.txt` in step with `serving/requirements.txt`)
 - `scaler/scaler.pkl` — MinMaxScaler fitted on the training values
 - `forecast_meta.json` — `time_steps`, `horizon`, `step_seconds`,
-  `features` (`window` | `anchored`), `target` (`level` | `delta`)
+  `features` (`window` | `anchored` | `anchored_tod`), `target`
+  (`level` | `delta`), `period_seconds` (seasonal cycle for `anchored_tod`)
 
 `forecast_training/features.py` is the single implementation of the
 transforms: the serving image copies it (`serving/Dockerfile` builds from the

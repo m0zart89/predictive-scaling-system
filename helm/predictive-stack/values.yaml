@@ -150,6 +150,9 @@ training:
     query: ""
     days: "14"
     stepSeconds: "300"
+    # Seasonal cycle for the time-of-day features: a real day. The benchmark
+    # compresses a day into DAY_SECONDS and sets this accordingly.
+    periodSeconds: "86400"
     timeSteps: "10"
     horizon: "6"
     minImprovement: "0.02"

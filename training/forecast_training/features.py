@@ -10,6 +10,17 @@ A registered model is a sklearn estimator plus two artifacts:
 serving/app.py implements the same `features`/`target` transforms for a single
 window; tests/test_training_serving.py checks that both sides agree.
 
+Why time-of-day features ("anchored_tod")
+-----------------------------------------
+A window of the last ten samples says where the load is and which way it is
+moving, not what time it is. On a daily pattern the morning ramp starts at
+the same hour every day; the window only sees it once it has begun. Encoding
+the last sample's position in the seasonal cycle (sin/cos of the phase, so
+23:55 and 00:05 are neighbours) lets the model learn "at 06:00 the next half
+hour goes up" and move before the window shows it. `period_seconds` is the
+cycle length: 86400 for real days, shorter when time is compressed, as in
+the benchmark.
+
 Why a "delta" target
 --------------------
 A tree ensemble predicts by averaging training targets, so it can never forecast
@@ -26,9 +37,11 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-FORMAT_VERSION = 1
-FEATURE_KINDS = ("window", "anchored")
+FORMAT_VERSION = 2
+FEATURE_KINDS = ("window", "anchored", "anchored_tod")
 TARGET_KINDS = ("level", "delta")
+# Feature kinds that need the timestamp of each window's last sample.
+TIMED_FEATURE_KINDS = ("anchored_tod",)
 
 
 @dataclass(frozen=True)
@@ -36,8 +49,10 @@ class ForecastMeta:
     time_steps: int = 10
     horizon: int = 1
     step_seconds: int = 300
-    features: str = "window"   # window: scaled window as-is; anchored: relative to last value
+    features: str = "window"   # window: scaled window as-is; anchored: relative to last value;
+                               # anchored_tod: anchored + sin/cos of the seasonal phase
     target: str = "level"      # level: model outputs values; delta: outputs change from last value
+    period_seconds: int = 86400   # seasonal cycle for anchored_tod (a real day; 2400 in the benchmark)
     format_version: int = FORMAT_VERSION
 
     def __post_init__(self):
@@ -47,6 +62,12 @@ class ForecastMeta:
             raise ValueError(f"target must be one of {TARGET_KINDS}")
         if self.time_steps < 2 or self.horizon < 1:
             raise ValueError("time_steps must be >= 2 and horizon >= 1")
+        if self.period_seconds <= 0:
+            raise ValueError("period_seconds must be > 0")
+
+    @property
+    def needs_time(self) -> bool:
+        return self.features in TIMED_FEATURE_KINDS
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -82,14 +103,27 @@ def make_windows(values: np.ndarray, time_steps: int, horizon: int):
     return X, Y, np.arange(n) + time_steps
 
 
-def build_features(X: np.ndarray, kind: str) -> np.ndarray:
+def time_features(last_ts, period_seconds: int = 86400) -> np.ndarray:
+    """(n, 2) sin/cos of where each window's last sample sits in the seasonal cycle."""
+    ts = np.asarray(last_ts, dtype=np.float64).reshape(-1)
+    phase = 2 * np.pi * (ts % period_seconds) / period_seconds
+    return np.column_stack([np.sin(phase), np.cos(phase)])
+
+
+def build_features(X: np.ndarray, kind: str, last_ts=None, period_seconds: int = 86400) -> np.ndarray:
+    """`last_ts`: unix time of each row's last sample; required for timed kinds."""
     X = np.atleast_2d(X)
     if kind == "window":
         return X
-    if kind == "anchored":
+    if kind in ("anchored", "anchored_tod"):
         last = X[:, -1:]
         # shape of the window relative to now, plus the current level
-        return np.hstack([X[:, :-1] - last, last])
+        feats = np.hstack([X[:, :-1] - last, last])
+        if kind == "anchored_tod":
+            if last_ts is None:
+                raise ValueError("anchored_tod features need the timestamp of the last sample")
+            feats = np.hstack([feats, time_features(last_ts, period_seconds)])
+        return feats
     raise ValueError(kind)
 
 

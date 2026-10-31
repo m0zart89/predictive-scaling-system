@@ -58,7 +58,7 @@ A fuller treatment, with the decisions table: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ### Retraining pipeline (`training/`)
 
-`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`), scores them on a chronological holdout and registers the winner with its scaler and `forecast_meta.json`. Promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
+`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`, and `hgb_delta_tod` / `rf_delta_tod` with the time of day as a feature), scores them on a chronological holdout and registers the winner with its scaler and `forecast_meta.json`. Promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
 
 ### Model registry (MLflow)
 
@@ -249,7 +249,7 @@ These are known simplifications, not omissions:
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
 - **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
 - **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It is one sample and shows the mechanism, not a capacity figure.
-- **No anticipation before a ramp starts.** The model sees only the last ten samples, so the forecast rises with the ramp, not ahead of it. Time-of-day features are the next step (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+- **Anticipation depends on the clock.** The `_tod` candidates add the phase of the day to the window, so the model can move before a daily ramp is visible; it still cannot foresee a ramp that is not periodic, and it needs a few days of history to learn the pattern.
 - **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
 - **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 

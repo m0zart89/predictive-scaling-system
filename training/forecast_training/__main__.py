@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--horizon", type=int, default=int(_env("TRAIN_HORIZON", 6)),
                    help="steps to forecast; 6 × 5 min = 30 min (default 6)")
     p.add_argument("--step-seconds", type=int, default=int(_env("TRAIN_STEP_SECONDS", 300)))
+    p.add_argument("--period-seconds", type=int, default=int(_env("TRAIN_PERIOD_SECONDS", 86400)),
+                   help="seasonal cycle for the time-of-day features: 86400 for real days, the "
+                        "compressed day length when time is compressed (default 86400)")
     p.add_argument("--test-fraction", type=float, default=float(_env("TRAIN_TEST_FRACTION", 0.2)))
     p.add_argument("--candidates", default=_env("TRAIN_CANDIDATES", ",".join(CANDIDATE_NAMES)),
                    help=f"comma-separated subset of: {', '.join(CANDIDATE_NAMES)}")
@@ -103,7 +106,7 @@ def main(argv=None) -> int:
         cfg = TrainConfig(
             model_name=args.model_name, alias=args.alias, experiment=args.experiment,
             time_steps=args.time_steps, horizon=args.horizon, step_seconds=args.step_seconds,
-            test_fraction=args.test_fraction, min_tracking=args.min_tracking,
+            period_seconds=args.period_seconds, test_fraction=args.test_fraction, min_tracking=args.min_tracking,
             min_improvement=args.min_improvement, min_fresh_windows=args.min_fresh_windows,
             refit=not args.no_refit, dry_run=args.dry_run,
             candidates=[c.strip() for c in args.candidates.split(",") if c.strip()],

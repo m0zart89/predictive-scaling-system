@@ -24,9 +24,6 @@ built from are in the git history of this file (`git log -p docs/ROADMAP.md`).
 
 Candidates for a next stage, roughly by value:
 
-- **Time-of-day features.** The model sees only the last ten samples, so it
-  cannot anticipate a ramp that has not started inside the window.
-  [docs/benchmark.md](benchmark.md) measures how much lead time it buys today.
 - **Alert-driven retraining.** `ForecastDriftHigh` → Alertmanager webhook →
   `kubectl create job --from=cronjob/forecast-retrain`.
 - **Real workload traces** (Alibaba cluster-trace-v2018, Google ClusterData2019,
