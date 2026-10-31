@@ -1,11 +1,12 @@
 name: real traces
 
 # The retraining pipeline on real traffic, not the synthetic demo: hourly
-# Wikipedia page views (a daily + weekly pattern, public, no key) for a few
-# articles over the last 30 days, converted with forecast_training.traces and
-# trained in dry-run mode against a throwaway SQLite MLflow. The summary per
-# article (winner, holdout RMSE per candidate, persistence baseline) is the
-# artifact; the job fails if no candidate beats persistence.
+# page views of whole Wikipedia projects (a daily + weekly pattern, public,
+# no key; different languages peak at different UTC hours) over the last 30
+# days, converted with forecast_training.traces and trained in dry-run mode
+# against a throwaway SQLite MLflow. The summary per project (winner, holdout
+# RMSE per candidate, persistence baseline) is the artifact; the job fails if
+# no candidate beats persistence.
 
 on:
   workflow_dispatch:
@@ -24,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        article: [Kubernetes, Python_(programming_language), Prometheus_(software)]
+        project: [en.wikipedia, de.wikipedia, ja.wikipedia]
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +40,7 @@ jobs:
         run: |
           mkdir -p traces
           PYTHONPATH=training python -m forecast_training.traces wikipedia \
-            --article "${{ matrix.article }}" --days 30 --out traces/views.json
+            --project "${{ matrix.project }}" --days 30 --out traces/views.json
 
       - name: "Train (dry run, SQLite MLflow): 24 h window, 6 h horizon, daily phase"
         env:
@@ -79,5 +80,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: traces-${{ matrix.article }}
+          name: traces-${{ matrix.project }}
           path: traces/

@@ -92,8 +92,8 @@ shape the pipeline reads, so the same code can be shown on something other
 than the synthetic demo:
 
 ```bash
-# hourly Wikipedia page views of an article: a real daily + weekly pattern, no key needed
-python -m forecast_training.traces wikipedia --article Kubernetes --days 30 --out traces/views.json
+# hourly page views of a whole Wikipedia project: a real daily + weekly pattern, no key needed
+python -m forecast_training.traces wikipedia --project en.wikipedia --days 30 --out traces/views.json
 MLFLOW_TRACKING_URI=sqlite:///mlflow.db python -m forecast_training --export traces/views.json \
     --step-seconds 3600 --time-steps 24 --horizon 6 --period-seconds 86400 --dry-run
 
@@ -103,8 +103,9 @@ python -m forecast_training.traces csv --path machine_usage.csv --ts-col 1 --val
 ```
 
 `.github/workflows/traces.yml` runs the Wikipedia case weekly for three
-articles and fails if no candidate beats persistence; the candidate table is
-in the job output and artifacts.
+projects (English, German, Japanese: the same daily shape at different UTC
+hours) and fails if no candidate beats persistence; the candidate table is in
+the job output and artifacts.
 
 ## Tests
 

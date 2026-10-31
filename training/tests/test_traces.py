@@ -10,15 +10,17 @@ from forecast_training.traces import csv_series, main, parse_wikimedia, to_expor
 
 def test_wikimedia_items_become_hourly_points(tmp_path):
     body = {"items": [
-        {"project": "en.wikipedia", "article": "Kubernetes", "timestamp": "2025100100", "views": 120},
-        {"project": "en.wikipedia", "article": "Kubernetes", "timestamp": "2025100101", "views": 95},
+        {"project": "en.wikipedia", "access": "all-access", "agent": "user",
+         "granularity": "hourly", "timestamp": "2025100100", "views": 120},
+        {"project": "en.wikipedia", "access": "all-access", "agent": "user",
+         "granularity": "hourly", "timestamp": "2025100101", "views": 95},
     ]}
     points = parse_wikimedia(body)
     assert points == [(1759276800, 120.0), (1759280400, 95.0)]
     assert points[1][0] - points[0][0] == 3600
 
     out = tmp_path / "wiki.json"
-    out.write_text(json.dumps(to_export(points, {"article": "Kubernetes"})))
+    out.write_text(json.dumps(to_export(points, {"project": "en.wikipedia"})))
     assert load_export(str(out)) == points          # round-trips through the pipeline's reader
 
 

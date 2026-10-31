@@ -6,10 +6,11 @@ The pipeline reads a Prometheus `query_range` response (one series of
 This module writes that shape from two kinds of source, so the same training
 code can be shown on real traffic, not only on the synthetic demo:
 
-    # hourly Wikipedia page views (a real daily + weekly pattern, free, no key)
-    python -m forecast_training.traces wikipedia --article Kubernetes --days 30 \
-        --out traces/wikipedia-kubernetes.json
-    python -m forecast_training --export traces/wikipedia-kubernetes.json \
+    # hourly page views of a whole Wikipedia project (a real daily + weekly
+    # pattern, free, no key; per-article data is daily only)
+    python -m forecast_training.traces wikipedia --project en.wikipedia --days 30 \
+        --out traces/wikipedia-en.json
+    python -m forecast_training --export traces/wikipedia-en.json \
         --step-seconds 3600 --time-steps 24 --horizon 6 --dry-run
 
     # any CSV with a timestamp and a value column, e.g. Alibaba
@@ -36,14 +37,14 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 Point = Tuple[int, float]
 
-WIKIMEDIA = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
+WIKIMEDIA = "https://wikimedia.org/api/rest_v1/metrics/pageviews/aggregate"
 USER_AGENT = "predictive-scaling-system/1.1 (https://github.com/m0zart89/predictive-scaling-system)"
 
 
 # ── sources ────────────────────────────────────────────────────────────────────
 
 def parse_wikimedia(body: dict) -> List[Point]:
-    """`items` of a per-article pageviews response → (unix hour, views)."""
+    """`items` of a pageviews response → (unix hour, views)."""
     points = []
     for item in body.get("items", []):
         ts = datetime.strptime(item["timestamp"], "%Y%m%d%H").replace(tzinfo=timezone.utc)
@@ -51,13 +52,13 @@ def parse_wikimedia(body: dict) -> List[Point]:
     return points
 
 
-def wikipedia_pageviews(article: str, days: int = 30, project: str = "en.wikipedia",
+def wikipedia_pageviews(project: str = "en.wikipedia", days: int = 30,
                         end: datetime | None = None, timeout: float = 60.0) -> List[Point]:
-    """Hourly views of one article over the last `days` whole days (ending yesterday)."""
+    """Hourly user views of a whole project over the last `days` whole days (ending yesterday)."""
     today = (end or datetime.now(timezone.utc)).replace(hour=0, minute=0, second=0, microsecond=0)
     last = today - timedelta(hours=1)                # yesterday 23:00; today is not final yet
     first = today - timedelta(days=days)             # 00:00, `days` days ago
-    url = "/".join([WIKIMEDIA, project, "all-access", "user", urllib.parse.quote(article, safe=""),
+    url = "/".join([WIKIMEDIA, urllib.parse.quote(project, safe=""), "all-access", "user",
                     "hourly", first.strftime("%Y%m%d%H"), last.strftime("%Y%m%d%H")])
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
@@ -142,9 +143,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="forecast_training.traces", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="source", required=True)
-    w = sub.add_parser("wikipedia", help="hourly page views of one article")
-    w.add_argument("--article", required=True)
-    w.add_argument("--project", default="en.wikipedia")
+    w = sub.add_parser("wikipedia", help="hourly page views of a whole project")
+    w.add_argument("--project", default="en.wikipedia", help="e.g. en.wikipedia, de.wikipedia")
     w.add_argument("--days", type=int, default=30)
     w.add_argument("--out", required=True)
     c = sub.add_parser("csv", help="a timestamp/value CSV, rows per timestamp combined")
@@ -160,8 +160,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.source == "wikipedia":
-        points = wikipedia_pageviews(args.article, args.days, args.project)
-        metric = {"source": "wikimedia-pageviews", "project": args.project, "article": args.article}
+        points = wikipedia_pageviews(args.project, args.days)
+        metric = {"source": "wikimedia-pageviews", "project": args.project}
     else:
         points = csv_series(args.path, args.ts_col, args.value_col, args.aggregate, args.ts_offset,
                             args.ts_format, args.delimiter, scale=args.scale)
