@@ -25,6 +25,11 @@ grafana:
   anonymous: false
   adminPassword: change-me
 
+security:
+  networkPolicy:
+    enabled: true            # needs a CNI that enforces NetworkPolicy
+    ingressNamespace: ingress-nginx
+
 prometheus:
   retention: 30d
   persistence:

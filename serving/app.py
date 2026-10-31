@@ -1,3 +1,4 @@
+import hmac
 import json
 import math
 import os
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 from prometheus_client import Counter, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator, metrics
@@ -43,6 +44,10 @@ FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
 # cluster has no champion until the first training run; this picks it up
 # without anyone having to call /reload.
 MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "30"))
+# When set, POST /reload requires the same value in the X-Reload-Token header
+# (the chart generates one and hands it to the training jobs). Empty: open,
+# for local runs only.
+RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -421,13 +426,17 @@ def predict(req: PredictRequest):
 
 
 @app.post("/reload", tags=["operations"], summary="Hot-reload model from MLflow")
-def reload():
+def reload(x_reload_token: Optional[str] = Header(default=None)):
     """
     Re-fetch the model from MLflow (MODEL_ALIAS, falling back to MODEL_STAGE)
     without restarting the pod. The retraining job calls this after moving the alias.
     Returns the new model metadata on success. On failure the previously loaded
-    model, if any, keeps serving.
+    model, if any, keeps serving. With RELOAD_TOKEN set, the X-Reload-Token
+    header must match.
     """
+    if RELOAD_TOKEN and not hmac.compare_digest(x_reload_token or "", RELOAD_TOKEN):
+        log.warning("POST /reload rejected: missing or wrong X-Reload-Token")
+        raise HTTPException(status_code=401, detail="X-Reload-Token header missing or wrong")
     log.info("Model reload triggered via POST /reload")
     try:
         load_model()

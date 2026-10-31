@@ -221,3 +221,37 @@ def test_time_of_day_model_serves_the_pipeline_forecast_for_the_given_timestamp(
     evening = serving.post("/predict", json={"values": window, "timestamp": int(ts[-1]) + 6 * 3600}).json()
     assert morning["predictions"] != evening["predictions"]   # the hour matters now
     assert serving.post("/predict", json={"values": window}).status_code == 200   # defaults to now
+
+
+def test_reload_requires_the_token_when_one_is_configured(registry, serving, monkeypatch):
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    monkeypatch.setattr(serving_app, "RELOAD_TOKEN", "s3cret")
+    client = TestClient(serving_app.app, raise_server_exceptions=False)
+    assert client.post("/reload").status_code == 401
+    assert client.post("/reload", headers={"X-Reload-Token": "wrong"}).status_code == 401
+    assert client.get("/ready").status_code == 503          # nothing was loaded by the refusals
+    assert client.post("/reload", headers={"X-Reload-Token": "s3cret"}).status_code == 200
+    assert client.get("/ready").status_code == 200
+
+    # the training side sends the header the service expects
+    seen = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        seen["token"] = req.get_header("X-reload-token")
+        return Resp()
+
+    from forecast_training import registry as reg
+    monkeypatch.setattr(reg.urllib.request, "urlopen", fake_urlopen)
+    assert reg.reload_serving("http://forecast-serving:8080", token="s3cret") is True
+    assert seen["token"] == "s3cret"

@@ -242,9 +242,12 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
     return Outcome("kept_champion", vs, metrics=metrics)
 
 
-def reload_serving(url: str, timeout: float = 30.0) -> bool:
-    """Ask forecast-serving to load the new champion. Failure is logged, not raised."""
-    req = urllib.request.Request(f"{url.rstrip('/')}/reload", data=b"", method="POST")
+def reload_serving(url: str, timeout: float = 30.0, token: Optional[str] = None) -> bool:
+    """Ask forecast-serving to load the new champion. Failure is logged, not raised.
+    `token` goes into X-Reload-Token (forecast-serving's RELOAD_TOKEN)."""
+    headers = {"X-Reload-Token": token} if token else {}
+    req = urllib.request.Request(f"{url.rstrip('/')}/reload", data=b"", method="POST",
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             log.info("serving reloaded: %s", resp.read().decode()[:200])

@@ -1,0 +1,17 @@
+{{- /*
+Token for forecast-serving's POST /reload, shared with the training jobs.
+Generated once and kept across upgrades (lookup), or set security.reloadToken.
+*/ -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace "forecast-reload-token").data | default dict }}
+{{- $token := .Values.security.reloadToken | default (get $existing "RELOAD_TOKEN" | b64dec) | default (randAlphaNum 32) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: forecast-reload-token
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+stringData:
+  RELOAD_TOKEN: {{ $token | quote }}

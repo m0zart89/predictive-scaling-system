@@ -41,6 +41,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "forecast-serving.fullname" . }}
                   key: MLFLOW_TRACKING_URI
+            - name: RELOAD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.reloadTokenSecret.name | default (include "forecast-serving.fullname" .) }}
+                  key: {{ if .Values.reloadTokenSecret.name }}{{ .Values.reloadTokenSecret.key }}{{ else }}RELOAD_TOKEN{{ end }}
             - name: MODEL_NAME
               value: {{ .Values.model.name | quote }}
             - name: MODEL_ALIAS
