@@ -380,7 +380,7 @@ Each entry becomes a `ScaledObject`; the nightly CronJob trains the model on the
 
 ### Pieces on their own
 
-- **Images** are published by CI to `ghcr.io/m0zart89/predictive-scaling-system/{forecast-serving,predictive-scaler,cpu-burner,forecast-training}:{<sha>,latest}` on every push to `main`, as multi-arch manifests for `linux/amd64` and `linux/arm64` (Raspberry Pi 4/5 with a 64-bit OS and other ARM nodes pull them as is; every platform image the chart uses ships arm64 too).
+- **Images** are published by CI to `ghcr.io/m0zart89/predictive-scaling-system/{forecast-serving,predictive-scaler,cpu-burner,forecast-training}:{<sha>,latest}` on every push to `main`.
 - **Helm charts**: `helm/predictive-stack` installs the whole system (`helm dependency build` first — KEDA is a dependency); `helm/forecast-serving` and `helm/predictive-scaler` work standalone.
 - **Plain manifests**: `helm template predictive helm/predictive-stack -n predictive --set demo.scaling=predictive > stack.yaml` renders everything for `kubectl apply` (install KEDA's CRDs first).
 - **Train a model** from anywhere with access to MLflow:
