@@ -2,11 +2,12 @@
 {{- $image := include "predictive-stack.image" (dict "image" $t.image "global" .Values.global) }}
 {{- $tw := include "predictive-stack.trainingWorkload" . | fromYaml }}
 {{- $query := $t.cronjob.query }}
-{{- if not $query }}
-{{- if not $tw.query }}{{ fail "training.cronjob.query is empty and there is no workload to train on: add an entry to .Values.workloads (or enable the demo)" }}{{ end }}
+{{- if and (not $query) $tw.query }}
 {{- $query = printf "(%s) / %s" $tw.query $tw.capacity }}
 {{- end }}
-{{- if $t.cronjob.enabled }}
+{{- /* No query and no workload (a pilot before its workloads are added): no
+       CronJob rather than one that would fail every night. NOTES.txt says so. */}}
+{{- if and $t.cronjob.enabled $query }}
 # Nightly retraining: pull the last N days from Prometheus, train candidates,
 # compare with the @champion model on data it has not seen, move the alias if
 # the new model is better, then tell forecast-serving to reload.

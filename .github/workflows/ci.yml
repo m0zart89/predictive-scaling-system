@@ -194,6 +194,7 @@ jobs:
 
       - name: Helm template (dry-run)
         run: |
+          set -x
           for chart in forecast-serving predictive-scaler; do
             helm template "$chart" "helm/$chart/" --set image.tag=ci-${{ github.sha }} --debug > /dev/null
           done
@@ -216,9 +217,11 @@ jobs:
           test "$(grep -c 'name: forecast-reload-token' /tmp/stack.yaml)" -ge 4
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
-          # no workload and no demo must fail loudly, not render a CronJob without a query
-          if helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /dev/null 2>&1; then
-            echo "::error::expected the chart to refuse a release with nothing to train on"; exit 1
+          # nothing to train on yet (pilot before its workloads are added): no CronJob,
+          # no broken query — the release must still install so KEDA's CRDs land
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /tmp/empty.yaml
+          if grep -q 'kind: CronJob' /tmp/empty.yaml; then
+            echo "::error::a CronJob was rendered with nothing to train on"; exit 1
           fi
 
   # Placeholder job — shows the intended CD path without implementing it
