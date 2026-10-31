@@ -23,9 +23,12 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 - **Drift threshold from the model.** Each version is tagged with its
   per-step holdout MAE, serving exports it, `ForecastDriftHigh` fires at
   twice it (fixed 0.25 only without a baseline).
-- **Real traces.** `forecast_training.traces` converts Wikimedia page views
-  and timestamp/value CSVs (Alibaba and the like); `traces.yml` trains on
-  three articles weekly and fails unless a candidate beats persistence.
+- **Real traces.** `forecast_training.traces` converts hourly Wikimedia page
+  views and timestamp/value CSVs (Alibaba and the like); `traces.yml` trains
+  on three projects weekly and fails unless a candidate beats persistence.
+  First run: delta models 76–85% better than persistence six hours out; the
+  gate rejects a pinned model with the best RMSE; `_tod` features add
+  nothing with a 24-hour window (`docs/traces.md`).
 
 ## v1.0.0 — stages 3–6 (PR #4)
 

@@ -104,8 +104,8 @@ python -m forecast_training.traces csv --path machine_usage.csv --ts-col 1 --val
 
 `.github/workflows/traces.yml` runs the Wikipedia case weekly for three
 projects (English, German, Japanese: the same daily shape at different UTC
-hours) and fails if no candidate beats persistence; the candidate table is in
-the job output and artifacts.
+hours) and fails if no candidate beats persistence. Results and what they
+say about the candidates and the gate: [docs/traces.md](../docs/traces.md).
 
 ## Tests
 
