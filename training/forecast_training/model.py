@@ -116,11 +116,14 @@ class Score:
     rmse_by_step: List[float]
     mae: float
     n: int
+    mae_by_step: List[float] = field(default_factory=list)   # serving compares its rolling MAE to this
 
     def as_metrics(self, prefix: str = "") -> Dict[str, float]:
         m = {f"{prefix}rmse": self.rmse, f"{prefix}mae": self.mae}
         for i, v in enumerate(self.rmse_by_step, start=1):
             m[f"{prefix}rmse_step_{i}"] = v
+        for i, v in enumerate(self.mae_by_step, start=1):
+            m[f"{prefix}mae_step_{i}"] = v
         return m
 
 
@@ -128,8 +131,10 @@ def score(y_true: np.ndarray, y_pred: np.ndarray, steps: int | None = None) -> S
     steps = steps or y_true.shape[1]
     err = y_pred[:, :steps] - y_true[:, :steps]
     by_step = np.sqrt(np.mean(err ** 2, axis=0))
+    mae_by_step = np.mean(np.abs(err), axis=0)
     return Score(rmse=float(np.mean(by_step)), rmse_by_step=[float(x) for x in by_step],
-                 mae=float(np.mean(np.abs(err))), n=int(len(err)))
+                 mae=float(np.mean(np.abs(err))), n=int(len(err)),
+                 mae_by_step=[float(x) for x in mae_by_step])
 
 
 def holdout_windows(values: np.ndarray, split: int, time_steps: int, horizon: int,

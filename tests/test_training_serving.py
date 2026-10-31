@@ -255,3 +255,19 @@ def test_reload_requires_the_token_when_one_is_configured(registry, serving, mon
     monkeypatch.setattr(reg.urllib.request, "urlopen", fake_urlopen)
     assert reg.reload_serving("http://forecast-serving:8080", token="s3cret") is True
     assert seen["token"] == "s3cret"
+
+
+def test_serving_exports_the_models_holdout_mae_for_the_drift_alert(registry, serving):
+    from prometheus_client import REGISTRY
+
+    ts, values = demand()
+    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta"]), "test", timestamps=ts)
+    from mlflow.tracking import MlflowClient
+    tags = MlflowClient().get_model_version("cpu-forecasting", out.version).tags
+    assert {"holdout_mae_step_1", "holdout_mae_step_2", "holdout_mae_step_3"} <= set(tags)
+
+    serving_app.load_model()
+    for step in (1, 2, 3):
+        got = REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": str(step)})
+        assert got == pytest.approx(float(tags[f"holdout_mae_step_{step}"]))
+    assert REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": "4"}) is None

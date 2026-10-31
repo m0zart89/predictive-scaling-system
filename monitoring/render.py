@@ -74,6 +74,7 @@ METRIC_LABELS = {
     "forecast_prediction_failures_total": {"reason"},
     "forecast_model_reloads_total": {"result"},
     "forecast_model_info": {"model_name", "model_version", "model_stage", "run_id", "horizon"},
+    "forecast_model_holdout_mae": {"horizon_step"},
     "forecast_abs_error": {"horizon_step"},
     "forecast_rolling_mae": {"horizon_step"},
     "predictive_scaler_decisions_total": {"scaledobject", "source"},

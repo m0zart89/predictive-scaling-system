@@ -59,7 +59,33 @@
             }
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "alert threshold.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {},
       "targets": [
@@ -71,9 +97,18 @@
           "expr": "forecast_rolling_mae",
           "legendFormat": "step {{horizon_step}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "2 * forecast_model_holdout_mae",
+          "legendFormat": "alert threshold step {{horizon_step}}",
+          "refId": "B"
         }
       ],
-      "description": "Mean |actual - forecast| over the last FORECAST_MAE_WINDOW resolved forecasts, in model units. ForecastDriftHigh fires above 0.25 for 30 min."
+      "description": "Mean |actual - forecast| over the last FORECAST_MAE_WINDOW resolved forecasts, in model units. ForecastDriftHigh fires when it stays above twice the model's holdout MAE (dashed) for 30 min."
     },
     {
       "id": 2,

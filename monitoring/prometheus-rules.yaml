@@ -106,14 +106,27 @@ data:
       # ── Forecast quality / drift ─────────────────────────────────────────────
       # forecast_rolling_mae is the mean |actual - forecast| over the last
       # FORECAST_MAE_WINDOW resolved forecasts, in model units (demand divided by
-      # the ScaledObject's `capacity`). The threshold is deliberately loose:
-      # tune it to ~2x the holdout RMSE of the champion (MLflow: holdout_rmse_step_N).
+      # the ScaledObject's `capacity`). The threshold is twice the holdout MAE
+      # the loaded model achieved in training (forecast_model_holdout_mae, from
+      # the registry version's tags), so it follows the workload and the model.
+      # A model without that tag (registered by the notebook) falls back to a
+      # fixed 0.25.
       - name: forecast-quality
         interval: 60s
         rules:
           - alert: ForecastDriftHigh
             expr: |
-              max by (horizon_step) (forecast_rolling_mae) > 0.25
+              (
+                max by (horizon_step) (forecast_rolling_mae)
+                  > on (horizon_step) 2 * max by (horizon_step) (forecast_model_holdout_mae)
+              )
+              or
+              (
+                (
+                  max by (horizon_step) (forecast_rolling_mae)
+                    unless on (horizon_step) max by (horizon_step) (forecast_model_holdout_mae)
+                ) > 0.25
+              )
             for: 30m
             labels:
               severity: warning
@@ -123,7 +136,8 @@ data:
               summary: "Forecast error is high (rolling MAE {{ $value | printf \"%.3f\" }} at horizon step {{ $labels.horizon_step }})"
               description: >
                 Rolling MAE for horizon step {{ $labels.horizon_step }} has been above
-                0.25 for 30 minutes. The model no longer tracks the workload:
+                twice the model's own holdout MAE (or 0.25 without a baseline) for
+                30 minutes. The model no longer tracks the workload:
                 check the Model quality dashboard, compare with the champion's
                 holdout RMSE in MLflow, and retrain (the forecast-retrain CronJob).
 

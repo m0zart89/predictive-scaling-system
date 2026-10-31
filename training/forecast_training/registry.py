@@ -176,6 +176,10 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
             client.set_registered_model_alias(cfg.model_name, cfg.alias, mv.version)
             tags = {"candidate": best.candidate.name, "horizon": cfg.horizon,
                     "holdout_rmse": f"{best.score.rmse:.6f}",
+                    # per-step holdout MAE: serving exports it so the drift alert
+                    # compares the live rolling MAE with what the model achieved
+                    **{f"holdout_mae_step_{i}": f"{v:.6f}"
+                       for i, v in enumerate(best.score.mae_by_step, start=1)},
                     "level_tracking": f"{best.tracking:.3f}"}
             if timestamps is not None:
                 # last point the registered model was fitted on; the next run

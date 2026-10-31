@@ -85,6 +85,12 @@ MODEL_INFO = Gauge(
     "Loaded model, as labels (always 1); lets dashboards show which version served",
     ["model_name", "model_version", "model_stage", "run_id", "horizon"],
 )
+MODEL_HOLDOUT_MAE = Gauge(
+    "forecast_model_holdout_mae",
+    "Holdout MAE the loaded model achieved in training, by horizon step (from the registry "
+    "version's tags); the drift alert compares forecast_rolling_mae with it",
+    ["horizon_step"],
+)
 # Scores past forecasts against the actual values that later windows carry:
 # forecast_abs_error / forecast_rolling_mae, both by horizon step.
 TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_MAX_PENDING,
@@ -193,6 +199,13 @@ def load_model() -> None:
     MODEL_INFO.clear()   # one series only: drop the previous version's labels
     MODEL_INFO.labels(model_name=MODEL_NAME, model_version=version, model_stage=selector,
                       run_id=run_id, horizon=str(loaded_meta["horizon"])).set(1)
+    MODEL_HOLDOUT_MAE.clear()
+    for key, raw in (v.tags or {}).items():
+        if key.startswith("holdout_mae_step_"):
+            try:
+                MODEL_HOLDOUT_MAE.labels(horizon_step=key.rsplit("_", 1)[1]).set(float(raw))
+            except ValueError:
+                log.warning("ignoring tag %s=%r on %s v%s", key, raw, MODEL_NAME, version)
     MODEL_RELOADS.labels(result="success").inc()
     log.info(
         "Model loaded: name=%s %s version=%s run_id=%s time_steps=%s horizon=%s target=%s",

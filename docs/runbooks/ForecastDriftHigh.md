@@ -8,8 +8,11 @@ The forecast service compares every forecast it made with the value that
 actually arrived in a later `/predict` window and keeps a rolling mean absolute
 error per horizon step (`forecast_rolling_mae{horizon_step}`, over the last
 `FORECAST_MAE_WINDOW` = 100 resolved forecasts). This alert fires when any step
-has stayed above **0.25** (model units: demand divided by the ScaledObject's
-`capacity`) for 30 minutes.
+has stayed above **twice the holdout MAE the loaded model achieved in training**
+(`forecast_model_holdout_mae{horizon_step}`, from the registry version's tags)
+for 30 minutes. A model without that tag, such as one registered by the
+notebook, is held to a fixed 0.25 (model units: demand divided by the
+ScaledObject's `capacity`).
 
 The model is no longer tracking the workload. The scaler keeps working — in
 `mode: max` it still never reports less than observed demand — but the lead
@@ -42,9 +45,9 @@ workload may be under-provisioned.
 - **A reload made it worse:** roll back by pointing the alias at the previous
   version (`mlflow` UI or `MlflowClient().set_registered_model_alias(...)`)
   and `POST /reload`.
-- **Threshold wrong for this workload:** change the `> 0.25` in
-  `monitoring/prometheus-rules.yaml` (`ForecastDriftHigh`) to about twice the
-  champion's holdout RMSE.
+- **Threshold wrong for this workload:** the factor 2 in
+  `monitoring/prometheus-rules.yaml` (`ForecastDriftHigh`) is the only knob;
+  the baseline itself comes from each model's own training run.
 - **Not enough signal yet:** the gauge is empty until the scaler's history
   window has filled and at least one horizon has elapsed; if the alert fired
   right after a restart with few resolved forecasts
