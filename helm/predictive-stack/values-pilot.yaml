@@ -1,0 +1,54 @@
+# Pilot profile: the stack for your own services, no demo workload.
+#
+#   helm dependency build helm/predictive-stack
+#   helm upgrade --install predictive helm/predictive-stack -n predictive --create-namespace \
+#     -f helm/predictive-stack/values-pilot.yaml --set global.imageTag=<sha or latest>
+#   # then, once KEDA's CRDs exist, add your workloads:
+#   helm upgrade predictive helm/predictive-stack -n predictive --reuse-values \
+#     -f my-workloads.yaml
+#
+# The model is trained by the nightly CronJob on the first workload's series;
+# there is no champion until it has run once (forecast-serving stays unready,
+# the scaler scales on observed demand). To get one sooner:
+#   kubectl -n predictive create job --from=cronjob/forecast-retrain retrain-now
+
+demo:
+  enabled: false
+
+# Pick the host names you will reach the UIs at; "localhost" only resolves on
+# the machine the cluster runs on.
+ingress:
+  enabled: true
+  domain: example.internal
+
+grafana:
+  anonymous: false
+  adminPassword: change-me
+
+prometheus:
+  retention: 30d
+  persistence:
+    enabled: true
+    size: 20Gi
+
+scalerDefaults:
+  stepSeconds: "300"
+  mode: max
+  forecastAggregation: max
+
+training:
+  cronjob:
+    days: "14"
+    stepSeconds: "300"
+    periodSeconds: "86400"
+
+# Example — replace with your services (see values.yaml for every key):
+# workloads:
+#   - name: api
+#     deployment: api
+#     query: sum(rate(container_cpu_usage_seconds_total{namespace="predictive", container="api"}[2m]))
+#     targetValue: "0.7"
+#     capacity: "4"
+#     minReplicas: 2
+#     maxReplicas: 20
+workloads: []

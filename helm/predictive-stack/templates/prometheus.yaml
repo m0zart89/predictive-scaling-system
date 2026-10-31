@@ -1,4 +1,22 @@
 {{- if .Values.prometheus.enabled }}
+{{- if .Values.prometheus.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.prometheus.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.prometheus.persistence.size }}
+---
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -106,6 +124,8 @@ metadata:
     {{- include "predictive-stack.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate        # the volume is ReadWriteOnce
   selector:
     matchLabels:
       app: prometheus
@@ -160,7 +180,12 @@ spec:
           configMap:
             name: prometheus-rules
         - name: data
+          {{- if .Values.prometheus.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: prometheus
+          {{- else }}
           emptyDir: {}
+          {{- end }}
 ---
 apiVersion: v1
 kind: Service

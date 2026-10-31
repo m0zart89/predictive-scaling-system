@@ -352,6 +352,29 @@ kubectl -n predictive logs deploy/predictive-scaler -f
 
 Knobs (environment variables of `up.sh`): `IMAGE_TAG` (`dev` builds locally; a commit sha pulls the images CI published to GHCR), `STEP_SECONDS=30` to compress time so the forecast window fills in 5 minutes instead of 50, `DEMO_SCALING=hpa` for the reactive baseline, `TRAIN=0` / `SMOKE=0` to skip steps. Re-running upgrades the release in place; `kind delete cluster --name predictive` removes everything.
 
+### Pilot on your own cluster
+
+The same chart, without the demo, scaling your services ([`helm/predictive-stack/values-pilot.yaml`](helm/predictive-stack/values-pilot.yaml)):
+
+```bash
+helm dependency build helm/predictive-stack
+helm upgrade --install predictive helm/predictive-stack -n predictive --create-namespace \
+  -f helm/predictive-stack/values-pilot.yaml --set global.imageTag=latest
+# KEDA's CRDs exist now; add your services as workloads
+cat > my-workloads.yaml <<'YAML'
+workloads:
+  - name: api
+    deployment: api
+    query: sum(rate(container_cpu_usage_seconds_total{namespace="predictive", container="api"}[2m]))
+    targetValue: "0.7"     # demand one replica should carry, in the query's units
+    capacity: "4"          # model input = demand / capacity
+    maxReplicas: 20
+YAML
+helm upgrade predictive helm/predictive-stack -n predictive --reuse-values -f my-workloads.yaml
+```
+
+Each entry becomes a `ScaledObject`; the nightly CronJob trains the model on the first entry's series divided by its `capacity`, so scaler and model always agree on units. Until the first training run there is no champion and the scaler scales on observed demand; `kubectl -n predictive create job --from=cronjob/forecast-retrain retrain-now` starts one as soon as there is a day of history. Prometheus keeps 30 days on a PersistentVolume, which is what the time-of-day features need.
+
 ### Pieces on their own
 
 - **Images** are published by CI to `ghcr.io/m0zart89/predictive-scaling-system/{forecast-serving,predictive-scaler,cpu-burner,forecast-training}:{<sha>,latest}` on every push to `main`.
