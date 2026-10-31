@@ -57,7 +57,14 @@ prometheus:
   image: prom/prometheus:v2.51.0
   scrapeInterval: 15s
   evaluationInterval: 30s
-  retention: 7d
+  # The retraining CronJob reads up to training.cronjob.days of history from
+  # here, and the time-of-day features need whole days of it: keep it on a
+  # volume and keep it long enough.
+  retention: 30d
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""        # "" = the cluster default (kind: local-path)
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
@@ -84,6 +91,43 @@ ingress:
     prometheus: prometheus
     mlflow: mlflow
     forecast: forecast
+
+# ── workloads scaled by the predictive scaler ──────────────────────────────────
+
+# Defaults for every ScaledObject the chart renders (workloads below and the
+# demo). Any key can be overridden per workload.
+scalerDefaults:
+  minReplicas: 1
+  maxReplicas: 10
+  # model input = demand / capacity. The model is trained on the same series
+  # (see training.workload), so this only needs to keep the numbers in a
+  # sensible range; 1 is fine when the query is already in cores.
+  capacity: "1"
+  timeSteps: "10"
+  stepSeconds: "300"      # must equal training.cronjob.stepSeconds
+  mode: max               # max: never below observed demand; forecast: trust the model
+  forecastAggregation: max
+  activationValue: "0"
+  cacheSeconds: "15"
+  timeoutSeconds: "3"
+  pollingInterval: 15
+  cooldownPeriod: 300
+  scaleDownStabilizationSeconds: 300
+  fallback:
+    failureThreshold: 3
+    replicas: 4
+
+# Your services. One ScaledObject per entry; the model is trained on the
+# entry named by training.workload (default: the first). Example:
+#
+# workloads:
+#   - name: api                       # ScaledObject name
+#     deployment: api                 # Deployment in this namespace
+#     query: sum(rate(container_cpu_usage_seconds_total{container="api"}[2m]))
+#     targetValue: "0.7"              # demand one replica should carry (query units)
+#     maxReplicas: 20
+#     capacity: "4"
+workloads: []
 
 # ── demo workload ──────────────────────────────────────────────────────────────
 
@@ -134,6 +178,11 @@ demo:
 # ── retraining ─────────────────────────────────────────────────────────────────
 
 training:
+  # Name of the entry in `workloads` whose series the model is trained on
+  # ("" = the first entry, or the demo when there are none). One model per
+  # release: other workloads are scaled on the same model and should share
+  # the pattern and the capacity.
+  workload: ""
   image:
     repository: ghcr.io/m0zart89/predictive-scaling-system/forecast-training
     tag: ""               # "" = global.imageTag
@@ -145,8 +194,9 @@ training:
   cronjob:
     enabled: true
     schedule: "17 3 * * *"
-    # "" = (demo.query) / demo.predictive.capacity: the series the scaler
-    # feeds the model. Set explicitly only together with a matching capacity.
+    # "" = (query of training.workload) / its capacity, i.e. exactly the
+    # series the scaler feeds the model. Set explicitly only together with a
+    # matching capacity on the workloads.
     query: ""
     days: "14"
     stepSeconds: "300"

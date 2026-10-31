@@ -66,60 +66,16 @@ spec:
       targetPort: http
 {{- if eq $demo.scaling "predictive" }}
 ---
-# Scales cpu-burner on forecast CPU demand through the predictive scaler:
-#   desiredReplicas = ceil(reportedDemand / targetValue),
-#   reportedDemand  = max(forecast, observed) in cores (mode=max).
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: cpu-burner
-  labels:
-    {{- include "predictive-stack.labels" . | nindent 4 }}
-spec:
-  scaleTargetRef:
-    name: cpu-burner
-  minReplicaCount: {{ $demo.minReplicas }}
-  maxReplicaCount: {{ $demo.maxReplicas }}
-  pollingInterval: {{ $demo.predictive.pollingInterval }}
-  cooldownPeriod: {{ $demo.predictive.cooldownPeriod }}
-  # Used when the scaler returns an error (Prometheus down, no samples):
-  # hold a safe replica count instead of guessing.
-  fallback:
-    failureThreshold: {{ $demo.predictive.fallback.failureThreshold }}
-    replicas: {{ $demo.predictive.fallback.replicas }}
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleUp:
-          stabilizationWindowSeconds: 0
-          policies:
-            - type: Percent
-              value: 100
-              periodSeconds: 15
-        scaleDown:
-          stabilizationWindowSeconds: {{ $demo.predictive.scaleDownStabilizationSeconds }}
-          policies:
-            - type: Pods
-              value: 1
-              periodSeconds: 60
-  triggers:
-    - type: external
-      metricType: AverageValue
-      metadata:
-        scalerAddress: predictive-scaler.{{ .Release.Namespace }}.svc.cluster.local:6000
-        prometheusServerAddress: http://prometheus.{{ .Release.Namespace }}.svc.cluster.local:9090
-        # Total demand in cores; independent of replica count.
-        query: {{ $demo.query | quote }}
-        forecastServiceURL: http://forecast-serving.{{ .Release.Namespace }}.svc.cluster.local:8080
-        targetValue: {{ $demo.predictive.targetValue | quote }}
-        capacity: {{ $demo.predictive.capacity | quote }}
-        timeSteps: {{ $demo.predictive.timeSteps | quote }}
-        stepSeconds: {{ $demo.predictive.stepSeconds | quote }}
-        mode: {{ $demo.predictive.mode }}
-        forecastAggregation: {{ $demo.predictive.forecastAggregation }}
-        activationValue: "0"
-        cacheSeconds: {{ $demo.predictive.cacheSeconds | quote }}
-        timeoutSeconds: {{ $demo.predictive.timeoutSeconds | quote }}
+{{- $w := dict "name" "cpu-burner" "deployment" "cpu-burner" "query" $demo.query
+      "targetValue" $demo.predictive.targetValue "capacity" $demo.predictive.capacity
+      "minReplicas" $demo.minReplicas "maxReplicas" $demo.maxReplicas
+      "timeSteps" $demo.predictive.timeSteps "stepSeconds" $demo.predictive.stepSeconds
+      "mode" $demo.predictive.mode "forecastAggregation" $demo.predictive.forecastAggregation
+      "cacheSeconds" $demo.predictive.cacheSeconds "timeoutSeconds" $demo.predictive.timeoutSeconds
+      "pollingInterval" $demo.predictive.pollingInterval "cooldownPeriod" $demo.predictive.cooldownPeriod
+      "scaleDownStabilizationSeconds" $demo.predictive.scaleDownStabilizationSeconds
+      "fallback" $demo.predictive.fallback }}
+{{ include "predictive-stack.scaledobject" (dict "root" . "w" $w) }}
 {{- else if eq $demo.scaling "hpa" }}
 ---
 # Reactive baseline: a plain CPU HPA (needs metrics-server in the cluster).

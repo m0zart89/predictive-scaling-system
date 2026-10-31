@@ -17,6 +17,9 @@ On a fresh cluster there is none yet — train one:
   helm upgrade {{ .Release.Name }} helm/predictive-stack -n {{ .Release.Namespace }} --reuse-values \
     --set training.bootstrap.enabled=true
 
+Workloads scaled by the predictive scaler: {{ len .Values.workloads }} (see .Values.workloads)
+Model trained on: {{ (include "predictive-stack.trainingWorkload" . | fromYaml).name | default "nothing yet" }}
+
 Demo workload scaling (demo.scaling): {{ .Values.demo.scaling }}
   predictive  KEDA ScaledObject through the predictive scaler (set after KEDA's CRDs exist)
   hpa         plain CPU HPA (needs metrics-server)

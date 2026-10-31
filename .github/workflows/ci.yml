@@ -188,6 +188,8 @@ jobs:
           helm lint helm/forecast-serving/ helm/predictive-scaler/
           helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
           helm lint helm/predictive-stack/ --set demo.scaling=hpa
+          helm lint helm/predictive-stack/ -f helm/predictive-stack/values-pilot.yaml
+          helm lint helm/predictive-stack/ -f helm/predictive-stack/ci/workloads-values.yaml
 
       - name: Helm template (dry-run)
         run: |
@@ -203,6 +205,16 @@ jobs:
           grep -q 'kind: ScaledObject' /tmp/stack.yaml
           # the CronJob trains on what the scaler feeds the model: demand / capacity
           grep -Fq '[1m]))) / 2.5"' /tmp/stack.yaml
+          # workloads: one ScaledObject each, the model trained on training.workload
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/ci/workloads-values.yaml > /tmp/workloads.yaml
+          test "$(grep -c 'kind: ScaledObject' /tmp/workloads.yaml)" = 2
+          grep -Fq 'container=\"worker\"}[2m]))) / 1"' /tmp/workloads.yaml
+          grep -q 'stepSeconds: "60"' /tmp/workloads.yaml
+          # no workload and no demo must fail loudly, not render a CronJob without a query
+          if helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /dev/null 2>&1; then
+            echo "::error::expected the chart to refuse a release with nothing to train on"; exit 1
+          fi
 
   # Placeholder job — shows the intended CD path without implementing it
   # In a real cluster, this would use ArgoCD image updater or a Helm upgrade action.
