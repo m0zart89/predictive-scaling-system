@@ -27,7 +27,7 @@ def test_csv_rows_with_the_same_timestamp_are_combined(tmp_path):
     p.write_text("m_1,0,40,10\nm_2,0,20,10\nm_1,10,50,10\nm_2,10,30,10\nm_3,10,bad,10\n")
     points = csv_series(str(p), 1, 2, aggregate="sum", ts_offset=1_000_000, scale=0.01)
     assert points == [(1_000_000, pytest.approx(0.6)), (1_000_010, pytest.approx(0.8))]
-    assert csv_series(str(p), 1, 2, aggregate="max")[1] == (1_000_010, 50.0)
+    assert csv_series(str(p), 1, 2, aggregate="max")[1] == (10, 50.0)   # no offset here
 
     q = tmp_path / "named.csv"                     # header, string timestamps
     q.write_text("time,cpu\n2025-10-01 00:00:00,1.5\n2025-10-01 00:05:00,2.5\n")
