@@ -23,8 +23,8 @@ import os
 import sys
 
 from .data import DataError, load_export, parse_exclude, query_prometheus, regularize
-from .model import CANDIDATE_NAMES
-from .registry import TrainConfig, reload_serving, run_pipeline
+from .model import CANDIDATE_NAMES, DEFAULT_UNDER_WEIGHT
+from .registry import BASELINES, TrainConfig, reload_serving, run_pipeline
 
 
 def _env(name: str, default=None):
@@ -61,7 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="minimum level tracking for a candidate to be eligible (default 0.5)")
     p.add_argument("--min-improvement", type=float,
                    default=float(_env("TRAIN_MIN_IMPROVEMENT", 0.0)),
-                   help="relative RMSE improvement needed to replace the champion (e.g. 0.02)")
+                   help="relative cost improvement needed to replace the champion (e.g. 0.02)")
+    p.add_argument("--under-weight", type=float,
+                   default=float(_env("TRAIN_UNDER_WEIGHT", DEFAULT_UNDER_WEIGHT)),
+                   help="selection cost: one unit of demand the forecast missed costs this many "
+                        "idle units (default 3; 1 = plain MAE)")
+    p.add_argument("--baseline", choices=BASELINES, default=_env("TRAIN_BASELINE", "persistence"),
+                   help="what the winner must beat: persistence (last value), seasonal (the value "
+                        "one --period-seconds earlier) or best of the two (default persistence; "
+                        "both are always logged)")
     p.add_argument("--min-fresh-windows", type=int,
                    default=int(_env("TRAIN_MIN_FRESH_WINDOWS", 48)),
                    help="windows newer than the champion's training data needed to compare "
@@ -110,6 +118,7 @@ def main(argv=None) -> int:
             time_steps=args.time_steps, horizon=args.horizon, step_seconds=args.step_seconds,
             period_seconds=args.period_seconds, test_fraction=args.test_fraction, min_tracking=args.min_tracking,
             min_improvement=args.min_improvement, min_fresh_windows=args.min_fresh_windows,
+            under_weight=args.under_weight, baseline=args.baseline,
             refit=not args.no_refit, dry_run=args.dry_run,
             candidates=[c.strip() for c in args.candidates.split(",") if c.strip()],
         )
