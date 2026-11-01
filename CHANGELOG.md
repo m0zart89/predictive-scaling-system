@@ -25,6 +25,11 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
   plus `periodSeconds / stepSeconds` per workload. Existing ScaledObjects
   and models are unaffected: `historySteps` defaults to `timeSteps`,
   `season_steps` to 0.
+- **Real traces, re-read.** With the seasonal baseline the Wikipedia result
+  is 11–24% better than "the same hour yesterday" (not 76–85% better than
+  persistence); `hgb_q75_delta_season` wins de.wikipedia, the quantile models
+  cover 0.72–0.78 of the actuals against 0.58–0.68 for the mean models
+  (`docs/traces.md`).
 
 ## v1.1.0 — after the audit (PR #5)
 

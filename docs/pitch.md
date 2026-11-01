@@ -24,9 +24,9 @@ traffic, the predictive scaler had the morning ramp's capacity in place
 features) and cut p95 latency during that ramp by 2–8%, at the cost of
 11–13% more replica-minutes. On the afternoon ramp and at peak it made no
 difference, because the HPA had kept its capacity. On real hourly Wikipedia
-traffic the same pipeline beats persistence by 76–85% six hours out, and its
-level-tracking gate rejected a best-RMSE model that could not follow new
-levels. The first benchmark run also caught a real units bug between training
+traffic the same pipeline beats "the same hour yesterday" by 11–24% six hours
+out (and plain persistence by 87–90%), and its level-tracking gate rejected a
+best-scoring model that could not follow new levels. The first benchmark run also caught a real units bug between training
 and scaling, which is now checked in CI.
 
 ---
@@ -55,7 +55,8 @@ Prometheus, запрашивает прогноз на 30 минут у FastAPI-
 суток) и снижал p95 на этой рампе на 2–8% ценой 11–13% лишних
 replica-minutes. На дневной рампе и на пике разницы не было: HPA сохранил
 ёмкость. На реальном почасовом трафике Википедии тот же пайплайн бьёт
-persistence на 76–85% на шесть часов вперёд, а проверка слежения за уровнем
-отклонила модель с лучшим RMSE, не умеющую следовать новым уровням. Первый
+прогноз «как вчера в этот час» на 11–24% на шесть часов вперёд (и простой
+persistence на 87–90%), а проверка слежения за уровнем отклонила модель с
+лучшим скором, не умеющую следовать новым уровням. Первый
 же прогон бенчмарка поймал реальную ошибку единиц между обучением и
 скейлингом, теперь она проверяется в CI.

@@ -308,7 +308,7 @@ Two runs so far, one with the plain delta model (v1.0: 60 s vs 165 s, p95 −8%,
 
 The setup matters as much as the model: the first run of this benchmark trained the model on raw cores while the scaler fed it `demand / capacity`, and the forecast over-provisioned all night. The CronJob now trains on exactly the series the scaler sends (and CI checks the rendered query).
 
-**On real traffic.** The same pipeline, unchanged, on hourly Wikipedia page views (three languages, 30 days, weekly in CI): the delta models beat persistence by 76–85% six hours out, the level-tracking gate rejects the best-RMSE model on one series because it cannot follow new levels, and the time-of-day features add nothing when the window already spans a day. Tables and reasoning: [docs/traces.md](docs/traces.md).
+**On real traffic.** The same pipeline, unchanged, on hourly Wikipedia page views (three languages, 30 days, weekly in CI): the models beat plain persistence by 87–90% six hours out and the honest baseline, the same hour yesterday, by 11–24%; the quantile-and-seasonal candidate wins one of the three series outright, the quantile models deliver the 0.75 coverage they estimate where mean models sit at 0.6, and the level-tracking gate rejects the best-scoring model on one series because it cannot follow new levels. Tables and reasoning: [docs/traces.md](docs/traces.md).
 
 ## Future Work
 
