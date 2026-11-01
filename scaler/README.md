@@ -3,9 +3,9 @@
 A [KEDA external scaler](https://keda.sh/docs/latest/concepts/external-scalers/)
 that scales a workload on **forecast** demand instead of current demand.
 
-For each `ScaledObject` it reads the last `timeSteps` samples of a PromQL
-query, sends them to `forecast-serving`'s `POST /predict`, and reports the
-result to KEDA as an external metric. KEDA's HPA then sets
+For each `ScaledObject` it reads the last `historySteps` samples of a PromQL
+query (at least the `timeSteps` window), sends them to `forecast-serving`'s
+`POST /predict`, and reports the result to KEDA as an external metric. KEDA's HPA then sets
 `replicas = ceil(reported / targetValue)`.
 
 ## Trigger metadata
@@ -18,7 +18,8 @@ result to KEDA as an external metric. KEDA's HPA then sets
 | `forecastServiceURL` | yes | — | forecast-serving base URL |
 | `targetValue` | yes | — | demand one replica should carry, in the query's unit |
 | `capacity` | no | `1` | model input = demand / capacity. The model must be trained on the same series divided by the same capacity (the chart's CronJob does this); for a model trained on another workload, pick it so this workload's range fits the training range |
-| `timeSteps` | no | `10` | samples per forecast; must match `time_steps` in forecast-serving's `GET /model-info` |
+| `timeSteps` | no | `10` | the window: consecutive samples a forecast needs; must match `time_steps` in forecast-serving's `GET /model-info` |
+| `historySteps` | no | `timeSteps` | samples fetched and sent with each forecast, ≥ `timeSteps`. Models with seasonal features need a cycle more (`input_length` in `/model-info`, e.g. 10 + 288 for a day of 5-minute samples); the umbrella chart sets it from the training period. Samples older than the window may be missing (sent as `null`; serving interpolates) |
 | `stepSeconds` | no | `300` | spacing of samples; must match the model's `step_seconds` (`/model-info`), 300 for models trained on 5-minute data |
 | `mode` | no | `max` | `max`: report max(forecast, observed). `forecast`: report the forecast alone |
 | `forecastAggregation` | no | `next` | `next`: first forecast step. `max`: peak over the model's horizon (more lead time) |
@@ -40,7 +41,8 @@ score the forecast against the actual value a later window brings
 | Condition | Reported value |
 |---|---|
 | forecast-serving unreachable, not ready (503) or bad answer | observed demand |
-| fewer than `timeSteps` consecutive samples (new workload, scrape gap, NaN) | observed demand |
+| fewer than `timeSteps` consecutive samples at the end of the history (new workload, scrape gap, NaN) | observed demand |
+| gaps further back, inside `historySteps` | forecast as usual; the gaps go to serving as `null` |
 | Prometheus error, or query returns no samples | gRPC `UNAVAILABLE` → KEDA `fallback` |
 
 ## Metrics (`:9100/metrics`)

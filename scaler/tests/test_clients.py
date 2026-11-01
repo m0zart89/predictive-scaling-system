@@ -175,3 +175,29 @@ def test_forecast_sends_series_and_timestamp_when_given(http):
     assert body["step_seconds"] == 30
     ForecastClient().predict(http.url, [0.1], timeout=2)
     assert set(json.loads(http.requests[-1][2])) == {"values"}
+
+
+def test_prometheus_history_is_grid_aligned_with_none_for_holes(http):
+    # samples at 0, 30, (90 missing), 120 and a NaN at 150: the grid ends at the newest
+    # sample and keeps the holes visible instead of shifting the series
+    http.body = {"status": "success", "data": {"resultType": "matrix", "result": [
+        {"metric": {}, "values": [[1700000000, "0.1"], [1700000030, "0.2"],
+                                  [1700000090, "0.4"], [1700000120, "0.5"], [1700000150, "NaN"]]}]}}
+    ts, values = PrometheusClient().fetch_history(http.url, "q", 8, 30, 2)
+    assert ts == [1700000150.0 - 30 * (7 - i) for i in range(8)]
+    assert values == [None, None, 0.1, 0.2, None, 0.4, 0.5, None]
+    # the trailing run (fetch_series) is derived from the same grid
+    ts2, values2 = PrometheusClient().fetch_series(http.url, "q", 8, 30, 2)
+    assert (ts2, values2) == ([], [])                      # the newest sample is a hole
+    http.body = matrix([0.1, 0.2, 0.3, 0.4])
+    ts, values = PrometheusClient().fetch_history(http.url, "q", 3, 30, 2)
+    assert values == [0.2, 0.3, 0.4] and ts[-1] == 1700000090.0
+    assert PrometheusClient().fetch_history(http.url, "q", 6, 30, 2)[1] == [None, None, 0.1, 0.2, 0.3, 0.4]
+
+
+def test_forecast_sends_nulls_for_history_gaps(http):
+    http.body = {"predictions": [0.5, 0.6]}
+    out = ForecastClient().predict(http.url, [None, 0.2, None, 0.3, 0.4], timeout=2)
+    assert out == [0.5, 0.6]
+    sent = json.loads(http.requests[0][2])
+    assert sent["values"] == [None, 0.2, None, 0.3, 0.4]

@@ -68,3 +68,15 @@ def test_forecast_aggregation():
     assert make_config(forecastAggregation="MAX").forecast_aggregation == "max"
     with pytest.raises(ConfigError, match="forecastAggregation"):
         make_config(forecastAggregation="mean")
+
+
+def test_history_steps_defaults_to_time_steps_and_must_not_be_shorter():
+    assert make_config().history_steps == 10
+    assert make_config(timeSteps="6").history_steps == 6
+    cfg = make_config(timeSteps="10", historySteps="298")     # a day of 5-minute samples more
+    assert cfg.history_steps == 298 and cfg.time_steps == 10
+    assert cfg.cache_key != make_config().cache_key           # part of the settings
+    with pytest.raises(ConfigError, match="historySteps"):
+        make_config(timeSteps="10", historySteps="9")
+    with pytest.raises(ConfigError, match="historySteps"):
+        make_config(historySteps="0")
