@@ -3,6 +3,29 @@
 Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 `main`; `v1.0.0` is the first release where every stage is in.
 
+## Unreleased
+
+- **Selection by cost, not RMSE.** Candidates are ranked by an asymmetric
+  cost: a unit of demand the forecast missed is worth `--under-weight`
+  (default 3) idle units; `coverage` is logged next to RMSE and MAE. The
+  champion comparison uses the same cost. `hgb_q75_delta` estimates the
+  75th percentile of the change, the forecast that minimises that cost.
+- **Seasonal persistence baseline.** "The same time one period ago" is
+  scored on every run next to plain persistence; `--baseline
+  persistence|seasonal|best` says which the winner must beat. The
+  real-traces workflow uses `best` and prints both.
+- **Seasonal lags.** `anchored_season` features add the level one cycle ago
+  and the change that followed it over the horizon; `hgb_delta_season`,
+  `rf_delta_season`, `hgb_q75_delta_season`. The input grows to
+  `time_steps + season_steps` samples (`forecast_meta.json`, format 3;
+  `/model-info` reports `input_length`). `/predict` takes at least that many
+  values, uses the tail and interpolates `null` gaps in the older part
+  (`forecast_input_filled_total`). The scaler fetches `historySteps` grid
+  instants (holes as `null`) and the umbrella chart sets it to the window
+  plus `periodSeconds / stepSeconds` per workload. Existing ScaledObjects
+  and models are unaffected: `historySteps` defaults to `timeSteps`,
+  `season_steps` to 0.
+
 ## v1.1.0 — after the audit (PR #5)
 
 - **Time-of-day features.** `hgb_delta_tod` / `rf_delta_tod` add sin/cos of

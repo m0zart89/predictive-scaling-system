@@ -58,7 +58,7 @@ A fuller treatment, with the decisions table: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ### Retraining pipeline (`training/`)
 
-`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`, and `hgb_delta_tod` / `rf_delta_tod` with the time of day as a feature), scores them on a chronological holdout and registers the winner with its scaler and `forecast_meta.json`. Promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
+`forecast_training` loads a demand series (live Prometheus or a saved export), regularises it onto the step grid, trains the candidates (`rf_level`, `rf_delta`, `hgb_delta`, `ridge_delta`; `hgb_delta_tod` / `rf_delta_tod` with the time of day as a feature; `hgb_q75_delta` estimating an upper quantile; `*_delta_season` with the values from one cycle ago as features), scores them on a chronological holdout by an asymmetric cost that charges a missed unit of demand three idle ones, checks them against plain and seasonal persistence, and registers the winner with its scaler and `forecast_meta.json`. Selection, baselines, promotion rules and the model contract: [training/README.md](training/README.md). The notebook in `notebooks/` is the original exploration record.
 
 ### Model registry (MLflow)
 
@@ -86,7 +86,7 @@ A compressed-day load generator and a workflow that runs the same day under a CP
 
 ### `POST /predict`
 
-Takes the last `time_steps` values of the series (raw units, `step_seconds` apart — both in `GET /model-info`) and returns the forecast for every step of the model's horizon.
+Takes the last `input_length` values of the series (raw units, `step_seconds` apart — both in `GET /model-info`) and returns the forecast for every step of the model's horizon. `input_length` is the `time_steps` window, plus one seasonal cycle of history for models with seasonal features; the last `time_steps` values must be present, older ones may be `null` where the caller has a gap (serving interpolates them), and a longer history is fine (the tail is used).
 
 **Request:**
 ```json
@@ -120,7 +120,7 @@ Re-fetches the champion from MLflow and swaps it in memory, atomically with its 
 
 ### `GET /model-info`
 
-Loaded version, run id, `time_steps`, `horizon`, `step_seconds`, feature/target kinds, and the current rolling MAE per horizon step.
+Loaded version, run id, `time_steps`, `input_length`, `season_steps`, `horizon`, `step_seconds`, feature/target kinds, and the current rolling MAE per horizon step.
 
 ### `GET /live`, `GET /ready`
 
@@ -249,7 +249,7 @@ These are known simplifications, not omissions:
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
 - **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
 - **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It is one sample and shows the mechanism, not a capacity figure.
-- **Anticipation depends on the clock.** The `_tod` candidates add the phase of the day to the window, so the model can move before a daily ramp is visible; it still cannot foresee a ramp that is not periodic, and it needs a few days of history to learn the pattern.
+- **Anticipation depends on the clock and on yesterday.** The `_tod` candidates add the phase of the day to the window, the `_season` candidates the values from one cycle ago, so the model can move before a daily ramp is visible; it still cannot foresee a ramp that is not periodic, and it needs a few days of history to learn the pattern (and a day of history in Prometheus before the seasonal input is anything but the window).
 - **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
 - **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
 
@@ -260,12 +260,15 @@ These are known simplifications, not omissions:
 The notebook is the exploration record; production models come from [`training/`](training/README.md), run nightly by the chart's `forecast-retrain` CronJob:
 
 ```
-Prometheus (14 days) → regularise + fill gaps → train candidates → holdout RMSE
-     → level-tracking check → compare with @champion on data it has not seen
+Prometheus (14 days) → regularise + fill gaps → train candidates → holdout cost
+     → level-tracking check → beat persistence (plain or seasonal)
+     → compare with @champion on data it has not seen
      → register + move alias → POST /reload on forecast-serving
 ```
 
-What it changed, measured on the January data (6-step / 30-minute horizon, last 20% held out):
+Selection is by an asymmetric cost, not RMSE: a unit of demand the forecast missed costs three idle units (`--under-weight`), because for an autoscaler the two errors are not worth the same. The `hgb_q75_*` candidates estimate the 75th percentile of the change, the forecast that minimises that cost; `coverage` (share of forecast steps at or above the actual) is logged next to RMSE so the trade-off stays visible. Two baselines are scored on every run, persistence and seasonal persistence (the same time yesterday); `--baseline` says which one the winner must beat.
+
+What the first version of the pipeline changed, measured on the January data (6-step / 30-minute horizon, last 20% held out, RMSE as the metric then):
 
 | Model | Holdout RMSE | Level tracking | Eligible |
 |---|---|---|---|
