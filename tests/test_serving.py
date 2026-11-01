@@ -66,12 +66,33 @@ def test_predict_validates_input_length(client):
 
 def test_predict_rejects_non_float_values(client):
     """
-    Non-numeric values in input must be rejected at Pydantic schema level (422).
-    Note: NaN is not valid JSON (RFC 8259) and is rejected at parse time before
-    reaching validators — this test uses None to verify the type validation path.
+    Non-numeric values are rejected at the Pydantic schema level (422). NaN is
+    not valid JSON (RFC 8259) and fails at parse time; null is allowed only as
+    a gap in the history part, never as the last value.
     """
+    assert client.post("/predict", json={"values": ["a"] * 10}).status_code == 422
     response = client.post("/predict", json={"values": [None] * 10})
     assert response.status_code == 422
+    assert "last value" in response.text
+
+
+def test_prepare_input_uses_the_tail_and_fills_gaps_in_the_history():
+    import numpy as np
+    import pytest
+
+    from app import prepare_input
+
+    arr, filled = prepare_input([1.0, 2.0, 3.0], time_steps=2, length=2)
+    assert arr.tolist() == [2.0, 3.0] and filled == 0                   # the tail
+    arr, filled = prepare_input([1.0, None, None, 4.0, 5.0, 6.0], time_steps=2, length=6)
+    np.testing.assert_allclose(arr, [1, 2, 3, 4, 5, 6])                  # linear fill
+    assert filled == 2
+    arr, filled = prepare_input([None, None, 4.0, 5.0], time_steps=2, length=4)
+    assert arr.tolist() == [4.0, 4.0, 4.0, 5.0] and filled == 2         # no earlier sample: flat
+    with pytest.raises(ValueError, match="at least 4"):
+        prepare_input([1.0, 2.0], 2, 4)
+    with pytest.raises(ValueError, match="must all be present"):
+        prepare_input([1.0, None, 3.0], 2, 3)
 
 
 def test_predict_rejects_empty_list(client):
