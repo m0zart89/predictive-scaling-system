@@ -52,6 +52,18 @@ class ScalerConfig:
     cache_seconds: float = 15.0
     timeout_seconds: float = 3.0
     metric_name: str = "predicted-demand"
+    # mode=max: the forecast may exceed observed demand by at most this factor
+    # (0 = no cap). A model asking for 10x current demand is wrong far more
+    # often than demand is about to grow 10x.
+    forecast_surge_factor: float = 3.0
+    # Circuit breaker (see breaker.py): bypass the forecast while the series
+    # does not resemble the history. Thresholds are in the breaker's units.
+    breaker: bool = True
+    breaker_residual_z: float = 4.0
+    breaker_level_shift: float = 2.5
+    breaker_jump_factor: float = 2.0
+    breaker_min_open_seconds: float = 600.0
+    breaker_calm_polls: int = 6
 
     @property
     def cache_key(self) -> str:
@@ -113,6 +125,12 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     if history_steps < time_steps:
         raise ConfigError(f"metadata.historySteps must be >= timeSteps ({time_steps}), "
                           f"got {history_steps}")
+    breaker = (meta.get("breaker") or "on").strip().lower()
+    if breaker not in ("on", "off", "true", "false"):
+        raise ConfigError(f"metadata.breaker must be on|off, got {breaker!r}")
+    level_shift = _positive_float(meta, "breakerLevelShift", default=2.5)
+    if level_shift <= 1:
+        raise ConfigError(f"metadata.breakerLevelShift must be > 1, got {level_shift!r}")
 
     return ScalerConfig(
         prometheus_address=_required(meta, "prometheusServerAddress").rstrip("/"),
@@ -129,4 +147,12 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
         cache_seconds=_positive_float(meta, "cacheSeconds", default=15.0, allow_zero=True),
         timeout_seconds=_positive_float(meta, "timeoutSeconds", default=3.0),
         metric_name=(meta.get("metricName") or "predicted-demand").strip(),
+        forecast_surge_factor=_positive_float(meta, "forecastSurgeFactor", default=3.0,
+                                              allow_zero=True),
+        breaker=breaker in ("on", "true"),
+        breaker_residual_z=_positive_float(meta, "breakerResidualZ", default=4.0),
+        breaker_level_shift=level_shift,
+        breaker_jump_factor=_positive_float(meta, "breakerJumpFactor", default=2.0),
+        breaker_min_open_seconds=_positive_float(meta, "breakerMinOpenSeconds", default=600.0),
+        breaker_calm_polls=_positive_int(meta, "breakerCalmPolls", default=6),
     )

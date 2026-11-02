@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
+from .breaker import BreakerConfig, CircuitBreaker
 from .clients import ForecastClient, ForecastError, PrometheusClient, PrometheusError
 from .config import ScalerConfig
 from .metrics import ScalerMetrics
@@ -74,6 +75,21 @@ class PredictiveEngine:
         self._lock = threading.Lock()
         # past forecasts, scored against the history each decision fetches
         self.ledger = ForecastLedger()
+        # one breaker per ScaledObject; its thresholds come from the trigger metadata
+        self._breakers: Dict[Tuple[str, str], CircuitBreaker] = {}
+
+    def _breaker(self, key: str, cfg: ScalerConfig) -> CircuitBreaker:
+        bk = (key, cfg.cache_key)
+        if bk not in self._breakers:
+            self._breakers = {k: v for k, v in self._breakers.items() if k[0] != key}
+            self._breakers[bk] = CircuitBreaker(BreakerConfig(
+                enabled=cfg.breaker, residual_z=cfg.breaker_residual_z,
+                residual_z_hard=2 * cfg.breaker_residual_z,
+                level_shift_high=cfg.breaker_level_shift, level_shift_low=1 / cfg.breaker_level_shift,
+                jump_factor=cfg.breaker_jump_factor, min_open_seconds=cfg.breaker_min_open_seconds,
+                max_open_seconds=max(cfg.breaker_min_open_seconds, 3600.0),
+                calm_polls=cfg.breaker_calm_polls), clock=time.time)
+        return self._breakers[bk]
 
     # KEDA calls GetMetrics on every HPA sync and IsActive on every polling
     # interval, often for the same ScaledObject within seconds. Caching keeps
@@ -124,10 +140,21 @@ class PredictiveEngine:
         key = f"{namespace}/{name}"
 
         # Score the forecasts made earlier for instants this history now holds.
+        residuals = []
         for r in self.ledger.score(key, grid_ts, history, cfg.capacity):
             self.metrics.forecast_abs_error.labels(**labels, step=str(r.step)).observe(abs(r.error))
             if r.step == 1:
                 self.metrics.forecast_residual.labels(**labels).set(r.error)
+                residuals.append(r.error)
+
+        # Does the present resemble the history the model learned? (model units)
+        verdict = self._breaker(key, cfg).observe(
+            key, observed / cfg.capacity,
+            [None if v is None else v / cfg.capacity for v in history],
+            cfg.history_steps - cfg.time_steps, residuals)
+        self.metrics.breaker_open.labels(**labels).set(0 if verdict.use_forecast else 1)
+        if verdict.tripped:
+            self.metrics.breaker_trips.labels(**labels, reason=verdict.tripped).inc()
 
         if len(values) < cfg.time_steps:
             source = "observed"
@@ -161,10 +188,21 @@ class PredictiveEngine:
                     self.metrics.forecast_demand.labels(**labels, step=str(k)).set(max(0.0, v * cfg.capacity))
                 reason = (f"forecast {predicted:.4g} ({cfg.forecast_aggregation} of "
                           f"{len(horizon)} step(s)), observed {observed:.4g}, mode={cfg.mode}")
+                cap = observed * cfg.forecast_surge_factor
+                if cfg.mode == "max" and cfg.forecast_surge_factor > 0 and observed > 0 and predicted > cap:
+                    reason += f"; capped at {cfg.forecast_surge_factor:g}x observed ({cap:.4g})"
+                    predicted = cap
             finally:
                 self.metrics.forecast_latency.observe(time.perf_counter() - started)
 
-        if predicted is None:
+        if predicted is not None and not verdict.use_forecast:
+            # The breaker is open: the forecast is recorded (metrics, scoring)
+            # but the decision is reactive until the series looks normal again.
+            self.metrics.breaker_bypass.labels(**labels).inc()
+            source = "observed"
+            reason = f"{verdict.reason}; forecast {predicted:.4g} bypassed, observed {observed:.4g}"
+            value = observed
+        elif predicted is None:
             value = observed
         elif cfg.mode == "forecast":
             value = predicted

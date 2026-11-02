@@ -74,6 +74,24 @@ class ScalerMetrics:
             "what the circuit breaker watches",
             _LABELS, registry=registry,
         )
+        self.breaker_open = Gauge(
+            "predictive_scaler_breaker_open",
+            "1 while the circuit breaker keeps the forecast out of the decision (reactive "
+            "scaling on observed demand); retraining excludes these intervals",
+            _LABELS, registry=registry,
+        )
+        self.breaker_trips = Counter(
+            "predictive_scaler_breaker_trips_total",
+            "Circuit breaker trips by signal: residual (forecast wrong now), level (far from "
+            "one season ago), jump (a step the history never contained)",
+            _LABELS + ("reason",), registry=registry,
+        )
+        self.breaker_bypass = Counter(
+            "predictive_scaler_breaker_bypass_total",
+            "Decisions that had a forecast and reported observed demand instead because the "
+            "breaker was open",
+            _LABELS, registry=registry,
+        )
         self.forecast_latency = Histogram(
             "predictive_scaler_forecast_latency_seconds",
             "Latency of calls to the forecast service",

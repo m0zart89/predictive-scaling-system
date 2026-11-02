@@ -286,3 +286,54 @@ def test_fallback_drops_the_per_step_forecast_series(metrics, registry):
     eng.decide(NS, NAME, cfg)
     assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="1")) is None
     assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) is None
+
+
+# ── circuit breaker and surge cap ──────────────────────────────────────────────
+
+def test_breaker_opens_on_a_jump_and_the_decision_turns_reactive(metrics, registry):
+    """A one-step jump the history never contained: the forecast is still made
+    and recorded, but the reported value is observed demand until the breaker
+    closes; metrics say so and retraining can exclude the interval."""
+    fc = FakeForecast(lambda v: 2.0)                 # model units; capacity 1
+    history = [0.2, 0.25, 0.2, 0.3, 0.25, 0.2, 0.3, 0.25, 0.2, 0.3]
+    prom = FakePrometheus(history)
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(cacheSeconds="0")
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "forecast" and d.value == pytest.approx(0.9)    # 2.0 capped at 3 x 0.3
+    assert registry.get_sample_value("predictive_scaler_breaker_open", labels()) == 0
+
+    prom.values = history + [1.5]                    # +1.2 against a largest rise of 0.1
+    prom.NOW += 300
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "observed" and d.value == pytest.approx(1.5)
+    assert d.predicted is not None                   # the forecast was made, not used
+    assert "breaker" in d.reason and "jump" in d.reason
+    assert registry.get_sample_value("predictive_scaler_breaker_open", labels()) == 1
+    assert registry.get_sample_value("predictive_scaler_breaker_trips_total", labels(reason="jump")) == 1
+    assert registry.get_sample_value("predictive_scaler_breaker_bypass_total", labels()) == 1
+    assert registry.get_sample_value("predictive_scaler_decisions_total", labels(source="observed")) == 1
+
+    # still open on the next poll (hold time), reactive again
+    prom.values = history + [1.5, 1.5]
+    prom.NOW += 300
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "observed" and "open" in d.reason
+
+
+def test_breaker_off_keeps_the_forecast_and_surge_cap_can_be_disabled(metrics):
+    fc = FakeForecast(lambda v: 2.0)
+    history = [0.2] * 9 + [0.3]
+    prom = FakePrometheus(history + [1.5])
+    eng = engine_with(metrics, prom, fc)
+    d = eng.decide(NS, NAME, make_config(breaker="off", forecastSurgeFactor="0"))
+    assert d.source == "forecast" and d.value == pytest.approx(2.0)   # uncapped, unbroken
+
+
+def test_surge_cap_limits_how_far_the_forecast_may_exceed_observed(metrics):
+    fc = FakeForecast(lambda v: 5.0)
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    d = eng.decide(NS, NAME, make_config(forecastSurgeFactor="2"))
+    assert d.predicted == pytest.approx(0.8) and "capped at 2x" in d.reason
+    d = eng.decide(NS, NAME, make_config(forecastSurgeFactor="2", mode="forecast"))
+    assert d.predicted == pytest.approx(5.0)        # the cap is a mode=max guard only

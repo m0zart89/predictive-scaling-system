@@ -17,7 +17,10 @@ Prometheus that feeds the scaler records what the clients experienced:
   bench_sim_hour                            simulated hour of day (0-24), to locate the ramps
 
 Environment: TARGET (http://cpu-burner:8080), DAY_SECONDS (2400), DAYS (1),
-WORK_MS (25), THINK_MS (100), METRICS_PORT (8000).
+WORK_MS (25), THINK_MS (100), METRICS_PORT (8000), and optionally
+SPIKE=<hour>,<duration_hours>,<factor> — an anomaly the pattern never has
+(a flash sale at 10:00 for half an hour at 3x: "10,0.5,3"), exported as
+bench_spike so the report can measure the circuit breaker around it.
 """
 
 from __future__ import annotations
@@ -53,15 +56,40 @@ LATENCY = Histogram(
 )
 CLIENTS = Gauge("bench_clients", "Clients currently generating load")
 SIM_HOUR = Gauge("bench_sim_hour", "Simulated hour of day")
+SPIKE_ON = Gauge("bench_spike", "1 while the injected spike (SPIKE env) is active")
 
 
-def clients_at(hour: float) -> int:
-    """Piecewise-linear client count for a simulated hour of day."""
+def parse_spike(spec: str):
+    """'hour,duration_hours,factor' -> (hour, duration, factor) or None."""
+    if not spec:
+        return None
+    hour, duration, factor = (float(x) for x in spec.split(","))
+    if duration <= 0 or factor <= 0:
+        raise ValueError("SPIKE duration and factor must be > 0")
+    return hour, duration, factor
+
+
+SPIKE = parse_spike(os.getenv("SPIKE", ""))
+
+
+def in_spike(hour: float, spike=None) -> bool:
+    spike = SPIKE if spike is None else spike
+    return bool(spike) and spike[0] <= hour % 24 < spike[0] + spike[1]
+
+
+def clients_at(hour: float, spike=None) -> int:
+    """Piecewise-linear client count for a simulated hour of day, times the
+    spike factor inside the injected spike."""
     hour = hour % 24
+    n = PROFILE[-1][1]
     for (h0, c0), (h1, c1) in zip(PROFILE, PROFILE[1:]):
         if h0 <= hour <= h1:
-            return round(c0 + (c1 - c0) * (hour - h0) / (h1 - h0))
-    return PROFILE[-1][1]
+            n = round(c0 + (c1 - c0) * (hour - h0) / (h1 - h0))
+            break
+    spike = SPIKE if spike is None else spike
+    if in_spike(hour, spike):
+        n = round(n * spike[2])
+    return n
 
 
 def worker(stop: threading.Event, active: threading.Event) -> None:
@@ -85,6 +113,9 @@ def worker(stop: threading.Event, active: threading.Event) -> None:
 def main() -> None:
     start_http_server(METRICS_PORT)
     max_clients = max(c for _, c in PROFILE)
+    if SPIKE:
+        max_clients = round(max_clients * SPIKE[2])
+        print(f"spike: {SPIKE[2]:g}x clients from hour {SPIKE[0]:g} for {SPIKE[1]:g} h", flush=True)
     stop = threading.Event()
     gates = [threading.Event() for _ in range(max_clients)]
     for gate in gates:
@@ -102,6 +133,7 @@ def main() -> None:
         hour = (elapsed % DAY_SECONDS) / DAY_SECONDS * 24
         n = clients_at(hour)
         SIM_HOUR.set(hour)
+        SPIKE_ON.set(1 if in_spike(hour) else 0)
         if n != last:
             for i, gate in enumerate(gates):
                 gate.set() if i < n else gate.clear()

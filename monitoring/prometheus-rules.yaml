@@ -160,6 +160,23 @@ data:
       - name: predictive-scaler
         interval: 30s
         rules:
+          - alert: ForecastBreakerOpenLong
+            expr: predictive_scaler_breaker_open == 1
+            for: 2h
+            labels:
+              severity: warning
+              service: predictive-scaler
+            annotations:
+              runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastBreakerOpenLong.md
+              summary: "{{ $labels.namespace }}/{{ $labels.scaledobject }}: reactive fallback for 2h, the model no longer fits"
+              description: >
+                The scaler's circuit breaker has kept the forecast out of the
+                decision for two hours: the series keeps tripping the residual,
+                level or jump signal, so the model no longer describes this
+                workload. Scaling is reactive meanwhile (observed demand, plus
+                the CPU floor trigger if enabled). Retrain with the breaker's
+                open intervals excluded; the alert-driven trigger does this.
+
           - alert: ScalerFallbackRate
             expr: |
               sum by (namespace, scaledobject) (
