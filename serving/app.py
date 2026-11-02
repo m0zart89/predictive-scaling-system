@@ -85,6 +85,11 @@ MODEL_INFO = Gauge(
     "Loaded model, as labels (always 1); lets dashboards show which version served",
     ["model_name", "model_version", "model_stage", "run_id", "horizon"],
 )
+INPUT_FILLED = Counter(
+    "forecast_input_filled_total",
+    "Values filled in by interpolation in the seasonal (older) part of /predict inputs: gaps "
+    "in the caller's history, or less than a season of it",
+)
 MODEL_HOLDOUT_MAE = Gauge(
     "forecast_model_holdout_mae",
     "Holdout MAE the loaded model achieved in training, by horizon step (from the registry "
@@ -103,7 +108,37 @@ TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_M
 # forecast_meta.json artifact were registered by the notebook: TIME_STEPS
 # scaled values in, one value out.
 LEGACY_FORECAST_META = {"time_steps": TIME_STEPS, "horizon": 1, "step_seconds": 300,
-                        "features": "window", "target": "level", "period_seconds": 86400}
+                        "features": "window", "target": "level", "period_seconds": 86400,
+                        "season_steps": 0}
+
+
+def input_length(meta: Dict[str, object]) -> int:
+    """Samples a caller must send: the window, preceded by one season for seasonal models."""
+    return int(meta["time_steps"]) + int(meta.get("season_steps", 0))
+
+
+def prepare_input(values: List[Optional[float]], time_steps: int, length: int):
+    """
+    Turn a caller's history into the model's input: the last `length` values,
+    the final `time_steps` of which (the window) must all be present. Gaps
+    (null) in the older, seasonal part are filled by linear interpolation
+    between the neighbouring samples — a missing scrape yesterday must not
+    cost a forecast today, and a caller with less than a season of history
+    (a new cluster) gets a forecast from the window alone, since a flat fill
+    makes the season-ago change zero. Returns (input array, filled count).
+    Raises ValueError with a message fit for a 422.
+    """
+    if len(values) < length:
+        extra = f" ({time_steps} window + {length - time_steps} of history)" if length > time_steps else ""
+        raise ValueError(f"Expected at least {length} values{extra}, got {len(values)}.")
+    arr = np.array([math.nan if v is None else v for v in values[-length:]], dtype=float)
+    if not np.all(np.isfinite(arr[-time_steps:])):
+        raise ValueError(f"The last {time_steps} values (the window) must all be present.")
+    missing = ~np.isfinite(arr)
+    if missing.any():
+        idx = np.arange(len(arr))
+        arr[missing] = np.interp(idx[missing], idx[~missing], arr[~missing])
+    return arr, int(missing.sum())
 
 
 @dataclass(frozen=True)
@@ -115,15 +150,18 @@ class Bundle:
     meta: Dict[str, object]       # forecast_meta.json merged over the legacy defaults
     info: Dict[str, str]          # operational metadata (version, run_id, loaded_at)
 
-    def forecast(self, values: List[float], timestamp: Optional[float] = None) -> List[float]:
-        """Raw window → forecast for each step of the model's horizon (raw units).
-        `timestamp`: unix time of the last value, used by time-of-day features
-        (defaults to now, which is right for a caller sending live windows)."""
-        arr    = np.array(values, dtype=float).reshape(-1, 1)
+    def forecast(self, values, timestamp: Optional[float] = None) -> List[float]:
+        """Raw input (`input_length` values, see prepare_input) → forecast for each
+        step of the model's horizon (raw units). `timestamp`: unix time of the last
+        value, used by time-of-day features (defaults to now, which is right for a
+        caller sending live windows)."""
+        arr    = np.asarray(values, dtype=float).reshape(-1, 1)
         scaled = self.scaler.transform(arr).reshape(1, -1)
         last_ts = np.array([timestamp if timestamp is not None else time.time()])
         out    = self.model.predict(build_features(scaled, self.meta["features"], last_ts,
-                                                   int(self.meta.get("period_seconds", 86400))))
+                                                   int(self.meta.get("period_seconds", 86400)),
+                                                   int(self.meta["time_steps"]),
+                                                   int(self.meta["horizon"])))
         out    = from_target(scaled, out, self.meta["target"])
         return [float(v) for v in self.scaler.inverse_transform(out.reshape(-1, 1)).ravel()]
 
@@ -186,6 +224,8 @@ def load_model() -> None:
         "model_stage":   selector,
         "model_version": version,
         "run_id":        run_id,
+        # which candidate the pipeline promoted (version tag; "" for notebook models)
+        "candidate":     (v.tags or {}).get("candidate", ""),
         "loaded_at":     datetime.now(timezone.utc).isoformat(),
     }
     previous = _bundle
@@ -282,10 +322,12 @@ Instrumentator().add(metrics.default(
 
 # ── Request / response schemas ─────────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    # Last time_steps cpu_usage values at step_seconds intervals (see /model-info),
-    # raw (unscaled).
-    # The service applies the stored MinMaxScaler internally.
-    values: List[float]
+    # The last `input_length` values of the series at step_seconds intervals
+    # (see /model-info), raw (unscaled); the service applies the stored
+    # MinMaxScaler. Longer histories are fine (the tail is used). The final
+    # `time_steps` values must be present; older ones may be null where the
+    # caller has a gap, and are interpolated.
+    values: List[Optional[float]]
     # Optional, for forecast quality tracking: which series this window belongs
     # to (callers forecasting several workloads should pass a distinct key per
     # workload), the unix time of the last value (default: arrival time) and
@@ -297,11 +339,13 @@ class PredictRequest(BaseModel):
 
     @field_validator("values")
     @classmethod
-    def values_must_be_finite(cls, v: List[float]) -> List[float]:
+    def values_must_be_finite(cls, v: List[Optional[float]]) -> List[Optional[float]]:
         if not v:
             raise ValueError("values must not be empty")
+        if v[-1] is None:
+            raise ValueError("the last value must be present")
         for i, x in enumerate(v):
-            if not math.isfinite(x):
+            if x is not None and not math.isfinite(x):
                 raise ValueError(f"values[{i}] is not finite: {x!r}")
         return v
 
@@ -371,6 +415,9 @@ def model_info():
     return {
         "model_loaded": b is not None,
         "time_steps":   meta["time_steps"],
+        # values a /predict call must carry: time_steps, plus a season for seasonal models
+        "input_length": input_length(meta),
+        "season_steps": meta.get("season_steps", 0),
         "horizon":      meta["horizon"],
         "step_seconds": meta["step_seconds"],
         "features":     meta["features"],
@@ -388,10 +435,11 @@ def predict(req: PredictRequest):
     """
     Predict CPU utilization for the next interval(s).
 
-    Input: the last `time_steps` observations (raw, unscaled; see /model-info).
-    Output: `prediction` for the next interval, `predictions` for every step of
-    the model's horizon (one value for models registered by the notebook), and
-    model provenance.
+    Input: the last `input_length` observations (raw, unscaled; see
+    /model-info) — the `time_steps` window, preceded by a season of history
+    for seasonal models, where gaps may be null. Output: `prediction` for the
+    next interval, `predictions` for every step of the model's horizon (one
+    value for models registered by the notebook), and model provenance.
 
     The model_version field in the response allows callers to detect a model
     swap that occurred between requests (e.g. after POST /reload).
@@ -400,18 +448,20 @@ def predict(req: PredictRequest):
     if b is None:
         raise HTTPException(status_code=503, detail="Model not loaded. POST /reload to recover.")
 
-    time_steps = b.meta["time_steps"]
-    if len(req.values) != time_steps:
+    time_steps = int(b.meta["time_steps"])
+    try:
+        model_input, filled = prepare_input(req.values, time_steps, input_length(b.meta))
+    except ValueError as exc:
         PREDICTION_FAILURES.labels(reason="validation").inc()
-        raise HTTPException(
-            status_code=422,
-            detail=f"Expected exactly {time_steps} values, got {len(req.values)}.",
-        )
+        raise HTTPException(status_code=422, detail=str(exc))
+    if filled:
+        INPUT_FILLED.inc(filled)
+    window = [float(v) for v in model_input[-time_steps:]]
 
     PREDICTION_REQUESTS.inc()
 
     try:
-        predictions = b.forecast(req.values, req.timestamp)
+        predictions = b.forecast(model_input, req.timestamp)
     except Exception as exc:
         PREDICTION_FAILURES.labels(reason="inference").inc()
         log.exception("Inference failed: %s", exc)
@@ -419,11 +469,12 @@ def predict(req: PredictRequest):
 
     if not all(math.isfinite(p) for p in predictions):
         PREDICTION_FAILURES.labels(reason="inference").inc()
-        log.error("Model returned non-finite prediction %r for input %s", predictions, req.values)
+        log.error("Model returned non-finite prediction %r for input %s", predictions, window)
         raise HTTPException(status_code=500, detail="Model produced a non-finite prediction.")
 
     try:
-        TRACKER.record(req.series, req.values, predictions,
+        # the window only: filled-in history is not an actual value to score against
+        TRACKER.record(req.series, window, predictions,
                        req.step_seconds or b.meta["step_seconds"], req.timestamp)
     except Exception:   # quality tracking must never fail a prediction
         log.exception("forecast quality tracking failed")

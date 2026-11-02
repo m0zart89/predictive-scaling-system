@@ -43,6 +43,8 @@ class ScalerConfig:
     target_value: float
     capacity: float = 1.0
     time_steps: int = 10
+    history_steps: int = 10    # samples fetched and sent; >= time_steps (a season more for
+                               # models with seasonal features; the chart computes it)
     step_seconds: int = 300
     mode: str = "max"
     forecast_aggregation: str = "next"
@@ -106,13 +108,20 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     if agg not in AGGREGATIONS:
         raise ConfigError(f"metadata.forecastAggregation must be one of {AGGREGATIONS}, got {agg!r}")
 
+    time_steps = _positive_int(meta, "timeSteps", default=10)
+    history_steps = _positive_int(meta, "historySteps", default=time_steps)
+    if history_steps < time_steps:
+        raise ConfigError(f"metadata.historySteps must be >= timeSteps ({time_steps}), "
+                          f"got {history_steps}")
+
     return ScalerConfig(
         prometheus_address=_required(meta, "prometheusServerAddress").rstrip("/"),
         query=_required(meta, "query"),
         forecast_url=_required(meta, "forecastServiceURL").rstrip("/"),
         target_value=_positive_float(meta, "targetValue"),
         capacity=_positive_float(meta, "capacity", default=1.0),
-        time_steps=_positive_int(meta, "timeSteps", default=10),
+        time_steps=time_steps,
+        history_steps=history_steps,
         step_seconds=_positive_int(meta, "stepSeconds", default=300),
         mode=mode,
         forecast_aggregation=agg,

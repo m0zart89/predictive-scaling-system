@@ -16,6 +16,12 @@ falls back to .Values.scalerDefaults.
 {{- if not (hasKey $w $k) }}{{ fail (printf "workload %q: %s is required" (get $w "name" | default "?") $k) }}{{ end }}
 {{- end }}
 {{- $fallback := $w.fallback | default $d.fallback }}
+{{- $timeSteps := ($w.timeSteps | default $d.timeSteps) | int }}
+{{- $stepSeconds := ($w.stepSeconds | default $d.stepSeconds) | int }}
+{{- /* history = the window + one seasonal cycle (rounded up), unless set explicitly */}}
+{{- $period := $root.Values.training.cronjob.periodSeconds | int }}
+{{- $season := div (add $period (sub $stepSeconds 1)) $stepSeconds }}
+{{- $historySteps := $w.historySteps | default $d.historySteps | default (add $timeSteps $season) }}
 # Scales {{ $w.deployment }} on forecast demand:
 #   desiredReplicas = ceil(reportedDemand / targetValue),
 #   reportedDemand  = max(forecast, observed) in the query's units (mode=max).
@@ -66,8 +72,12 @@ spec:
         # model input = demand / capacity: the model is trained on that series
         # (training.workload), so the two must agree
         capacity: {{ $w.capacity | default $d.capacity | quote }}
-        timeSteps: {{ $w.timeSteps | default $d.timeSteps | quote }}
-        stepSeconds: {{ $w.stepSeconds | default $d.stepSeconds | quote }}
+        timeSteps: {{ $timeSteps | quote }}
+        # samples sent with every forecast: the window plus one seasonal cycle
+        # (training.cronjob.periodSeconds / stepSeconds), so a model with seasonal
+        # features sees the same time a cycle ago; the older part may have gaps
+        historySteps: {{ $historySteps | quote }}
+        stepSeconds: {{ $stepSeconds | quote }}
         mode: {{ $w.mode | default $d.mode }}
         forecastAggregation: {{ $w.forecastAggregation | default $d.forecastAggregation }}
         activationValue: {{ $w.activationValue | default $d.activationValue | quote }}

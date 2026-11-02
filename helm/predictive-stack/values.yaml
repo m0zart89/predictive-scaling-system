@@ -120,6 +120,10 @@ scalerDefaults:
   # sensible range; 1 is fine when the query is already in cores.
   capacity: "1"
   timeSteps: "10"
+  # Samples fetched and sent per forecast. "" = timeSteps + one seasonal cycle
+  # (training.cronjob.periodSeconds / stepSeconds): what the seasonal
+  # candidates need. Set it to timeSteps to send the window alone.
+  historySteps: ""
   stepSeconds: "300"      # must equal training.cronjob.stepSeconds
   mode: max               # max: never below observed demand; forecast: trust the model
   forecastAggregation: max
@@ -222,6 +226,13 @@ training:
     timeSteps: "10"
     horizon: "6"
     minImprovement: "0.02"
+    # Selection cost: one unit of demand the forecast missed costs this many
+    # idle units (1 = plain MAE). The hgb_q75 candidates estimate the quantile
+    # that minimises it at 3.
+    underWeight: "3"
+    # What the winner must beat: persistence (last value), seasonal (the value
+    # one periodSeconds earlier) or best of the two. Both are always logged.
+    baseline: persistence
   # One-off Job that trains from a saved Prometheus export in a ConfigMap
   # (kubectl create configmap train-data --from-file=notebooks/data-jan-2022.json)
   # and reloads forecast-serving. scripts/up.sh enables it on a fresh cluster.

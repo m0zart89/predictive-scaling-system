@@ -95,16 +95,26 @@ class PredictiveEngine:
         labels = {"namespace": namespace, "scaledobject": name}
 
         try:
-            timestamps, values = self.prometheus.fetch_series(
-                cfg.prometheus_address, cfg.query, cfg.time_steps,
+            # history_steps grid instants (None where a sample is missing): the
+            # window the model's features are built on, preceded by the older
+            # history a seasonal model reads
+            grid_ts, history = self.prometheus.fetch_history(
+                cfg.prometheus_address, cfg.query, cfg.history_steps,
                 cfg.step_seconds, cfg.timeout_seconds,
             )
         except PrometheusError:
             self.metrics.prometheus_failures.labels(**labels).inc()
             raise
-        if not values:
+        if not history:
             self.metrics.prometheus_failures.labels(**labels).inc()
             raise NoDataError(f"query returned no samples for {namespace}/{name}")
+
+        # The window: the trailing run of consecutive samples (the grid ends at
+        # the newest sample, so it is never empty). A hole shortens it.
+        n = 0
+        while n < len(history) and history[-1 - n] is not None:
+            n += 1
+        timestamps, values = grid_ts[len(history) - n:], history[len(history) - n:]
 
         observed = max(0.0, values[-1])
         predicted: Optional[float] = None
@@ -114,7 +124,11 @@ class PredictiveEngine:
             reason = (f"only {len(values)}/{cfg.time_steps} samples of history; "
                       "scaling on observed demand until the window fills")
         else:
-            model_input = [v / cfg.capacity for v in values]
+            if cfg.history_steps > cfg.time_steps:
+                # the whole history, holes as null: serving interpolates the old part
+                model_input = [None if v is None else v / cfg.capacity for v in history]
+            else:
+                model_input = [v / cfg.capacity for v in values[-cfg.time_steps:]]
             started = time.perf_counter()
             try:
                 # series + the last sample's time let forecast-serving score this

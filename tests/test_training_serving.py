@@ -5,6 +5,7 @@ forecast the pipeline computed; a model registered the old way (notebook:
 stage "Production", no alias, no forecast_meta.json) must keep working.
 """
 
+import math
 import os
 import pickle
 import sys
@@ -63,7 +64,7 @@ def test_pipeline_model_serves_identical_multistep_forecast(registry, serving):
     serving_app.load_model()
     info = serving.get("/model-info").json()
     assert info["horizon"] == 4 and info["target"] == "delta" and info["features"] == "anchored"
-    assert info["model_stage"] == "@champion"
+    assert info["model_stage"] == "@champion" and info["candidate"] == "hgb_delta"
 
     window = [float(v) for v in values[-10:]]
     body = serving.post("/predict", json={"values": window}).json()
@@ -80,14 +81,63 @@ def test_pipeline_model_serves_identical_multistep_forecast(registry, serving):
     assert serving.post("/predict", json={"values": high}).json()["prediction"] > 2.5
 
 
-def test_wrong_window_length_uses_model_time_steps(registry, serving):
+def test_window_length_comes_from_the_model(registry, serving):
+    """At least input_length values; a longer history is fine and its tail is
+    used, so a scaler fetching a season of history serves any model."""
     ts, values = demand()
     run_pipeline(values, TrainConfig(time_steps=6, horizon=2, candidates=["hgb_delta"]), "test",
                  timestamps=ts)
     serving_app.load_model()
+    info = serving.get("/model-info").json()
+    assert info["input_length"] == 6 and info["season_steps"] == 0
     assert serving.post("/predict", json={"values": [0.1] * 6}).status_code == 200
-    r = serving.post("/predict", json={"values": [0.1] * 10})
-    assert r.status_code == 422 and "Expected exactly 6" in r.json()["detail"]
+    r = serving.post("/predict", json={"values": [0.1] * 5})
+    assert r.status_code == 422 and "Expected at least 6" in r.json()["detail"]
+    short = serving.post("/predict", json={"values": [0.3] * 6}).json()["predictions"]
+    long = serving.post("/predict", json={"values": [None, 9.0, None] + [0.3] * 6}).json()["predictions"]
+    assert long == short                                  # only the tail counts
+    r = serving.post("/predict", json={"values": [0.3] * 5 + [None, 0.3]})
+    assert r.status_code == 422 and "must all be present" in r.json()["detail"]
+
+
+def test_seasonal_model_takes_a_season_of_history_and_fills_gaps(registry, serving):
+    """A model with anchored_season features needs time_steps + season_steps
+    values; serving reports that in /model-info, forecasts exactly what the
+    pipeline would, interpolates nulls in the history part and still answers
+    (from the window alone) when there is no history at all."""
+    from prometheus_client import REGISTRY
+
+    ts, values = demand(days=12)
+    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta_season"]), "test",
+                       timestamps=ts)
+    assert out.promoted
+    serving_app.load_model()
+    info = serving.get("/model-info").json()
+    assert info["features"] == "anchored_season"
+    assert info["season_steps"] == 288 and info["input_length"] == 298
+
+    from mlflow.tracking import MlflowClient
+    bundle, _, _ = load_champion(MlflowClient(), "cpu-forecasting", "champion")
+    history = [float(v) for v in values[-298:]]
+    body = serving.post("/predict", json={"values": history}).json()
+    np.testing.assert_allclose(body["predictions"], bundle.predict(history)[0], rtol=1e-9)
+
+    r = serving.post("/predict", json={"values": history[-10:]})     # window only: too short
+    assert r.status_code == 422 and "288 of history" in r.json()["detail"]
+
+    filled_before = REGISTRY.get_sample_value("forecast_input_filled_total")
+    gappy = list(history)
+    gappy[100:103] = [None, None, None]
+    body = serving.post("/predict", json={"values": gappy}).json()
+    interpolated = list(history)
+    interpolated[100:103] = list(np.interp([100, 101, 102], [99, 103], [history[99], history[103]]))
+    np.testing.assert_allclose(body["predictions"], bundle.predict(interpolated)[0], rtol=1e-9)
+    assert REGISTRY.get_sample_value("forecast_input_filled_total") == filled_before + 3
+
+    # a new cluster: nothing but the window is known yet
+    cold = [None] * 288 + history[-10:]
+    body = serving.post("/predict", json={"values": cold})
+    assert body.status_code == 200 and all(math.isfinite(p) for p in body.json()["predictions"])
 
 
 def test_legacy_notebook_model_still_loads_via_stage(registry, serving):
@@ -114,7 +164,7 @@ def test_legacy_notebook_model_still_loads_via_stage(registry, serving):
 
     serving_app.load_model()                        # no @champion → falls back to stage
     info = serving.get("/model-info").json()
-    assert info["model_stage"] == "Production"
+    assert info["model_stage"] == "Production" and info["candidate"] == ""
     assert info["horizon"] == 1 and info["target"] == "level"
 
     window = [float(v) for v in values[-10:]]

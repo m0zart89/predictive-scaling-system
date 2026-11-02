@@ -11,7 +11,8 @@ BASE_META = {
 
 
 class FakePrometheus:
-    """Returns a fixed window (or raises) and records every call."""
+    """Returns a fixed history (None = missing sample; or raises) and records
+    every call. Like the real client, the grid ends at the newest sample."""
 
     def __init__(self, values=None, exc=None):
         self.values = list(values or [])
@@ -20,7 +21,7 @@ class FakePrometheus:
 
     NOW = 1_700_000_000.0   # time of the last sample the fake returns
 
-    def fetch_series(self, address, query, points, step_seconds, timeout, now=None):
+    def fetch_history(self, address, query, points, step_seconds, timeout, now=None):
         self.calls.append(dict(address=address, query=query, points=points,
                                step_seconds=step_seconds, timeout=timeout))
         if self.exc:
@@ -28,6 +29,13 @@ class FakePrometheus:
         values = self.values[-points:]
         timestamps = [self.NOW - (len(values) - 1 - i) * step_seconds for i in range(len(values))]
         return timestamps, values
+
+    def fetch_series(self, *args, **kwargs):
+        timestamps, values = self.fetch_history(*args, **kwargs)
+        run = 0
+        while run < len(values) and values[-1 - run] is not None:
+            run += 1
+        return timestamps[len(values) - run:], values[len(values) - run:]
 
     def fetch_window(self, *args, **kwargs):
         return self.fetch_series(*args, **kwargs)[1]

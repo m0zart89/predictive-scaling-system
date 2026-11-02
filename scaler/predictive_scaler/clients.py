@@ -48,6 +48,28 @@ class PrometheusClient:
         exactly `step_seconds` apart. A gap (missing scrape, NaN from a division
         by zero) shortens the window instead of hiding a hole from the model;
         the engine then scales on observed demand until the window refills.
+        """
+        timestamps, values = self.fetch_history(address, query, points, step_seconds, timeout, now)
+        run_ts: List[float] = []
+        run_values: List[float] = []
+        for ts, v in zip(timestamps, values):
+            if v is None:
+                run_ts, run_values = [], []          # a hole: start the run again
+                continue
+            run_ts.append(ts)
+            run_values.append(v)
+        return run_ts, run_values
+
+    def fetch_history(self, address: str, query: str, points: int, step_seconds: int,
+                      timeout: float, now: Optional[float] = None
+                      ) -> Tuple[List[float], List[Optional[float]]]:
+        """
+        Return (timestamps, values) for the last `points` grid instants of
+        `query`, `step_seconds` apart and ending at the newest sample Prometheus
+        returned, oldest first. An instant with no sample, or a sample that is
+        not finite (NaN from a division by zero), is None: the caller sees the
+        hole instead of a shifted series. Empty lists when the query matched
+        nothing.
 
         The query must resolve to exactly one series — aggregate it in PromQL
         (sum/avg) so the scaler never has to guess how to combine series.
@@ -84,25 +106,29 @@ class PrometheusClient:
         if not result:
             return [], []
 
-        timestamps: List[float] = []
-        values: List[float] = []
+        samples: List[Tuple[float, Optional[float]]] = []
         for ts, raw in result[0].get("values", []):
             try:
                 v = float(raw)
             except (TypeError, ValueError):
                 v = math.nan
-            if not math.isfinite(v):
-                timestamps, values = [], []          # a hole: start the run again
-                continue
-            if timestamps and abs(float(ts) - timestamps[-1] - step_seconds) > 1:
-                timestamps, values = [], []          # samples not step_seconds apart
-            timestamps.append(float(ts))
-            values.append(v)
-        return timestamps[-points:], values[-points:]
+            samples.append((float(ts), v if math.isfinite(v) else None))
+        if not samples:
+            return [], []
+        # query_range evaluates at start + k*step, so every sample sits on a
+        # grid; anchor it at the newest sample and leave None where one is missing
+        last = samples[-1][0]
+        grid = [last - (points - 1 - i) * step_seconds for i in range(points)]
+        values: List[Optional[float]] = [None] * points
+        for ts, v in samples:
+            k = round((ts - grid[0]) / step_seconds)
+            if 0 <= k < points and abs(grid[k] - ts) <= 1:
+                values[k] = v
+        return grid, values
 
 
 class ForecastClient:
-    def predict(self, base_url: str, values: List[float], timeout: float,
+    def predict(self, base_url: str, values: List[Optional[float]], timeout: float,
                 series: Optional[str] = None, timestamp: Optional[float] = None,
                 step_seconds: Optional[int] = None) -> List[float]:
         """
@@ -110,9 +136,11 @@ class ForecastClient:
         horizon (model space). Models with a single-step horizon, and services
         that predate multi-step forecasts, yield a one-element list.
 
-        `series`, `timestamp` (unix time of the last sample) and `step_seconds`
-        (their spacing) let the service score this forecast against the actual
-        values a later window carries; older services ignore them.
+        `values` may hold None for gaps in the older part of a long history
+        (sent as null; the service interpolates them). `series`, `timestamp`
+        (unix time of the last sample) and `step_seconds` (their spacing) let
+        the service score this forecast against the actual values a later
+        window carries; older services ignore them.
         """
         body_out: dict = {"values": values}
         if series:
