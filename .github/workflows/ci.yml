@@ -222,10 +222,23 @@ jobs:
           test "$(grep -c '^kind: ScaledObject$' /tmp/workloads.yaml)" = 2
           grep -Fq 'container=\"worker\"}[2m]))) / 1"' /tmp/workloads.yaml
           grep -q 'stepSeconds: "60"' /tmp/workloads.yaml
-          # the worker's extra channel reaches its ScaledObject and the CronJob (as JSON)
-          grep -Fq 'channels: "{\"rps\":\"sum(rate(http_requests_total{container=\"worker\"}[2m]))\"}"' /tmp/workloads.yaml
-          grep -q 'targetChannel: "cpu"' /tmp/workloads.yaml
-          grep -q 'name: TRAIN_CHANNELS' /tmp/workloads.yaml
+          # the worker's extra channel reaches its ScaledObject and the CronJob as valid
+          # JSON (the query's own quotes survive two layers of escaping)
+          python3 - <<'PY'
+          import json, yaml
+          docs = [d for d in yaml.safe_load_all(open("/tmp/workloads.yaml")) if d]
+          so = [d for d in docs if d["kind"] == "ScaledObject" and d["metadata"]["name"] == "worker"][0]
+          meta = so["spec"]["triggers"][0]["metadata"]
+          assert json.loads(meta["channels"]) == {"rps": 'sum(rate(http_requests_total{container="worker"}[2m]))'}, meta["channels"]
+          assert meta["targetChannel"] == "cpu"
+          cj = [d for d in docs if d["kind"] == "CronJob"][0]
+          env = {e["name"]: e.get("value") for e in cj["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+          assert json.loads(env["TRAIN_CHANNELS"]) == {"rps": 'sum(rate(http_requests_total{container="worker"}[2m]))'}
+          assert env["TRAIN_TARGET_CHANNEL"] == "cpu"
+          api = [d for d in docs if d["kind"] == "ScaledObject" and d["metadata"]["name"] == "api"][0]
+          assert "channels" not in api["spec"]["triggers"][0]["metadata"]
+          print("channels ok")
+          PY
           if grep -q 'name: TRAIN_CHANNELS' /tmp/stack.yaml; then
             echo "::error::TRAIN_CHANNELS rendered for a workload without channels"; exit 1
           fi
