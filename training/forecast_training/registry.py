@@ -290,14 +290,21 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
     return Outcome("kept_champion", vs, metrics=metrics)
 
 
-def reload_serving(url: str, timeout: float = 30.0, token: Optional[str] = None) -> bool:
+def reload_serving(url: str, timeout: float = 30.0, token: Optional[str] = None,
+                   tls_dir: Optional[str] = None) -> bool:
     """Ask forecast-serving to load the new champion. Failure is logged, not raised.
-    `token` goes into X-Reload-Token (forecast-serving's RELOAD_TOKEN)."""
+    `token` goes into X-Reload-Token (forecast-serving's RELOAD_TOKEN); `tls_dir`
+    (SERVING_TLS_DIR) holds the client certificate for an https URL."""
     headers = {"X-Reload-Token": token} if token else {}
     req = urllib.request.Request(f"{url.rstrip('/')}/reload", data=b"", method="POST",
                                  headers=headers)
+    context = None
+    if tls_dir:
+        import ssl
+        context = ssl.create_default_context(cafile=os.path.join(tls_dir, "ca.crt"))
+        context.load_cert_chain(os.path.join(tls_dir, "tls.crt"), os.path.join(tls_dir, "tls.key"))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:  # noqa: S310
             log.info("serving reloaded: %s", resp.read().decode()[:200])
             return True
     except (urllib.error.URLError, OSError) as exc:

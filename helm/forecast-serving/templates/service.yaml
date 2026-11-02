@@ -13,7 +13,8 @@ spec:
   selector:
     {{- include "forecast-serving.selectorLabels" . | nindent 4 }}
   ports:
+    # the same port number either way: callers only change the scheme under mTLS
     - port: {{ .Values.service.port }}
-      targetPort: http
+      targetPort: {{ if include "forecast-serving.tls" . }}https{{ else }}http{{ end }}
       protocol: TCP
       name: http

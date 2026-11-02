@@ -8,9 +8,21 @@
 # there only (namespace-scoped RBAC).
 
 global:
-  # Tag for the four project images (forecast-serving, predictive-scaler,
-  # cpu-burner, forecast-training). CI publishes <sha> and latest to GHCR.
+  # Tag for the project images (forecast-serving, predictive-scaler,
+  # cpu-burner, forecast-training, mlflow-server). CI publishes <sha> and
+  # latest to GHCR.
   imageTag: latest
+  # Mutual TLS on both internal loops (KEDA → scaler over gRPC, scaler /
+  # training jobs / ingress → forecast-serving over https) with certificates
+  # from cert-manager (templates/tls.yaml). issuerRef names the CA issuer that
+  # signs everything; the subcharts read this switch too.
+  tls:
+    enabled: false
+    issuerRef:
+      name: ""              # e.g. internal-ca; scripts/up.sh TLS=1 creates predictive-ca
+      kind: ClusterIssuer
+    duration: 720h
+    renewBefore: 240h
 
 # ── subcharts ──────────────────────────────────────────────────────────────────
 
@@ -178,6 +190,9 @@ security:
     # NetworkPolicy; off by default because kind's kindnet does not.
     enabled: false
     ingressNamespace: ingress-nginx
+    # Default-deny ingress for the whole namespace, with an allow policy per
+    # component (templates/networkpolicy.yaml). Egress stays open.
+    defaultDeny: false
 
 # ── workloads scaled by the predictive scaler ──────────────────────────────────
 

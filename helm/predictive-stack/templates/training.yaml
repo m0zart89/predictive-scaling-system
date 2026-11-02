@@ -75,12 +75,16 @@ spec:
                 - name: MODEL_ALIAS
                   value: champion
                 - name: SERVING_RELOAD_URL
-                  value: http://forecast-serving:8080
+                  value: {{ if .Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving:8080
                 - name: SERVING_RELOAD_TOKEN
                   valueFrom:
                     secretKeyRef:
                       name: forecast-reload-token
                       key: RELOAD_TOKEN
+                {{- if .Values.global.tls.enabled }}
+                - name: SERVING_TLS_DIR
+                  value: /etc/serving-tls
+                {{- end }}
               {{- with .Values.mlflow.client.existingSecret }}
               envFrom:
                 - secretRef:
@@ -92,6 +96,16 @@ spec:
                 allowPrivilegeEscalation: false
                 capabilities:
                   drop: ["ALL"]
+              {{- if .Values.global.tls.enabled }}
+              volumeMounts:
+                - name: serving-tls
+                  mountPath: /etc/serving-tls
+                  readOnly: true
+          volumes:
+            - name: serving-tls
+              secret:
+                secretName: forecast-training-client
+              {{- end }}
 {{- end }}
 {{- if $t.bootstrap.enabled }}
 ---
@@ -148,7 +162,7 @@ spec:
             - --horizon={{ $t.bootstrap.horizon }}
             - --period-seconds={{ $t.cronjob.periodSeconds }}
             - --under-weight={{ $t.cronjob.underWeight }}
-            - --reload-url=http://forecast-serving:8080
+            - --reload-url={{ if .Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving:8080
           env:
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow:5000
@@ -161,6 +175,10 @@ spec:
                 secretKeyRef:
                   name: forecast-reload-token
                   key: RELOAD_TOKEN
+            {{- if .Values.global.tls.enabled }}
+            - name: SERVING_TLS_DIR
+              value: /etc/serving-tls
+            {{- end }}
           {{- with .Values.mlflow.client.existingSecret }}
           envFrom:
             - secretRef:
@@ -176,8 +194,18 @@ spec:
             - name: data
               mountPath: /data
               readOnly: true
+            {{- if .Values.global.tls.enabled }}
+            - name: serving-tls
+              mountPath: /etc/serving-tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: data
           configMap:
             name: {{ $t.bootstrap.configMap }}
+        {{- if .Values.global.tls.enabled }}
+        - name: serving-tls
+          secret:
+            secretName: forecast-training-client
+        {{- end }}
 {{- end }}

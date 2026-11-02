@@ -25,8 +25,20 @@ terminationGracePeriodSeconds: 20
 topologySpreadConstraints: []
 
 # Set by the predictive-stack umbrella chart; standalone installs use image.tag.
+# global.tls.enabled: mutual TLS on the gRPC port and towards forecast-serving.
 global:
   imageTag: ""
+  tls:
+    enabled: false
+
+# Mutual TLS: the gRPC server presents tls.secretName's certificate and
+# requires one from KEDA (TriggerAuthentication with caCert/tlsClientCert/
+# tlsClientKey, trigger metadata enableTLS); the same directory holds the
+# client certificate the scaler shows forecast-serving (https URLs only;
+# Prometheus stays plain HTTP). Enabled by global.tls.enabled or tls.enabled.
+tls:
+  enabled: false
+  secretName: predictive-scaler-tls
 
 image:
   repository: ghcr.io/m0zart89/predictive-scaling-system/predictive-scaler

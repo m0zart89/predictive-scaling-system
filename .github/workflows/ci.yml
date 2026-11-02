@@ -258,8 +258,11 @@ jobs:
           # and points the scaler, Grafana and the training job at the URL
           grep -q '^kind: Prometheus$' /tmp/prod.yaml
           grep -q '^kind: PrometheusRule$' /tmp/prod.yaml
-          grep -q 'record: workload:demand' /tmp/prod.yaml
           grep -q 'alert: ForecastDriftHigh' /tmp/prod.yaml
+          # the demand rule needs workloads: the PrometheusRule carries one per entry
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml \
+            -f helm/predictive-stack/ci/workloads-values.yaml | grep -c 'record: workload:demand' | grep -qx 2
           if grep -q 'name: prometheus-config' /tmp/prod.yaml; then
             echo "::error::the builtin Prometheus was rendered in operator mode"; exit 1
           fi
@@ -280,6 +283,33 @@ jobs:
           if helm template predictive helm/predictive-stack/ -n predictive --set mlflow.replicas=2 > /dev/null 2>&1; then
             echo "::error::mlflow.replicas=2 on SQLite rendered"; exit 1
           fi
+          # mutual TLS: five Certificates, KEDA's TriggerAuthentication and enableTLS,
+          # https towards serving, uvicorn with client-cert verification, the scaler's
+          # TLS_DIR and plaintext health port, the forecast ingress with backend mTLS
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set global.tls.enabled=true --set global.tls.issuerRef.name=internal-ca > /tmp/tls.yaml
+          test "$(grep -c '^kind: Certificate$' /tmp/tls.yaml)" = 5
+          grep -q '^kind: TriggerAuthentication$' /tmp/tls.yaml
+          grep -q 'enableTLS: "true"' /tmp/tls.yaml
+          grep -q 'name: predictive-scaler-mtls' /tmp/tls.yaml
+          grep -q 'forecastServiceURL: https://forecast-serving' /tmp/tls.yaml
+          grep -q -- '--ssl-cert-reqs' /tmp/tls.yaml
+          grep -q 'name: TLS_DIR' /tmp/tls.yaml
+          grep -q 'name: HEALTH_PORT' /tmp/tls.yaml
+          grep -q 'name: SERVING_TLS_DIR' /tmp/tls.yaml
+          grep -q 'backend-protocol: "HTTPS"' /tmp/tls.yaml
+          grep -q 'prometheus.io/port: "9100"' /tmp/tls.yaml
+          if grep -q 'forecastServiceURL: http://' /tmp/tls.yaml; then
+            echo "::error::a plaintext forecastServiceURL was rendered under TLS"; exit 1
+          fi
+          if helm template predictive helm/predictive-stack/ -n predictive --set global.tls.enabled=true > /dev/null 2>&1; then
+            echo "::error::global.tls.enabled without an issuer rendered"; exit 1
+          fi
+          # default-deny ingress with the pilot profile
+          helm template predictive helm/predictive-stack/ -n predictive -f helm/predictive-stack/values-pilot.yaml \
+            -f helm/predictive-stack/ci/workloads-values.yaml > /tmp/pilot.yaml
+          grep -q 'name: default-deny-ingress' /tmp/pilot.yaml
+          test "$(grep -c '^kind: NetworkPolicy$' /tmp/pilot.yaml)" -ge 8
           # the default profile renders no PDB (single replicas) but the same probes
           if grep -q '^kind: PodDisruptionBudget$' /tmp/stack.yaml; then
             echo "::error::a PodDisruptionBudget was rendered for single-replica defaults"; exit 1

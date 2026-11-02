@@ -55,3 +55,8 @@ ServiceAccount name.
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/* Mutual TLS: the umbrella's global switch or this chart's own. */}}
+{{- define "predictive-scaler.tls" -}}
+{{- if or .Values.tls.enabled (and .Values.global.tls .Values.global.tls.enabled) }}true{{ end -}}
+{{- end }}

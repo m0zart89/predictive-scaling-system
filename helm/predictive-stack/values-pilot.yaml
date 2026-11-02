@@ -29,6 +29,7 @@ security:
   networkPolicy:
     enabled: true            # needs a CNI that enforces NetworkPolicy
     ingressNamespace: ingress-nginx
+    defaultDeny: true
 
 prometheus:
   retention: 30d

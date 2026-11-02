@@ -51,7 +51,7 @@ spec:
                 port:
                   number: 5000
     {{- end }}
-    {{- if (index .Values "forecast-serving").enabled }}
+    {{- if and (index .Values "forecast-serving").enabled (not .Values.global.tls.enabled) }}
     - host: {{ printf "%s.%s" $i.hosts.forecast $i.domain | quote }}
       http:
         paths:
@@ -63,4 +63,40 @@ spec:
                 port:
                   number: 8080
     {{- end }}
+{{- if and (index .Values "forecast-serving").enabled .Values.global.tls.enabled }}
+---
+# Under mTLS the forecast host is its own Ingress: ingress-nginx speaks https
+# to forecast-serving and presents the forecast-ingress-client certificate
+# (annotations are per Ingress object, not per host).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: predictive-stack-forecast
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-secret: {{ printf "%s/forecast-ingress-client" .Release.Namespace | quote }}
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: {{ printf "forecast-serving.%s.svc" .Release.Namespace | quote }}
+    nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+    {{- with $i.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with $i.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ printf "%s.%s" $i.hosts.forecast $i.domain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: forecast-serving
+                port:
+                  number: 8080
+{{- end }}
 {{- end }}

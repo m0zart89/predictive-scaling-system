@@ -68,7 +68,10 @@ spec:
         # Total demand, independent of replica count (aggregate to one series);
         # the recorded workload:demand series with prometheus.recordDemand.
         query: {{ include "predictive-stack.demandQuery" (dict "root" $root "name" $w.name "query" $w.query) | quote }}
-        forecastServiceURL: http://forecast-serving.{{ $root.Release.Namespace }}.svc.cluster.local:8080
+        forecastServiceURL: {{ if $root.Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving.{{ $root.Release.Namespace }}.svc.cluster.local:8080
+        {{- if $root.Values.global.tls.enabled }}
+        enableTLS: "true"
+        {{- end }}
         targetValue: {{ $w.targetValue | quote }}
         # model input = demand / capacity: the model is trained on that series
         # (training.workload), so the two must agree
@@ -93,6 +96,10 @@ spec:
         breakerJumpFactor: {{ $w.breakerJumpFactor | default $d.breakerJumpFactor | quote }}
         breakerMinOpenSeconds: {{ $w.breakerMinOpenSeconds | default $d.breakerMinOpenSeconds | quote }}
         breakerCalmPolls: {{ $w.breakerCalmPolls | default $d.breakerCalmPolls | quote }}
+{{- if $root.Values.global.tls.enabled }}
+      authenticationRef:
+        name: predictive-scaler-mtls
+{{- end }}
 {{- $floor := $w.reactiveFloor | default $d.reactiveFloor }}
 {{- if $floor.enabled }}
     # Reactive floor: a plain CPU trigger next to the predictive one. KEDA takes

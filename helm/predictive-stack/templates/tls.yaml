@@ -1,0 +1,110 @@
+{{- if .Values.global.tls.enabled }}
+{{- $t := .Values.global.tls }}
+{{- $issuer := required "global.tls.issuerRef.name is required with global.tls.enabled" $t.issuerRef.name }}
+{{- $ns := .Release.Namespace }}
+# Mutual TLS on both loops, certificates from cert-manager:
+#   KEDA ──(gRPC, enableTLS + TriggerAuthentication)──▶ predictive-scaler
+#   predictive-scaler / training jobs / ingress ──(https, client cert)──▶ forecast-serving
+# One CA (global.tls.issuerRef) signs everything; rotation rewrites the
+# Secrets and the pods roll on the next deploy (or a reloader).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forecast-serving-tls
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  secretName: forecast-serving-tls
+  issuerRef: {name: {{ $issuer }}, kind: {{ $t.issuerRef.kind }}}
+  duration: {{ $t.duration }}
+  renewBefore: {{ $t.renewBefore }}
+  # client auth too: the pod probes itself with this certificate (localhost)
+  usages: [server auth, client auth]
+  commonName: forecast-serving
+  dnsNames:
+    - forecast-serving
+    - forecast-serving.{{ $ns }}.svc
+    - forecast-serving.{{ $ns }}.svc.cluster.local
+    - localhost
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: predictive-scaler-tls
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  secretName: predictive-scaler-tls
+  issuerRef: {name: {{ $issuer }}, kind: {{ $t.issuerRef.kind }}}
+  duration: {{ $t.duration }}
+  renewBefore: {{ $t.renewBefore }}
+  # server auth for KEDA's calls, client auth towards forecast-serving (one mount)
+  usages: [server auth, client auth]
+  commonName: predictive-scaler
+  dnsNames:
+    - predictive-scaler
+    - predictive-scaler.{{ $ns }}.svc
+    - predictive-scaler.{{ $ns }}.svc.cluster.local
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keda-scaler-client
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  secretName: keda-scaler-client
+  issuerRef: {name: {{ $issuer }}, kind: {{ $t.issuerRef.kind }}}
+  duration: {{ $t.duration }}
+  renewBefore: {{ $t.renewBefore }}
+  usages: [client auth]
+  commonName: keda-operator
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forecast-training-client
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  secretName: forecast-training-client
+  issuerRef: {name: {{ $issuer }}, kind: {{ $t.issuerRef.kind }}}
+  duration: {{ $t.duration }}
+  renewBefore: {{ $t.renewBefore }}
+  usages: [client auth]
+  commonName: forecast-retrain
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forecast-ingress-client
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  secretName: forecast-ingress-client
+  issuerRef: {name: {{ $issuer }}, kind: {{ $t.issuerRef.kind }}}
+  duration: {{ $t.duration }}
+  renewBefore: {{ $t.renewBefore }}
+  usages: [client auth]
+  commonName: ingress-nginx
+---
+# KEDA presents keda-scaler-client to the scaler and verifies the scaler
+# against the CA (KEDA >= 2.16: enableTLS on the external trigger).
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: predictive-scaler-mtls
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: caCert
+      name: keda-scaler-client
+      key: ca.crt
+    - parameter: tlsClientCert
+      name: keda-scaler-client
+      key: tls.crt
+    - parameter: tlsClientKey
+      name: keda-scaler-client
+      key: tls.key
+{{- end }}

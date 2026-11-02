@@ -143,6 +143,17 @@ security:
   networkPolicy:
     enabled: true
     ingressNamespace: ingress-nginx
+    defaultDeny: true
+
+# cert-manager must be installed and the CA issuer must exist:
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.3/cert-manager.yaml
+#   (then a ClusterIssuer backed by your internal CA; scripts/up.sh TLS=1 shows a self-signed one)
+global:
+  tls:
+    enabled: true
+    issuerRef:
+      name: internal-ca
+      kind: ClusterIssuer
 
 training:
   cronjob:

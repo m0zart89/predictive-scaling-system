@@ -85,6 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="forecast-serving base URL to POST /reload after a promotion")
     p.add_argument("--reload-token", default=_env("SERVING_RELOAD_TOKEN"),
                    help="value for the X-Reload-Token header (forecast-serving's RELOAD_TOKEN)")
+    p.add_argument("--reload-tls-dir", default=_env("SERVING_TLS_DIR"),
+                   help="directory with tls.crt, tls.key, ca.crt for an https --reload-url (mTLS)")
     p.add_argument("--dry-run", action="store_true",
                    help="train, compare and log, but do not register or move the alias")
     p.add_argument("--summary", help="also write the JSON summary to this file")
@@ -129,7 +131,8 @@ def main(argv=None) -> int:
 
     summary = outcome.to_dict()
     if outcome.promoted and args.reload_url:
-        summary["serving_reloaded"] = reload_serving(args.reload_url, token=args.reload_token)
+        summary["serving_reloaded"] = reload_serving(args.reload_url, token=args.reload_token,
+                                                     tls_dir=args.reload_tls_dir)
 
     log.info("%s: %s", outcome.decision, outcome.reason)
     text = json.dumps(summary, indent=2, sort_keys=True)

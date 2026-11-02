@@ -56,6 +56,10 @@ MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "")
 # (the chart generates one and hands it to the training jobs). Empty: open,
 # for local runs only.
 RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")
+# With the API behind mTLS (uvicorn --ssl-cert-reqs 2) Prometheus cannot scrape
+# /metrics without a client certificate; set this to serve the same registry
+# over plain HTTP on a second port (0 = off, /metrics on the API port only).
+METRICS_PORT = int(os.getenv("METRICS_PORT", "0"))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -391,6 +395,10 @@ async def lifespan(application: FastAPI):
     _stop_loading.clear()
     threading.Thread(target=_load_model_until_available, name="model-loader", daemon=True).start()
     threading.Thread(target=_refresh_model_forever, name="model-refresh", daemon=True).start()
+    if METRICS_PORT:
+        from prometheus_client import start_http_server
+        start_http_server(METRICS_PORT)
+        log.info("Plain-HTTP /metrics on :%d (the API port may require client certificates)", METRICS_PORT)
     log.info("Model loading initiated in background. Traffic held until /ready returns 200.")
 
     yield

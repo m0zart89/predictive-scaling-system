@@ -133,8 +133,39 @@ def build_server(engine: PredictiveEngine, metrics: ScalerMetrics, address: str,
     for svc in ("", SERVICE_NAME):
         health_servicer.set(svc, health_pb2.HealthCheckResponse.SERVING)
 
+    creds = server_credentials(os.getenv("TLS_DIR", ""))
+    port = server.add_secure_port(address, creds) if creds else server.add_insecure_port(address)
+    return server, port
+
+
+def build_health_server(address: str) -> tuple[grpc.Server, int]:
+    """A plaintext server with only the health service: Kubernetes' native grpc
+    probes carry no client certificate, so under mTLS they probe this port."""
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    for svc in ("", SERVICE_NAME):
+        health_servicer.set(svc, health_pb2.HealthCheckResponse.SERVING)
     port = server.add_insecure_port(address)
     return server, port
+
+
+def server_credentials(tls_dir: str):
+    """
+    Mutual TLS from a mounted cert-manager Secret (tls.crt, tls.key, ca.crt):
+    KEDA must present a certificate signed by the same CA (its
+    TriggerAuthentication carries tlsClientCert/tlsClientKey/caCert and the
+    trigger sets enableTLS). Empty TLS_DIR: plaintext, for local runs.
+    """
+    if not tls_dir:
+        return None
+    with open(os.path.join(tls_dir, "tls.key"), "rb") as f:
+        key = f.read()
+    with open(os.path.join(tls_dir, "tls.crt"), "rb") as f:
+        crt = f.read()
+    with open(os.path.join(tls_dir, "ca.crt"), "rb") as f:
+        ca = f.read()
+    return grpc.ssl_server_credentials([(key, crt)], root_certificates=ca, require_client_auth=True)
 
 
 def main() -> None:
@@ -155,12 +186,21 @@ def main() -> None:
 
     start_http_server(metrics_port)
     server.start()
-    log.info("Predictive scaler listening: gRPC :%d, metrics :%d", port, metrics_port)
+    health_server = None
+    if os.getenv("TLS_DIR"):
+        health_port = int(os.getenv("HEALTH_PORT", "6001"))
+        health_server, health_port = build_health_server(f"[::]:{health_port}")
+        health_server.start()
+        log.info("Plaintext health service for probes on :%d", health_port)
+    log.info("Predictive scaler listening: gRPC :%d (%s), metrics :%d", port,
+             "mTLS" if os.getenv("TLS_DIR") else "plaintext", metrics_port)
 
     def _shutdown(signum, _frame):
         log.info("Received signal %d, shutting down", signum)
         stop_event.set()
         server.stop(grace=10)
+        if health_server is not None:
+            health_server.stop(grace=None)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

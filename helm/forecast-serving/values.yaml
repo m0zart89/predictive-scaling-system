@@ -28,8 +28,23 @@ extraEnv: []
 extraEnvFrom: []
 
 # Set by the predictive-stack umbrella chart; standalone installs use image.tag.
+# global.tls.enabled puts the API behind mutual TLS (see tls below).
 global:
   imageTag: ""
+  tls:
+    enabled: false
+
+# Mutual TLS on the API: uvicorn serves https on 8443 with the certificate in
+# tls.secretName (cert-manager layout: tls.crt, tls.key, ca.crt) and requires a
+# client certificate chained to ca.crt from every caller (the scaler, the
+# training jobs, the ingress controller). /metrics is then served on a plain
+# port (tls.metricsPort) for Prometheus, and the probes exec a python call with
+# the pod's own certificate (the Certificate must carry client auth and the
+# name localhost). Enabled by global.tls.enabled or tls.enabled.
+tls:
+  enabled: false
+  secretName: forecast-serving-tls
+  metricsPort: 9100
 
 image:
   repository: ghcr.io/m0zart89/predictive-scaling-system/forecast-serving
@@ -41,11 +56,9 @@ serviceAccount:
   create: true
   name: ""
 
-# Prometheus auto-discovery annotations
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "8080"
-  prometheus.io/path: "/metrics"
+# Extra pod annotations. The prometheus.io/scrape|port|path annotations are
+# rendered by the template (the port moves to tls.metricsPort under mTLS).
+podAnnotations: {}
 
 service:
   type: ClusterIP

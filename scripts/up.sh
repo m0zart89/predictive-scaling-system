@@ -22,6 +22,9 @@
 #   MAX_REPLICAS   demo.maxReplicas                      (default: 10)
 #   TRAIN          1 = train the first model from the saved export (default: 1)
 #   SMOKE          1 = run the smoke tests at the end     (default: 1)
+#   TLS            1 = install cert-manager, create a self-signed CA issuer
+#                  (predictive-ca) and enable mutual TLS on both internal loops
+#                  (global.tls.enabled)                   (default: 0)
 #   HELM_EXTRA     extra arguments for helm upgrade (e.g. "--set grafana.anonymous=false")
 #   DOMAIN         ingress domain                         (default: localhost)
 set -euo pipefail
@@ -39,6 +42,8 @@ STEP_SECONDS=${STEP_SECONDS:-300}
 DEMO_SCALING=${DEMO_SCALING:-predictive}
 MAX_REPLICAS=${MAX_REPLICAS:-10}
 TRAIN=${TRAIN:-1}
+TLS=${TLS:-0}
+CERT_MANAGER_VERSION=${CERT_MANAGER_VERSION:-v1.16.3}
 SMOKE=${SMOKE:-1}
 HELM_EXTRA=${HELM_EXTRA:-}
 DOMAIN=${DOMAIN:-localhost}
@@ -100,6 +105,45 @@ log "Waiting for ingress-nginx"
 kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s >/dev/null
 kubectl -n ingress-nginx wait --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=300s >/dev/null
 
+# ── 3b. cert-manager (TLS=1) ───────────────────────────────────────────────────
+TLS_SET=""
+if [ "$TLS" = "1" ]; then
+  log "Installing cert-manager ($CERT_MANAGER_VERSION) and a self-signed CA issuer 'predictive-ca'"
+  kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml" >/dev/null
+  for d in cert-manager cert-manager-cainjector cert-manager-webhook; do
+    kubectl -n cert-manager rollout status "deployment/$d" --timeout=300s >/dev/null
+  done
+  # the webhook admits objects a few seconds after its rollout; retry the apply
+  for i in $(seq 1 30); do
+    kubectl apply -f - <<'EOF' >/dev/null 2>&1 && break
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: selfsigned, namespace: cert-manager}
+spec: {selfSigned: {}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: predictive-ca, namespace: cert-manager}
+spec:
+  isCA: true
+  commonName: predictive-ca
+  secretName: predictive-ca
+  duration: 8760h
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: selfsigned, kind: Issuer}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: predictive-ca}
+spec: {ca: {secretName: predictive-ca}}
+EOF
+    [ "$i" = 30 ] && die "cert-manager webhook did not admit the CA issuer"
+    sleep 5
+  done
+  kubectl -n cert-manager wait --for=condition=Ready certificate/predictive-ca --timeout=180s >/dev/null
+  TLS_SET="--set global.tls.enabled=true --set global.tls.issuerRef.name=predictive-ca"
+fi
+
 # ── 4. helm ────────────────────────────────────────────────────────────────────
 log "Resolving chart dependencies (KEDA)"
 helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1 || true
@@ -119,8 +163,12 @@ helm upgrade --install "$RELEASE" helm/predictive-stack \
   --set demo.scaling=none \
   --set demo.maxReplicas="$MAX_REPLICAS" \
   --set demo.predictive.stepSeconds="$STEP_SECONDS" \
-  $HELM_EXTRA \
+  $TLS_SET $HELM_EXTRA \
   --timeout 10m >/dev/null
+if [ "$TLS" = "1" ]; then
+  log "Waiting for the certificates"
+  kubectl -n "$NAMESPACE" wait --for=condition=Ready certificate --all --timeout=180s >/dev/null
+fi
 
 log "Waiting for the platform components"
 for d in mlflow prometheus grafana predictive-scaler cpu-burner \
@@ -144,7 +192,7 @@ fi
 helm upgrade "$RELEASE" helm/predictive-stack -n "$NAMESPACE" --reuse-values \
   --set demo.scaling="$DEMO_SCALING" \
   --set training.bootstrap.enabled="$([ "$TRAIN" = "1" ] && echo true || echo false)" \
-  $HELM_EXTRA \
+  $TLS_SET $HELM_EXTRA \
   --timeout 10m >/dev/null
 
 if [ "$TRAIN" = "1" ]; then
@@ -181,33 +229,38 @@ if [ "$SMOKE" = "1" ]; then
   # it a little load first and retry until the window has data.
   kubectl -n "$NAMESPACE" run smoke-load --image=busybox:1.36 --restart=Never --rm -i --quiet --command -- \
     sh -c 'for i in $(seq 1 40); do wget -q -O- "http://cpu-burner:8080/work?ms=50" >/dev/null; done; echo load ok' || true
-  kubectl -n "$NAMESPACE" run scaler-smoke --image="$REGISTRY/predictive-scaler:$IMAGE_TAG" \
-    --image-pull-policy=IfNotPresent --restart=Never --rm -i --quiet --command \
-    --env="NS=$NAMESPACE" --env="STEP=$STEP_SECONDS" -- python - <<'PY'
-import os, time, grpc
-from predictive_scaler import externalscaler_pb2 as pb, externalscaler_pb2_grpc as pbg
-ns = os.environ["NS"]
-ref = pb.ScaledObjectRef(name="cpu-burner", namespace=ns, scalerMetadata={
-    "prometheusServerAddress": f"http://prometheus.{ns}.svc.cluster.local:9090",
-    "query": 'sum(rate(process_cpu_seconds_total{app="cpu-burner"}[1m]))',
-    "forecastServiceURL": f"http://forecast-serving.{ns}.svc.cluster.local:8080",
-    "targetValue": "0.35", "capacity": "2.5", "stepSeconds": os.environ["STEP"], "cacheSeconds": "0"})
-stub = pbg.ExternalScalerStub(grpc.insecure_channel(f"predictive-scaler.{ns}.svc.cluster.local:6000"))
-spec = stub.GetMetricSpec(ref, timeout=10).metricSpecs[0]
-print(f"GetMetricSpec: {spec.metricName} targetSizeFloat={spec.targetSizeFloat}")
-assert spec.metricName == "predicted-demand" and abs(spec.targetSizeFloat - 0.35) < 1e-9
-for attempt in range(24):
-    try:
-        m = stub.GetMetrics(pb.GetMetricsRequest(scaledObjectRef=ref, metricName=spec.metricName), timeout=10)
-        v = m.metricValues[0]
-        print(f"GetMetrics: {v.metricName}={v.metricValueFloat:.4f}")
-        break
-    except grpc.RpcError as exc:
-        print(f"GetMetrics: {exc.code().name} ({exc.details()}); waiting for samples")
-        time.sleep(10)
-else:
-    raise SystemExit("scaler never returned a metric")
-PY
+  kubectl -n "$NAMESPACE" create configmap scaler-smoke --from-file=smoke.py=scripts/scaler-smoke.py \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl -n "$NAMESPACE" delete pod scaler-smoke --ignore-not-found >/dev/null
+  kubectl -n "$NAMESPACE" apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scaler-smoke
+spec:
+  restartPolicy: Never
+  containers:
+    - name: smoke
+      image: $REGISTRY/predictive-scaler:$IMAGE_TAG
+      imagePullPolicy: IfNotPresent
+      command: ["python", "/smoke/smoke.py"]
+      env:
+        - {name: NS, value: "$NAMESPACE"}
+        - {name: STEP, value: "$STEP_SECONDS"}
+$([ "$TLS" = "1" ] && echo '        - {name: TLS_DIR, value: /etc/keda-tls}')
+      volumeMounts:
+        - {name: smoke, mountPath: /smoke}
+$([ "$TLS" = "1" ] && echo '        - {name: keda-tls, mountPath: /etc/keda-tls, readOnly: true}')
+  volumes:
+    - name: smoke
+      configMap: {name: scaler-smoke}
+$([ "$TLS" = "1" ] && echo '    - name: keda-tls
+      secret: {secretName: keda-scaler-client}')
+EOF
+  kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Succeeded pod/scaler-smoke --timeout=300s >/dev/null \
+    || { kubectl -n "$NAMESPACE" logs pod/scaler-smoke; die "scaler smoke test failed"; }
+  kubectl -n "$NAMESPACE" logs pod/scaler-smoke
+  kubectl -n "$NAMESPACE" delete pod scaler-smoke --ignore-not-found >/dev/null
 
   echo
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
