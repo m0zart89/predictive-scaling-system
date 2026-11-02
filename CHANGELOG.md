@@ -25,6 +25,10 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
   plus `periodSeconds / stepSeconds` per workload. Existing ScaledObjects
   and models are unaffected: `historySteps` defaults to `timeSteps`,
   `season_steps` to 0.
+- **Benchmark.** With selection by cost the morning ramp had its capacity in
+  45 s against the HPA's 180 s (v1.1: 105 s), p95 during the ramp −6%,
+  replica-minutes +13%; the afternoon ramp and the peak are unchanged.
+  `/model-info` now names the promoted `candidate`.
 - **Real traces, re-read.** With the seasonal baseline the Wikipedia result
   is 11–24% better than "the same hour yesterday" (not 76–85% better than
   persistence); `hgb_q75_delta_season` wins de.wikipedia, the quantile models

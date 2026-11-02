@@ -64,7 +64,7 @@ def test_pipeline_model_serves_identical_multistep_forecast(registry, serving):
     serving_app.load_model()
     info = serving.get("/model-info").json()
     assert info["horizon"] == 4 and info["target"] == "delta" and info["features"] == "anchored"
-    assert info["model_stage"] == "@champion"
+    assert info["model_stage"] == "@champion" and info["candidate"] == "hgb_delta"
 
     window = [float(v) for v in values[-10:]]
     body = serving.post("/predict", json={"values": window}).json()
@@ -164,7 +164,7 @@ def test_legacy_notebook_model_still_loads_via_stage(registry, serving):
 
     serving_app.load_model()                        # no @champion → falls back to stage
     info = serving.get("/model-info").json()
-    assert info["model_stage"] == "Production"
+    assert info["model_stage"] == "Production" and info["candidate"] == ""
     assert info["horizon"] == 1 and info["target"] == "level"
 
     window = [float(v) for v in values[-10:]]

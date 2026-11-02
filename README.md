@@ -293,16 +293,16 @@ Predictive scaler vs a plain CPU HPA, same kind cluster, same compressed day of 
 
 | | Reactive HPA | Predictive | |
 |---|---|---|---|
-| Morning ramp: time to the 3 replicas it needed | 180 s | 105 s | −42% |
-| Morning ramp: p95 latency | 76 ms | 75 ms | −2% |
+| Morning ramp: time to the 3 replicas it needed | 180 s | 45 s | −75% |
+| Morning ramp: p95 latency | 77 ms | 73 ms | −6% |
 | Afternoon ramp, peak, whole day: p95 latency | same | same | |
-| Replica-minutes over the day | 96.75 | 107.75 | +11% |
+| Replica-minutes over the day | 96.75 | 109.75 | +13% |
 
-Two runs so far, one with the plain delta model (v1.0: 60 s vs 165 s, p95 −8%, replica-minutes +13%) and one with the time-of-day model above (v1.1). What they say, honestly:
+Three runs so far: the plain delta model (v1.0: 60 s vs 165 s, p95 −8%, replica-minutes +13%), the time-of-day model (v1.1: 105 s vs 180 s, p95 −2%, +11%) and the run above, where the warm-up training chose by the asymmetric cost (an anchored delta model won; the seasonal candidates had two compressed days to learn from). What they say, honestly:
 
-- **The forecast helps where capacity has to grow from a low base.** On the morning ramp the predictive scaler had the capacity in place 75–105 s sooner. Latency during the ramp was lower by 2–8%; with pods that start in a second there is little latency to save.
-- **Part of that is not foresight.** In both runs the scaler entered the ramp with two replicas instead of one: `forecastAggregation: max` over a noisy night occasionally asked for a second replica, and each request reset the HPA's 300-second scale-down window.
-- **Time-of-day features did not change the outcome here.** The v1.1 model knows the phase of the compressed day, yet its lead over the HPA was no larger than the plain model's. Two warm-up days give it 160 samples to learn the phase from, and the scaler acts only through the HPA, whose own tolerance and stabilisation set the floor. One sample per configuration; the weekly run accumulates more.
+- **The forecast helps where capacity has to grow from a low base.** On the morning ramp the predictive scaler had the capacity in place 75–135 s sooner. Latency during the ramp was lower by 2–8%; with pods that start in a second there is little latency to save.
+- **Part of that is not foresight.** In every run the scaler entered the ramp with two replicas instead of one: `forecastAggregation: max` over a noisy night occasionally asked for a second replica, and each request reset the HPA's 300-second scale-down window.
+- **The features mattered less than the metric.** The time-of-day model (v1.1) was no earlier than the plain one; selecting by the cost that charges a shortfall three idle units gave the earliest ramp of the three runs. Two warm-up days are 160 samples, little for a seasonal model to learn from, and the scaler acts only through the HPA, whose own tolerance and stabilisation set the floor. One sample per configuration; the weekly run accumulates more.
 - **Where the HPA already holds capacity, there is nothing to win.** Both scalers kept three replicas through the lunch dip, so the afternoon ramp, the peak and the worst minute look the same, and neither run had a request over 500 ms.
 - **It costs.** 11–13% more replica-minutes, mostly the second replica held overnight.
 

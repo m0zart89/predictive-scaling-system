@@ -224,6 +224,8 @@ def load_model() -> None:
         "model_stage":   selector,
         "model_version": version,
         "run_id":        run_id,
+        # which candidate the pipeline promoted (version tag; "" for notebook models)
+        "candidate":     (v.tags or {}).get("candidate", ""),
         "loaded_at":     datetime.now(timezone.utc).isoformat(),
     }
     previous = _bundle
