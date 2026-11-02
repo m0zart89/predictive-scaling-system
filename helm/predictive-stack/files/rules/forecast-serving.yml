@@ -81,21 +81,20 @@ groups:
 
       - alert: ForecastReloadErrorRate
         expr: |
-          rate(http_requests_total{
-            job="forecast-serving",
-            handler="/reload",
-            status=~"5.."
-          }[10m]) > 0
-        for: 1m
+          sum by (pod) (increase(forecast_model_reloads_total{result="failure"}[15m])) > 0
+        for: 15m
         labels:
           severity: warning
           service: forecast-serving
         annotations:
           runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastReloadErrorRate.md
-          summary: "Model reload is failing"
+          summary: "forecast-serving cannot load the model from the registry ({{ $labels.pod }})"
           description: >
-            POST /reload is returning 5xx errors.
-            MLflow may be unavailable or the Production model stage is empty.
+            The lifecycle worker's loads from MLflow have been failing for
+            15 minutes (forecast_model_reloads_total{result="failure"}).
+            A loaded model keeps serving meanwhile; a pod without one stays
+            unready. MLflow may be unavailable, the @champion alias missing,
+            or the version's artifacts unreadable.
 
   # ── Forecast quality / drift ─────────────────────────────────────────────
   # forecast_rolling_mae is the mean |actual - forecast| over the last

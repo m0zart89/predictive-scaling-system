@@ -10,7 +10,7 @@
 {{- if and $t.cronjob.enabled $query }}
 # Nightly retraining: pull the last N days from Prometheus, train candidates,
 # compare with the @champion model on data it has not seen, move the alias if
-# the new model is better, then tell forecast-serving to reload.
+# the new model is better; every forecast-serving replica picks it up on its own.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -82,17 +82,6 @@ spec:
                   value: cpu-forecasting
                 - name: MODEL_ALIAS
                   value: champion
-                - name: SERVING_RELOAD_URL
-                  value: {{ if .Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving:8080
-                - name: SERVING_RELOAD_TOKEN
-                  valueFrom:
-                    secretKeyRef:
-                      name: forecast-reload-token
-                      key: RELOAD_TOKEN
-                {{- if .Values.global.tls.enabled }}
-                - name: SERVING_TLS_DIR
-                  value: /etc/serving-tls
-                {{- end }}
               {{- with .Values.mlflow.client.existingSecret }}
               envFrom:
                 - secretRef:
@@ -104,21 +93,11 @@ spec:
                 allowPrivilegeEscalation: false
                 capabilities:
                   drop: ["ALL"]
-              {{- if .Values.global.tls.enabled }}
-              volumeMounts:
-                - name: serving-tls
-                  mountPath: /etc/serving-tls
-                  readOnly: true
-          volumes:
-            - name: serving-tls
-              secret:
-                secretName: forecast-training-client
-              {{- end }}
 {{- end }}
 {{- if $t.bootstrap.enabled }}
 ---
 # One-off: train the first champion from a saved Prometheus export mounted
-# from a ConfigMap, then reload forecast-serving. Named by release revision so
+# from a ConfigMap. Named by release revision so
 # `helm upgrade --set training.bootstrap.enabled=true` can run it again.
 apiVersion: batch/v1
 kind: Job
@@ -170,7 +149,6 @@ spec:
             - --horizon={{ $t.bootstrap.horizon }}
             - --period-seconds={{ $t.cronjob.periodSeconds }}
             - --under-weight={{ $t.cronjob.underWeight }}
-            - --reload-url={{ if .Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving:8080
           env:
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow:5000
@@ -178,15 +156,6 @@ spec:
               value: cpu-forecasting
             - name: MODEL_ALIAS
               value: champion
-            - name: SERVING_RELOAD_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: forecast-reload-token
-                  key: RELOAD_TOKEN
-            {{- if .Values.global.tls.enabled }}
-            - name: SERVING_TLS_DIR
-              value: /etc/serving-tls
-            {{- end }}
           {{- with .Values.mlflow.client.existingSecret }}
           envFrom:
             - secretRef:
@@ -202,18 +171,8 @@ spec:
             - name: data
               mountPath: /data
               readOnly: true
-            {{- if .Values.global.tls.enabled }}
-            - name: serving-tls
-              mountPath: /etc/serving-tls
-              readOnly: true
-            {{- end }}
       volumes:
         - name: data
           configMap:
             name: {{ $t.bootstrap.configMap }}
-        {{- if .Values.global.tls.enabled }}
-        - name: serving-tls
-          secret:
-            secretName: forecast-training-client
-        {{- end }}
 {{- end }}

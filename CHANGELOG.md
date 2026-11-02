@@ -5,6 +5,23 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 
 ## Unreleased
 
+### Serving lifecycle (PR #10)
+
+- **No more `/reload`.** The endpoint, its token Secret, the training jobs'
+  reload call and the client certificate for it are gone. A lifecycle
+  worker in every replica polls the registry alias (`MODEL_REFRESH_SECONDS`)
+  and hot-swaps the model under an `asyncio.Lock`; startup fetches the
+  champion once before the port opens (`STARTUP_LOAD_TIMEOUT`) and a
+  registry outage leaves the pod alive, unready, serving the cache when
+  there is one, retrying every `MODEL_RETRY_SECONDS`.
+- **Async inference.** `POST /predict` is `async`; scaling, features and
+  the scikit-learn predict run in a bounded thread pool
+  (`INFERENCE_THREADS`), never on the event loop. `STRICT_INPUT_LENGTH`
+  rejects inputs longer than `input_length` (default: the tail is used).
+- **Probes:** `/healthz` and `/readyz` (200 with the served version, 503
+  without a model); `/live` and `/ready` remain as aliases.
+  `ForecastReloadErrorRate` now watches `forecast_model_reloads_total`.
+
 ### Production (PR #9) — docs/production-blueprint.md applied
 
 - **HA without shared state.** The scaler scores its own forecasts from the

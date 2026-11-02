@@ -7,7 +7,7 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   # A pod without a model is alive but not ready. It must still be reachable
-  # through the Service: the retraining job POSTs /reload to it, and
+  # through the Service: bootstrap scripts and operators wait on it, and
   # bootstrap scripts wait on /live. Callers of /predict get a 503 they handle.
   publishNotReadyAddresses: true
   selector:

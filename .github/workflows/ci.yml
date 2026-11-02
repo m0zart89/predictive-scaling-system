@@ -194,7 +194,7 @@ jobs:
           helm lint helm/predictive-stack/ --set demo.scaling=predictive --set training.bootstrap.enabled=true
           helm lint helm/predictive-stack/ --set demo.scaling=hpa
           helm lint helm/predictive-stack/ -f helm/predictive-stack/values-pilot.yaml
-          helm lint helm/forecast-serving/ --set reloadToken=secret-for-lint
+          helm lint helm/forecast-serving/
           helm lint helm/predictive-stack/ -f helm/predictive-stack/ci/workloads-values.yaml
 
       - name: Helm template (dry-run)
@@ -248,8 +248,10 @@ jobs:
           # an explicit historySteps wins over the computed one
           helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
             --set scalerDefaults.historySteps=10 | grep -q 'historySteps: "10"'
-          # the reload token reaches both the service and the training jobs
-          test "$(grep -c 'name: forecast-reload-token' /tmp/stack.yaml)" -ge 4
+          # nothing pushes to forecast-serving any more: no reload token, no reload URL
+          if grep -q 'reload-token\|SERVING_RELOAD' /tmp/stack.yaml; then
+            echo "::error::a reload token or URL was rendered"; exit 1
+          fi
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
           # production profile: PDBs, anti-affinity, HA KEDA, read-only images
@@ -308,7 +310,7 @@ jobs:
           # TLS_DIR and plaintext health port, the forecast ingress with backend mTLS
           helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
             --set global.tls.enabled=true --set global.tls.issuerRef.name=internal-ca > /tmp/tls.yaml
-          test "$(grep -c '^kind: Certificate$' /tmp/tls.yaml)" = 5
+          test "$(grep -c '^kind: Certificate$' /tmp/tls.yaml)" = 4
           grep -q '^kind: TriggerAuthentication$' /tmp/tls.yaml
           grep -q 'enableTLS: "true"' /tmp/tls.yaml
           grep -q 'name: predictive-scaler-mtls' /tmp/tls.yaml
@@ -316,7 +318,6 @@ jobs:
           grep -q -- '--ssl-cert-reqs' /tmp/tls.yaml
           grep -q 'name: TLS_DIR' /tmp/tls.yaml
           grep -q 'name: HEALTH_PORT' /tmp/tls.yaml
-          grep -q 'name: SERVING_TLS_DIR' /tmp/tls.yaml
           grep -q 'backend-protocol: "HTTPS"' /tmp/tls.yaml
           grep -q 'prometheus.io/port: "9100"' /tmp/tls.yaml
           if grep -q 'forecastServiceURL: http://' /tmp/tls.yaml; then

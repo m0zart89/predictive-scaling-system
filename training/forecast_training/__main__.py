@@ -8,7 +8,10 @@ Retrain the workload forecasting model.
     # from live Prometheus (what the CronJob runs)
     python -m forecast_training --prometheus http://prometheus:9090 \
         --query 'avg(rate(container_cpu_usage_seconds_total{namespace="demo"}[5m]))' \
-        --days 14 --reload-url http://forecast-serving:8080
+        --days 14
+
+forecast-serving picks a promoted version up on its own: every replica
+polls the registry alias (MODEL_REFRESH_SECONDS); nothing is pushed to it.
 
 The MLflow server comes from MLFLOW_TRACKING_URI. Prints a JSON summary on
 stdout; exits 0 whether or not a new model was promoted, 1 on errors.
@@ -25,7 +28,7 @@ import sys
 from .data import (DataError, align_series, load_export, parse_exclude, query_prometheus,
                    regularize)
 from .model import CANDIDATE_NAMES, DEFAULT_UNDER_WEIGHT
-from .registry import BASELINES, TrainConfig, reload_serving, run_pipeline
+from .registry import BASELINES, TrainConfig, run_pipeline
 
 
 def _env(name: str, default=None):
@@ -105,12 +108,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-name", default=_env("MODEL_NAME", "cpu-forecasting"))
     p.add_argument("--alias", default=_env("MODEL_ALIAS", "champion"))
     p.add_argument("--experiment", default=_env("MLFLOW_EXPERIMENT", "cpu-forecasting"))
-    p.add_argument("--reload-url", default=_env("SERVING_RELOAD_URL"),
-                   help="forecast-serving base URL to POST /reload after a promotion")
-    p.add_argument("--reload-token", default=_env("SERVING_RELOAD_TOKEN"),
-                   help="value for the X-Reload-Token header (forecast-serving's RELOAD_TOKEN)")
-    p.add_argument("--reload-tls-dir", default=_env("SERVING_TLS_DIR"),
-                   help="directory with tls.crt, tls.key, ca.crt for an https --reload-url (mTLS)")
     p.add_argument("--reason", default=_env("TRAIN_REASON", "scheduled"),
                    help="why this run exists, recorded as an MLflow tag (the alert-driven trigger "
                         "sets the alert name)")
@@ -171,9 +168,6 @@ def main(argv=None) -> int:
         return 1
 
     summary = outcome.to_dict()
-    if outcome.promoted and args.reload_url:
-        summary["serving_reloaded"] = reload_serving(args.reload_url, token=args.reload_token,
-                                                     tls_dir=args.reload_tls_dir)
 
     log.info("%s: %s", outcome.decision, outcome.reason)
     text = json.dumps(summary, indent=2, sort_keys=True)

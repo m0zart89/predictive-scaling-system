@@ -274,7 +274,7 @@ Three facts about this code decide the manifests:
    With three replicas two keep serving the old version. Replace push with
    pull: a background thread in serving checks the registry alias every
    `MODEL_REFRESH_SECONDS` (60) and reloads when the version changes.
-   `/reload` stays for operators. Code, around the existing retry loop in
+   (`/reload` was removed afterwards; the lifecycle worker is the one path.) Code, around the existing retry loop in
    `serving/app.py`:
 
    ```python

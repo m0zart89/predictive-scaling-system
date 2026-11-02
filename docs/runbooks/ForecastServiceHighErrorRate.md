@@ -16,7 +16,7 @@ the model or MLflow is broken rather than a transient blip.
    (`status` is the class, `5xx`).
    - `/predict` 500: inference error — the model raised, or returned a
      non-finite value (`forecast_prediction_failures_total{reason="inference"}`).
-   - `/reload` 500: MLflow unreachable or no champion — see
+   - 503 on `/predict`: no model loaded (registry unreachable, no champion) — see
      [ForecastReloadErrorRate](ForecastReloadErrorRate.md).
 2. Pod logs: `kubectl logs deploy/forecast-serving` — inference errors are
    logged with the input window.
@@ -26,8 +26,8 @@ the model or MLflow is broken rather than a transient blip.
 
 ## How to fix
 
-- Inference errors after a reload: roll the `@champion` alias back to the
-  previous version and `POST /reload`.
+- Inference errors after a model swap: roll the `@champion` alias back to
+  the previous version; the replicas swap on their next poll.
 - Errors from a bad artifact: re-run training
   (`kubectl -n predictive create job --from=cronjob/forecast-retrain retrain-manual`)
   to register a fresh version.

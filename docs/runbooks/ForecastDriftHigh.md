@@ -41,10 +41,11 @@ workload may be under-provisioned.
 - **Workload changed, model stale:** retrain now instead of waiting for the
   nightly CronJob: `kubectl -n predictive create job --from=cronjob/forecast-retrain
   retrain-manual`. The pipeline only moves `@champion` to a model that beats
-  the current one on data neither has seen, then calls `/reload`.
-- **A reload made it worse:** roll back by pointing the alias at the previous
-  version (`mlflow` UI or `MlflowClient().set_registered_model_alias(...)`)
-  and `POST /reload`.
+  the current one on data neither has seen; the serving replicas pick it up
+  within a minute.
+- **A new version made it worse:** roll back by pointing the alias at the
+  previous version (`mlflow` UI or `MlflowClient().set_registered_model_alias(...)`);
+  the replicas swap on their next poll.
 - **Threshold wrong for this workload:** the factor 2 in
   `monitoring/prometheus-rules.yaml` (`ForecastDriftHigh`) is the only knob;
   the baseline itself comes from each model's own training run.
