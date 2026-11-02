@@ -34,6 +34,13 @@ data:
 
     rule_files:
       - /etc/prometheus/rules/*.yml
+    {{- if .Values.alertmanager.enabled }}
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: [alertmanager:9093]
+    {{- end }}
 
     scrape_configs:
       # Every pod in this namespace annotated prometheus.io/scrape=true:

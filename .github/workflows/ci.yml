@@ -305,6 +305,17 @@ jobs:
           if helm template predictive helm/predictive-stack/ -n predictive --set global.tls.enabled=true > /dev/null 2>&1; then
             echo "::error::global.tls.enabled without an issuer rendered"; exit 1
           fi
+          # alert-driven retraining: Alertmanager routes the two alerts to the trigger,
+          # the trigger has the CronJob/Jobs RBAC and the shared token, Prometheus
+          # knows the Alertmanager (builtin config and the operator CR)
+          grep -q 'alertmanager:9093' /tmp/prod.yaml || grep -q 'name: alertmanager' /tmp/prod.yaml
+          grep -q 'url: http://retrain-trigger:8080/alertmanager' /tmp/prod.yaml
+          grep -q 'alertname =~ "ForecastDriftHigh|ForecastBreakerOpenLong"' /tmp/prod.yaml
+          grep -q 'forecast_training.trigger' /tmp/prod.yaml
+          grep -q 'resourceNames: \[forecast-retrain\]' /tmp/prod.yaml
+          test "$(grep -c 'name: retrain-trigger-token' /tmp/prod.yaml)" -ge 3
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set alertmanager.enabled=true --set training.trigger.enabled=true | grep -q 'targets: \[alertmanager:9093\]'
           # default-deny ingress with the pilot profile
           helm template predictive helm/predictive-stack/ -n predictive -f helm/predictive-stack/values-pilot.yaml \
             -f helm/predictive-stack/ci/workloads-values.yaml > /tmp/pilot.yaml

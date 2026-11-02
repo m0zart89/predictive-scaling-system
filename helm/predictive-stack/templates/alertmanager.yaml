@@ -1,0 +1,140 @@
+{{- $a := .Values.alertmanager }}
+{{- if and $a.enabled .Values.prometheus.enabled }}
+{{- $trigger := and .Values.training.trigger.enabled .Values.training.cronjob.enabled }}
+# Alertmanager: routes the retraining alerts to the retrain-trigger webhook
+# (grouped per ScaledObject, no wait, repeated at most every 6 h) and anything
+# else to the receivers in alertmanager.extraReceivers / extraRoutes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  labels:
+    app: alertmanager
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: default
+      group_by: [alertname]
+      routes:
+        {{- if $trigger }}
+        - receiver: retrain-trigger
+          matchers:
+            - alertname =~ "{{ join "|" .Values.training.trigger.alerts }}"
+          group_by: [alertname, scaledobject]
+          group_wait: 0s
+          group_interval: 5m
+          repeat_interval: {{ $a.retrainRepeatInterval }}
+          continue: true
+        {{- end }}
+        {{- with $a.extraRoutes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    receivers:
+      - name: default
+      {{- if $trigger }}
+      - name: retrain-trigger
+        webhook_configs:
+          - url: http://retrain-trigger:8080/alertmanager
+            send_resolved: false
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alertmanager/secrets/token
+      {{- end }}
+      {{- with $a.extraReceivers }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  labels:
+    app: alertmanager
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+      annotations:
+        checksum/config: {{ print ($a | toYaml) (.Values.training.trigger | toYaml) | sha256sum | trunc 32 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alertmanager
+          image: {{ $a.image | quote }}
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - name: http
+              containerPort: 9093
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            periodSeconds: 20
+          resources:
+            {{- toYaml $a.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: data
+              mountPath: /alertmanager
+            {{- if $trigger }}
+            - name: trigger-token
+              mountPath: /etc/alertmanager/secrets
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: data
+          emptyDir: {}
+        {{- if $trigger }}
+        - name: trigger-token
+          secret:
+            secretName: retrain-trigger-token
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  labels:
+    app: alertmanager
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http
+{{- end }}

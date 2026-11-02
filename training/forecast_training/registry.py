@@ -73,6 +73,7 @@ class TrainConfig:
     min_fresh_windows: int = 48      # 4 hours of 5-minute data
     under_weight: float = DEFAULT_UNDER_WEIGHT   # cost of a unit of shortfall, in idle units
     baseline: str = "persistence"    # the winner must beat: persistence | seasonal | best
+    reason: str = "scheduled"        # why this run exists: scheduled | the alert that triggered it
     refit: bool = True
     dry_run: bool = False
     candidates: List[str] = field(default_factory=lambda: [c.name for c in CANDIDATES])
@@ -162,6 +163,7 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
             "under_weight": cfg.under_weight, "baseline": cfg.baseline,
             "candidates": ",".join(cfg.candidates),
         })
+        mlflow.set_tag("reason", cfg.reason)
 
         results, split = train_and_select(values, cfg.time_steps, cfg.horizon, cfg.step_seconds,
                                           cfg.test_fraction, cfg.min_tracking, candidates,
@@ -209,7 +211,7 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
             _log_bundle(final)
             mv = mlflow.register_model(f"runs:/{parent.info.run_id}/model", cfg.model_name)
             client.set_registered_model_alias(cfg.model_name, cfg.alias, mv.version)
-            tags = {"candidate": best.candidate.name, "horizon": cfg.horizon,
+            tags = {"candidate": best.candidate.name, "horizon": cfg.horizon, "reason": cfg.reason,
                     "holdout_rmse": f"{best.score.rmse:.6f}",
                     "holdout_cost": f"{best.score.cost:.6f}",
                     "holdout_coverage": f"{best.score.coverage:.4f}",

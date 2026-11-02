@@ -155,6 +155,23 @@ prometheus:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
 
+# Alertmanager for the chart's rules. Its one built-in route sends the
+# retraining alerts to the retrain trigger (training.trigger); add your own
+# receivers and routes (Alertmanager config syntax) for paging.
+alertmanager:
+  enabled: false
+  image: prom/alertmanager:v0.27.0
+  retrainRepeatInterval: 6h
+  extraRoutes: []
+  #  - receiver: oncall
+  #    matchers: ['severity = "critical"']
+  extraReceivers: []
+  #  - name: oncall
+  #    slack_configs: [...]
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
+
 grafana:
   enabled: true
   image: grafana/grafana:10.4.2
@@ -341,6 +358,19 @@ training:
   # One-off Job that trains from a saved Prometheus export in a ConfigMap
   # (kubectl create configmap train-data --from-file=notebooks/data-jan-2022.json)
   # and reloads forecast-serving. scripts/up.sh enables it on a fresh cluster.
+  # Alert-driven retraining: a small receiver (forecast_training.trigger, the
+  # training image) that turns a firing alert into a Job cloned from the
+  # CronJob, with the circuit breaker's open intervals excluded from the
+  # training window. Needs alertmanager.enabled; the token is generated once.
+  trigger:
+    enabled: false
+    token: ""
+    alerts: [ForecastDriftHigh, ForecastBreakerOpenLong]
+    minGapHours: "6"            # no second alert-driven Job within this gap
+    excludePadSeconds: "1800"   # pad around each breaker interval (one horizon)
+    resources:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {cpu: 200m, memory: 256Mi}
   bootstrap:
     enabled: false
     configMap: train-data

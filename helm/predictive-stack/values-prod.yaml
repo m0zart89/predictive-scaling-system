@@ -155,7 +155,13 @@ global:
       name: internal-ca
       kind: ClusterIssuer
 
+alertmanager:
+  enabled: true
+  # extraRoutes / extraReceivers: your paging integration
+
 training:
+  trigger:
+    enabled: true          # ForecastDriftHigh / ForecastBreakerOpenLong start a retrain Job
   cronjob:
     days: "28"             # four weeks: every weekday seen four times
     stepSeconds: "300"

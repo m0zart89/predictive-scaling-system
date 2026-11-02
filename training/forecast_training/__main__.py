@@ -87,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="value for the X-Reload-Token header (forecast-serving's RELOAD_TOKEN)")
     p.add_argument("--reload-tls-dir", default=_env("SERVING_TLS_DIR"),
                    help="directory with tls.crt, tls.key, ca.crt for an https --reload-url (mTLS)")
+    p.add_argument("--reason", default=_env("TRAIN_REASON", "scheduled"),
+                   help="why this run exists, recorded as an MLflow tag (the alert-driven trigger "
+                        "sets the alert name)")
     p.add_argument("--dry-run", action="store_true",
                    help="train, compare and log, but do not register or move the alias")
     p.add_argument("--summary", help="also write the JSON summary to this file")
@@ -120,7 +123,7 @@ def main(argv=None) -> int:
             time_steps=args.time_steps, horizon=args.horizon, step_seconds=args.step_seconds,
             period_seconds=args.period_seconds, test_fraction=args.test_fraction, min_tracking=args.min_tracking,
             min_improvement=args.min_improvement, min_fresh_windows=args.min_fresh_windows,
-            under_weight=args.under_weight, baseline=args.baseline,
+            under_weight=args.under_weight, baseline=args.baseline, reason=args.reason,
             refit=not args.no_refit, dry_run=args.dry_run,
             candidates=[c.strip() for c in args.candidates.split(",") if c.strip()],
         )

@@ -40,6 +40,13 @@ spec:
       name: {{ $o.thanos.objectStorageSecret }}
       key: {{ $o.thanos.objectStorageKey }}
   {{- end }}
+  {{- if .Values.alertmanager.enabled }}
+  alerting:
+    alertmanagers:
+      - namespace: {{ .Release.Namespace }}
+        name: alertmanager
+        port: http
+  {{- end }}
   podMonitorSelector:
     matchLabels:
       app.kubernetes.io/instance: {{ .Release.Name }}
