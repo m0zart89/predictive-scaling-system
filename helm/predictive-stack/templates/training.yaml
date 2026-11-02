@@ -81,6 +81,11 @@ spec:
                     secretKeyRef:
                       name: forecast-reload-token
                       key: RELOAD_TOKEN
+              {{- with .Values.mlflow.client.existingSecret }}
+              envFrom:
+                - secretRef:
+                    name: {{ . }}       # MLFLOW_TRACKING_USERNAME / _PASSWORD
+              {{- end }}
               resources:
                 {{- toYaml $t.resources | nindent 16 }}
               securityContext:
@@ -156,6 +161,11 @@ spec:
                 secretKeyRef:
                   name: forecast-reload-token
                   key: RELOAD_TOKEN
+          {{- with .Values.mlflow.client.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
           resources:
             {{- toYaml $t.resources | nindent 12 }}
           securityContext:

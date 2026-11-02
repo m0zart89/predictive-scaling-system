@@ -46,9 +46,48 @@ keda:
 
 mlflow:
   enabled: true
-  image: ghcr.io/mlflow/mlflow:v2.11.1
+  image:
+    # Upstream image: SQLite + local artifacts only. mlflow/Dockerfile adds the
+    # PostgreSQL driver and the S3 client (CI publishes it as mlflow-server);
+    # values-prod.yaml points here.
+    repository: ghcr.io/mlflow/mlflow
+    tag: v2.11.1            # "" = global.imageTag (for the mlflow-server image)
+  replicas: 1               # > 1 needs an external backend store (stateless servers)
+  workers: 1                # gunicorn workers per replica
+  # Backend store. Default: SQLite on the PVC below (one replica). Production:
+  # a PostgreSQL DSN read from a Secret, e.g.
+  #   postgresql+psycopg2://mlflow:***@mlflow-db.internal:5432/mlflow?sslmode=require
+  backendStore:
+    existingSecret: ""      # Secret with the DSN under secretKey
+    secretKey: MLFLOW_BACKEND_STORE_URI
+  # Artifacts are always proxied through the server (clients never need
+  # object-store credentials). Default: a path on the PVC. Production: an
+  # s3://bucket/prefix (or MinIO: same, plus MLFLOW_S3_ENDPOINT_URL and keys in
+  # artifacts.existingSecret; on AWS prefer IRSA on serviceAccount.annotations).
+  artifacts:
+    destination: /mlflow/artifacts
+    existingSecret: ""      # optional env for the object store (keys, endpoint, region)
+  serviceAccount:
+    annotations: {}         # eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/mlflow-artifacts
+  # MLflow's built-in basic-auth app. existingSecret holds `basic_auth.ini`
+  # (admin_username, admin_password, database_uri for the auth tables) and is
+  # mounted read-only; the UI and API then require credentials.
+  auth:
+    enabled: false
+    existingSecret: ""
+  # Credentials the training jobs use when auth is on: a Secret with
+  # MLFLOW_TRACKING_USERNAME / MLFLOW_TRACKING_PASSWORD. forecast-serving reads
+  # the same kind of Secret through forecast-serving.extraEnvFrom.
+  client:
+    existingSecret: ""
+  # With an external backend store, run `mlflow db upgrade` as a pre-upgrade
+  # hook so servers never start against an older schema.
+  dbUpgradeHook: true
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
   persistence:
-    enabled: true
+    enabled: true           # ignored (no volume) when backendStore.existingSecret is set
     size: 2Gi
     storageClass: ""        # "" = the cluster default (kind: local-path)
   resources:
