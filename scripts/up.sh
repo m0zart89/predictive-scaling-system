@@ -245,6 +245,7 @@ spec:
       imagePullPolicy: IfNotPresent
       command: ["python", "/smoke/smoke.py"]
       env:
+        - {name: PYTHONPATH, value: /app}      # the scaler package lives in the image's WORKDIR
         - {name: NS, value: "$NAMESPACE"}
         - {name: STEP, value: "$STEP_SECONDS"}
 $([ "$TLS" = "1" ] && echo '        - {name: TLS_DIR, value: /etc/keda-tls}')
