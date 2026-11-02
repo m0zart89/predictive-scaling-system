@@ -66,15 +66,15 @@ Versioned models with a `@champion` alias the pipeline moves atomically; artifac
 
 ### Inference service (`serving/`)
 
-A stateless FastAPI service: validates the window, applies the stored scaler and the model's feature/target transform, returns the whole horizon, hot-swaps the model on `/reload` without a restart, and scores its own past forecasts (`serving/quality.py`). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve.
+A stateless FastAPI service: validates the input, applies the stored scaler(s) and the model's feature/target transform, returns the whole horizon, follows the registry alias on its own (every replica polls it, `/reload` is for operators), keeps a last-known-good copy of the model to serve from when MLflow is down at startup, and scores its own past forecasts (`serving/quality.py`; with several replicas the scaler's own scoring is the source instead). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve. Under `global.tls.enabled` it requires client certificates.
 
 ### Predictive scaler (`scaler/`)
 
-A KEDA external scaler (gRPC). Each `ScaledObject` carries its own PromQL query, target per replica, `capacity` (units conversion) and forecast settings in trigger metadata, so one deployment serves any number of workloads. Failure policy, metrics and metadata reference: [scaler/README.md](scaler/README.md).
+A KEDA external scaler (gRPC). Each `ScaledObject` carries its own PromQL query (plus extra channels for a multivariate model), target per replica, `capacity` (units conversion), forecast settings and circuit-breaker thresholds in trigger metadata, so one deployment serves any number of workloads. The scaler scores its own forecasts against the history it fetches, caps a forecast at `forecastSurgeFactor` × observed, and opens its breaker (reactive scaling, interval exported for retraining to exclude) when the series stops resembling the history. Failure policy, metrics and metadata reference: [scaler/README.md](scaler/README.md).
 
 ### Observability (`monitoring/`)
 
-Prometheus discovers annotated pods in the namespace; alert rules cover availability, latency, model health, forecast drift and scaler fallbacks, each with a runbook in `docs/runbooks/`; three Grafana dashboards are provisioned from `monitoring/dashboards/` and validated in CI.
+Prometheus discovers annotated pods in the namespace (or, with the Prometheus Operator, PodMonitors; or an external Thanos/VictoriaMetrics endpoint); alert rules cover availability, latency, model health, forecast drift, scaler fallbacks and a breaker that stays open, each with a runbook in `docs/runbooks/`; three Grafana dashboards are provisioned from `monitoring/dashboards/` and validated in CI. Alertmanager routes `ForecastDriftHigh` and `ForecastBreakerOpenLong` to the retrain trigger (`training.trigger`), which starts a retraining Job with the anomaly excluded.
 
 ### Benchmark (`bench/`)
 
@@ -86,7 +86,7 @@ A compressed-day load generator and a workflow that runs the same day under a CP
 
 ### `POST /predict`
 
-Takes the last `input_length` values of the series (raw units, `step_seconds` apart — both in `GET /model-info`) and returns the forecast for every step of the model's horizon. `input_length` is the `time_steps` window, plus one seasonal cycle of history for models with seasonal features; the last `time_steps` values must be present, older ones may be `null` where the caller has a gap (serving interpolates them), and a longer history is fine (the tail is used).
+Takes the last `input_length` values of the series (raw units, `step_seconds` apart — both in `GET /model-info`) and returns the forecast for every step of the model's horizon. `input_length` is the `time_steps` window, plus one seasonal cycle of history for models with seasonal features; the last `time_steps` values must be present, older ones may be `null` where the caller has a gap (serving interpolates them), and a longer history is fine (the tail is used). A multivariate model takes one such list per channel, `{"cpu": [...], "rps": [...]}` (names in `GET /model-info`).
 
 **Request:**
 ```json
@@ -247,11 +247,11 @@ MLflow provides the model versioning and stage promotion semantics needed to saf
 These are known simplifications, not omissions:
 
 - **Single-metric forecasting.** The model predicts CPU only. Real workload characterisation requires memory, network I/O, and queue depth. Each adds a feature dimension and a data collection dependency.
-- **Drift is measured, not yet acted on.** `forecast_rolling_mae` and `ForecastDriftHigh` flag a model that stopped tracking the workload; retraining is still on the nightly schedule rather than triggered by the alert. The MAE is only as good as the scaler's windows: it needs `stepSeconds` to match the model and a few horizons of traffic before it says anything.
+- **Drift is acted on by retraining, not by the scaler.** `ForecastDriftHigh` starts a retraining Job (with the breaker's intervals excluded) when `training.trigger` is on; until the new champion lands, the breaker's residual signal is what takes a wrong model out of the loop. Both need a few horizons of traffic before they say anything.
 - **One benchmark, one small node.** The predictive-vs-reactive comparison ([docs/benchmark.md](docs/benchmark.md)) runs on a single CI runner that also hosts the load generator and the platform, on a pattern the model was trained on. It is one sample and shows the mechanism, not a capacity figure.
 - **Anticipation depends on the clock and on yesterday.** The `_tod` candidates add the phase of the day to the window, the `_season` candidates the values from one cycle ago, so the model can move before a daily ramp is visible; it still cannot foresee a ramp that is not periodic, and it needs a few days of history to learn the pattern (and a day of history in Prometheus before the seasonal input is anything but the window).
 - **Short, noisy history.** Fifteen days of 5-minute data with large step-to-step swings: the best models beat persistence by ~60% RMSE but still carry ~0.2 cores of error per step. More history (and the weekly pattern it would expose) is the cheapest improvement available.
-- **Single-node scale.** The stack is sized for kind and CI runners: one replica of everything, SQLite behind MLflow, Prometheus on an `emptyDir`. The chart is the production shape (Ingress, GHCR images, namespace RBAC), not production capacity.
+- **Defaults are sized for kind and CI.** One replica of everything, SQLite behind MLflow, a single Prometheus. `helm/predictive-stack/values-prod.yaml` is the production shape: replicas with PDBs and anti-affinity, MLflow on PostgreSQL and object storage, the Prometheus Operator with Thanos, mutual TLS, default-deny network policies, Alertmanager and the retrain trigger ([docs/production-blueprint.md](docs/production-blueprint.md)). It is rendered and checked in CI; the mTLS path runs in the kind e2e; the external stores are not exercised there.
 
 ---
 
@@ -320,8 +320,8 @@ Add memory utilisation and request queue depth as input features. CPU alone is a
 **GPU workloads**  
 The notebook's sequence models already run on CUDA when it is available; the production pipeline is CPU-only scikit-learn because the data is small. For GPU inference workloads the same pattern applies with a different demand metric (GPU utilisation or queue depth); serving and the scaler do not change.
 
-**Alert-triggered retraining**  
-`ForecastDriftHigh` already measures the regression; the next step is to let it start the retraining job (Alertmanager webhook → `kubectl create job`) instead of waiting for the nightly run.
+**A real pilot**  
+Everything above the demo is exercised by CI on kind for minutes; a workload with its own traffic for weeks is what settles the questions the benchmark cannot: whether the seasonal lags pay off with a month of history, how often the breaker trips on real noise, and what the multivariate channel buys on a service behind a load balancer.
 
 ---
 
@@ -381,6 +381,18 @@ helm upgrade predictive helm/predictive-stack -n predictive --reuse-values -f my
 
 Each entry becomes a `ScaledObject`; the nightly CronJob trains the model on the first entry's series divided by its `capacity`, so scaler and model always agree on units. Until the first training run there is no champion and the scaler scales on observed demand; `kubectl -n predictive create job --from=cronjob/forecast-retrain retrain-now` starts one as soon as there is a day of history. Prometheus keeps 30 days on a PersistentVolume, which is what the time-of-day features need.
 
+### Production profile
+
+`helm/predictive-stack/values-prod.yaml` on top of the pilot profile: three serving and two scaler replicas with PDBs and required anti-affinity, HA KEDA, MLflow on PostgreSQL + S3 (uncomment the Secrets), the Prometheus Operator with an optional Thanos sidecar and the demand series recorded per workload, mutual TLS on both internal loops from cert-manager (`global.tls`), default-deny network policies, Alertmanager and the alert-driven retrain trigger, the circuit breaker with a CPU floor trigger. Each piece and why: [docs/production-blueprint.md](docs/production-blueprint.md).
+
+```bash
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.3/cert-manager.yaml
+# a ClusterIssuer named internal-ca (your CA), then:
+helm upgrade --install predictive helm/predictive-stack -n predictive --create-namespace \
+  -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml \
+  --set global.imageTag=<sha>
+```
+
 ### Pieces on their own
 
 - **Images** are published by CI to `ghcr.io/m0zart89/predictive-scaling-system/{forecast-serving,predictive-scaler,cpu-burner,forecast-training}:{<sha>,latest}` on every push to `main`.
@@ -406,21 +418,23 @@ predictive-scaling-system/
 │   ├── e2e.yml                  # up.sh on kind, 10 min of load, scaling assertions
 │   └── benchmark.yml            # predictive vs reactive, manual + weekly, commits docs/benchmark.md
 ├── serving/                     # FastAPI inference service
-│   ├── app.py                   # /predict, /reload, /model-info, probes
-│   └── quality.py               # forecast error tracking (forecast_abs_error / forecast_rolling_mae)
+│   ├── app.py                   # /predict, /reload, /model-info, probes, alias refresh, model cache
+│   └── quality.py               # in-process forecast error tracking (single replica)
 ├── scaler/                      # KEDA external scaler (gRPC): Prometheus → /predict → replicas
-│   ├── predictive_scaler/       # config, clients, decision engine, gRPC server, metrics
+│   ├── predictive_scaler/       # config, clients, decision engine, breaker, quality, gRPC server (mTLS), metrics
 │   └── tests/
 ├── training/                    # retraining pipeline: candidates, level-tracking gate, MLflow aliases
-│   ├── forecast_training/       # data, features (shared contract), models, registry, CLI
+│   ├── forecast_training/       # data, features (shared contract), models, registry, CLI, traces, trigger
 │   └── tests/
+├── mlflow/Dockerfile            # MLflow server image with the PostgreSQL driver and the S3 client
 ├── helm/
 │   ├── predictive-stack/        # umbrella chart: the whole system, KEDA as a dependency
 │   │   └── files/               # dashboards and rules synced from monitoring/ by render.py
 │   ├── forecast-serving/        # standalone chart for the service
 │   └── predictive-scaler/       # standalone chart for the scaler
 ├── scripts/
-│   ├── up.sh                    # kind cluster → helm install → train → smoke tests
+│   ├── up.sh                    # kind cluster → (cert-manager) → helm install → train → smoke tests
+│   ├── scaler-smoke.py          # the gRPC smoke test, run in-cluster (mTLS-aware)
 │   ├── e2e.sh                   # load + verify scaling (used by e2e.yml)
 │   └── kind-config.yaml
 ├── bench/                       # load generator, run.sh, collect.py, report.py

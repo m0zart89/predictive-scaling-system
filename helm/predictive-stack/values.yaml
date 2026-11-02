@@ -8,9 +8,21 @@
 # there only (namespace-scoped RBAC).
 
 global:
-  # Tag for the four project images (forecast-serving, predictive-scaler,
-  # cpu-burner, forecast-training). CI publishes <sha> and latest to GHCR.
+  # Tag for the project images (forecast-serving, predictive-scaler,
+  # cpu-burner, forecast-training, mlflow-server). CI publishes <sha> and
+  # latest to GHCR.
   imageTag: latest
+  # Mutual TLS on both internal loops (KEDA → scaler over gRPC, scaler /
+  # training jobs / ingress → forecast-serving over https) with certificates
+  # from cert-manager (templates/tls.yaml). issuerRef names the CA issuer that
+  # signs everything; the subcharts read this switch too.
+  tls:
+    enabled: false
+    issuerRef:
+      name: ""              # e.g. internal-ca; scripts/up.sh TLS=1 creates predictive-ca
+      kind: ClusterIssuer
+    duration: 720h
+    renewBefore: 240h
 
 # ── subcharts ──────────────────────────────────────────────────────────────────
 
@@ -46,9 +58,48 @@ keda:
 
 mlflow:
   enabled: true
-  image: ghcr.io/mlflow/mlflow:v2.11.1
+  image:
+    # Upstream image: SQLite + local artifacts only. mlflow/Dockerfile adds the
+    # PostgreSQL driver and the S3 client (CI publishes it as mlflow-server);
+    # values-prod.yaml points here.
+    repository: ghcr.io/mlflow/mlflow
+    tag: v2.11.1            # "" = global.imageTag (for the mlflow-server image)
+  replicas: 1               # > 1 needs an external backend store (stateless servers)
+  workers: 1                # gunicorn workers per replica
+  # Backend store. Default: SQLite on the PVC below (one replica). Production:
+  # a PostgreSQL DSN read from a Secret, e.g.
+  #   postgresql+psycopg2://mlflow:***@mlflow-db.internal:5432/mlflow?sslmode=require
+  backendStore:
+    existingSecret: ""      # Secret with the DSN under secretKey
+    secretKey: MLFLOW_BACKEND_STORE_URI
+  # Artifacts are always proxied through the server (clients never need
+  # object-store credentials). Default: a path on the PVC. Production: an
+  # s3://bucket/prefix (or MinIO: same, plus MLFLOW_S3_ENDPOINT_URL and keys in
+  # artifacts.existingSecret; on AWS prefer IRSA on serviceAccount.annotations).
+  artifacts:
+    destination: /mlflow/artifacts
+    existingSecret: ""      # optional env for the object store (keys, endpoint, region)
+  serviceAccount:
+    annotations: {}         # eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/mlflow-artifacts
+  # MLflow's built-in basic-auth app. existingSecret holds `basic_auth.ini`
+  # (admin_username, admin_password, database_uri for the auth tables) and is
+  # mounted read-only; the UI and API then require credentials.
+  auth:
+    enabled: false
+    existingSecret: ""
+  # Credentials the training jobs use when auth is on: a Secret with
+  # MLFLOW_TRACKING_USERNAME / MLFLOW_TRACKING_PASSWORD. forecast-serving reads
+  # the same kind of Secret through forecast-serving.extraEnvFrom.
+  client:
+    existingSecret: ""
+  # With an external backend store, run `mlflow db upgrade` as a pre-upgrade
+  # hook so servers never start against an older schema.
+  dbUpgradeHook: true
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
   persistence:
-    enabled: true
+    enabled: true           # ignored (no volume) when backendStore.existingSecret is set
     size: 2Gi
     storageClass: ""        # "" = the cluster default (kind: local-path)
   resources:
@@ -57,6 +108,38 @@ mlflow:
 
 prometheus:
   enabled: true
+  # builtin:  the chart's own single Prometheus (Deployment, PVC, rules ConfigMap).
+  # operator: a Prometheus CR for the Prometheus Operator — an HA pair with an
+  #           optional Thanos sidecar — plus PodMonitors and a PrometheusRule
+  #           carrying the same rules. The chart still renders the `prometheus`
+  #           Service the other components use.
+  # external: nothing is deployed; the scaler, the training jobs and Grafana use
+  #           external.url (Thanos Query, VictoriaMetrics, a central Prometheus).
+  mode: builtin
+  external:
+    url: ""                 # e.g. http://thanos-query.monitoring.svc:9090
+  operator:
+    name: predictive
+    replicas: 2
+    retention: 15d          # local; the object store keeps the rest
+    retentionSize: 80GB
+    storageClass: ""
+    size: 100Gi
+    externalLabels: {}      # cluster: prod-eu-1
+    thanos:
+      enabled: false
+      image: quay.io/thanos/thanos:v0.37.2
+      objectStorageSecret: thanos-objstore    # key objstore.yml
+      objectStorageKey: objstore.yml
+  # Where the training jobs read history: "" = the same endpoint the scaler
+  # uses. Point it at Thanos Query to train on history beyond local retention.
+  trainingUrl: ""
+  # Record every workload's demand query as workload:demand{workload="<name>"}
+  # (evaluated every minute) and point the ScaledObjects and the training job
+  # at the recorded series instead of the raw query: cheap over 30 days,
+  # identical from local TSDB or the store gateway, and scaler and model read
+  # the same numbers by construction. The rules are rendered either way.
+  recordDemand: false
   image: prom/prometheus:v2.51.0
   scrapeInterval: 15s
   evaluationInterval: 30s
@@ -71,6 +154,23 @@ prometheus:
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
+
+# Alertmanager for the chart's rules. Its one built-in route sends the
+# retraining alerts to the retrain trigger (training.trigger); add your own
+# receivers and routes (Alertmanager config syntax) for paging.
+alertmanager:
+  enabled: false
+  image: prom/alertmanager:v0.27.0
+  retrainRepeatInterval: 6h
+  extraRoutes: []
+  #  - receiver: oncall
+  #    matchers: ['severity = "critical"']
+  extraReceivers: []
+  #  - name: oncall
+  #    slack_configs: [...]
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
 
 grafana:
   enabled: true
@@ -107,6 +207,9 @@ security:
     # NetworkPolicy; off by default because kind's kindnet does not.
     enabled: false
     ingressNamespace: ingress-nginx
+    # Default-deny ingress for the whole namespace, with an allow policy per
+    # component (templates/networkpolicy.yaml). Egress stays open.
+    defaultDeny: false
 
 # ── workloads scaled by the predictive scaler ──────────────────────────────────
 
@@ -129,6 +232,29 @@ scalerDefaults:
   forecastAggregation: max
   activationValue: "0"
   cacheSeconds: "15"
+  # mode=max guard: the forecast may exceed observed demand by at most this
+  # factor ("0" = no cap).
+  forecastSurgeFactor: "3"
+  # Circuit breaker (scaler/README.md): while the series does not resemble the
+  # history the model learned — a jump larger than any in the fetched history,
+  # a level far from one season ago, forecasts wrong by more than the noise —
+  # the scaler reports observed demand only and exports
+  # predictive_scaler_breaker_open=1 so retraining can exclude the interval.
+  breaker: "on"
+  breakerResidualZ: "4"
+  breakerLevelShift: "2.5"
+  breakerJumpFactor: "2"
+  breakerJumpMinSamples: "48"   # history needed before a rise can count as unusual (4 h at 5 min)
+  breakerMinOpenSeconds: "600"
+  breakerCalmPolls: "6"
+  # Name of the demand series when a workload lists extra channels (see
+  # workloads[].channels); the model's target channel.
+  targetChannel: cpu
+  # Always-on reactive floor: a plain CPU trigger on the same ScaledObject
+  # (KEDA takes the larger desired count). Needs CPU requests on the pods.
+  reactiveFloor:
+    enabled: false
+    cpuUtilization: "70"
   timeoutSeconds: "3"
   pollingInterval: 15
   cooldownPeriod: 300
@@ -146,6 +272,11 @@ scalerDefaults:
 #     query: sum(rate(container_cpu_usage_seconds_total{container="api"}[2m]))
 #     targetValue: "0.7"              # demand one replica should carry (query units)
 #     maxReplicas: 20
+#     # extra input series for a multivariate model (request rate leads CPU):
+#     # the ScaledObject sends them next to the demand series and the CronJob
+#     # trains on them when this is training.workload
+#     channels:
+#       rps: sum(rate(http_requests_total{namespace="predictive", container="api"}[2m]))
 #     capacity: "4"
 workloads: []
 
@@ -236,6 +367,19 @@ training:
   # One-off Job that trains from a saved Prometheus export in a ConfigMap
   # (kubectl create configmap train-data --from-file=notebooks/data-jan-2022.json)
   # and reloads forecast-serving. scripts/up.sh enables it on a fresh cluster.
+  # Alert-driven retraining: a small receiver (forecast_training.trigger, the
+  # training image) that turns a firing alert into a Job cloned from the
+  # CronJob, with the circuit breaker's open intervals excluded from the
+  # training window. Needs alertmanager.enabled; the token is generated once.
+  trigger:
+    enabled: false
+    token: ""
+    alerts: [ForecastDriftHigh, ForecastBreakerOpenLong]
+    minGapHours: "6"            # no second alert-driven Job within this gap
+    excludePadSeconds: "1800"   # pad around each breaker interval (one horizon)
+    resources:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {cpu: 200m, memory: 256Mi}
   bootstrap:
     enabled: false
     configMap: train-data

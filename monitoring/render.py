@@ -126,7 +126,8 @@ _PROMQL_WORDS = {"by", "without", "on", "ignoring", "group_left", "group_right",
                  "delta", "deriv", "predict_linear", "topk", "bottomk", "stddev", "time",
                  "vector", "scalar", "changes", "resets", "s", "m", "h", "d", "w", "y",
                  "ms", "inf", "nan", "absent_over_time", "max_over_time", "min_over_time",
-                 "avg_over_time", "sum_over_time", "count_over_time", "last_over_time"}
+                 "avg_over_time", "sum_over_time", "count_over_time", "last_over_time",
+                 "label_replace", "label_join"}
 
 
 def check_labels(expr: str, where: str) -> None:

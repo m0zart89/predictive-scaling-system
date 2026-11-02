@@ -1,3 +1,4 @@
+{{- $tls := include "forecast-serving.tls" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,6 +8,10 @@ metadata:
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
   selector:
     matchLabels:
@@ -18,24 +23,51 @@ spec:
       annotations:
         # Trigger rolling restart when the Secret content changes
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: {{ if $tls }}{{ .Values.tls.metricsPort | quote }}{{ else }}"8080"{{ end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
       serviceAccountName: {{ include "forecast-serving.serviceAccountName" . }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Values.global.imageTag | default "latest" }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if $tls }}
+          # mutual TLS: every caller presents a certificate from the same CA
+          args: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8443",
+                 "--ssl-certfile", "/etc/tls/tls.crt", "--ssl-keyfile", "/etc/tls/tls.key",
+                 "--ssl-ca-certs", "/etc/tls/ca.crt", "--ssl-cert-reqs", "2"]
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.tls.metricsPort }}
+              protocol: TCP
+          {{- else }}
           ports:
             - name: http
               containerPort: 8080
               protocol: TCP
+          {{- end }}
           env:
+            {{- if $tls }}
+            - name: METRICS_PORT
+              value: {{ .Values.tls.metricsPort | quote }}
+            {{- end }}
             - name: MLFLOW_TRACKING_URI
               valueFrom:
                 secretKeyRef:
@@ -54,15 +86,94 @@ spec:
               value: {{ .Values.model.stage | quote }}
             - name: TIME_STEPS
               value: {{ .Values.model.timeSteps | quote }}
+            # pull-based refresh: every replica follows the alias on its own
+            - name: MODEL_REFRESH_SECONDS
+              value: {{ .Values.model.refreshSeconds | quote }}
+            - name: MODEL_CACHE_DIR
+              value: /cache
+            - name: TMPDIR
+              value: /tmp
+            # in-process quality tracking; 0 when the scaler scores forecasts itself
+            - name: FORECAST_MAX_SERIES
+              value: {{ .Values.quality.maxSeries | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $tls }}
+          {{- /* the kubelet has no client certificate: probe from inside with the pod's own */}}
+          startupProbe:
+            exec:
+              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/live',context=c,timeout=4)"]
+            periodSeconds: {{ .Values.startupProbe.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold | default 60 }}
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/live',context=c,timeout=4)"]
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 10 }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold | default 3 }}
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/ready',context=c,timeout=4)"]
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold | default 6 }}
+          {{- else }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false  # MLflow writes temp files on model load
+            # MLflow downloads to TMPDIR and the model cache lives in /cache;
+            # both are emptyDirs, so the image itself stays read-only.
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /cache
+            {{- if $tls }}
+            - name: tls
+              mountPath: /etc/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir:
+            sizeLimit: {{ .Values.cache.sizeLimit }}
+        {{- if $tls }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

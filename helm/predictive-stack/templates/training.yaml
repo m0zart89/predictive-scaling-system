@@ -3,7 +3,7 @@
 {{- $tw := include "predictive-stack.trainingWorkload" . | fromYaml }}
 {{- $query := $t.cronjob.query }}
 {{- if and (not $query) $tw.query }}
-{{- $query = printf "(%s) / %s" $tw.query $tw.capacity }}
+{{- $query = printf "(%s) / %s" (include "predictive-stack.demandQuery" (dict "root" . "name" $tw.name "query" $tw.query)) $tw.capacity }}
 {{- end }}
 {{- /* No query and no workload (a pilot before its workloads are added): no
        CronJob rather than one that would fail every night. NOTES.txt says so. */}}
@@ -49,11 +49,19 @@ spec:
                 - name: MLFLOW_TRACKING_URI
                   value: http://mlflow:5000
                 - name: TRAIN_PROMETHEUS_URL
-                  value: http://prometheus:9090
+                  value: {{ include "predictive-stack.trainingPrometheusUrl" . | quote }}
                 # Model units: the scaler feeds the model demand / capacity, so the
                 # model is trained on exactly that series of training.workload.
                 - name: TRAIN_QUERY
                   value: {{ $query | quote }}
+                {{- with $tw.channels }}
+                # multivariate: the workload's extra channels (name -> PromQL), the
+                # demand series stays the target
+                - name: TRAIN_CHANNELS
+                  value: {{ . | toJson | quote }}
+                - name: TRAIN_TARGET_CHANNEL
+                  value: {{ $tw.targetChannel | quote }}
+                {{- end }}
                 - name: TRAIN_DAYS
                   value: {{ $t.cronjob.days | quote }}
                 - name: TRAIN_STEP_SECONDS
@@ -75,18 +83,37 @@ spec:
                 - name: MODEL_ALIAS
                   value: champion
                 - name: SERVING_RELOAD_URL
-                  value: http://forecast-serving:8080
+                  value: {{ if .Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving:8080
                 - name: SERVING_RELOAD_TOKEN
                   valueFrom:
                     secretKeyRef:
                       name: forecast-reload-token
                       key: RELOAD_TOKEN
+                {{- if .Values.global.tls.enabled }}
+                - name: SERVING_TLS_DIR
+                  value: /etc/serving-tls
+                {{- end }}
+              {{- with .Values.mlflow.client.existingSecret }}
+              envFrom:
+                - secretRef:
+                    name: {{ . }}       # MLFLOW_TRACKING_USERNAME / _PASSWORD
+              {{- end }}
               resources:
                 {{- toYaml $t.resources | nindent 16 }}
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
                   drop: ["ALL"]
+              {{- if .Values.global.tls.enabled }}
+              volumeMounts:
+                - name: serving-tls
+                  mountPath: /etc/serving-tls
+                  readOnly: true
+          volumes:
+            - name: serving-tls
+              secret:
+                secretName: forecast-training-client
+              {{- end }}
 {{- end }}
 {{- if $t.bootstrap.enabled }}
 ---
@@ -143,7 +170,7 @@ spec:
             - --horizon={{ $t.bootstrap.horizon }}
             - --period-seconds={{ $t.cronjob.periodSeconds }}
             - --under-weight={{ $t.cronjob.underWeight }}
-            - --reload-url=http://forecast-serving:8080
+            - --reload-url={{ if .Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving:8080
           env:
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow:5000
@@ -156,6 +183,15 @@ spec:
                 secretKeyRef:
                   name: forecast-reload-token
                   key: RELOAD_TOKEN
+            {{- if .Values.global.tls.enabled }}
+            - name: SERVING_TLS_DIR
+              value: /etc/serving-tls
+            {{- end }}
+          {{- with .Values.mlflow.client.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
           resources:
             {{- toYaml $t.resources | nindent 12 }}
           securityContext:
@@ -166,8 +202,18 @@ spec:
             - name: data
               mountPath: /data
               readOnly: true
+            {{- if .Values.global.tls.enabled }}
+            - name: serving-tls
+              mountPath: /etc/serving-tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: data
           configMap:
             name: {{ $t.bootstrap.configMap }}
+        {{- if .Values.global.tls.enabled }}
+        - name: serving-tls
+          secret:
+            secretName: forecast-training-client
+        {{- end }}
 {{- end }}

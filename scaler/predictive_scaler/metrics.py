@@ -52,6 +52,46 @@ class ScalerMetrics:
             "Prometheus queries that failed; the gRPC call returned an error to KEDA",
             _LABELS, registry=registry,
         )
+        self.forecast_demand = Gauge(
+            "predictive_scaler_forecast_demand",
+            "Forecast demand for each step of the model's horizon, in the query's units "
+            "(absent while in fallback)",
+            _LABELS + ("step",), registry=registry,
+        )
+        # Scored by the scaler itself from the history it fetches (see quality.py):
+        # exact, per replica, in model units so it compares with forecast_model_holdout_mae.
+        self.forecast_abs_error = Histogram(
+            "predictive_scaler_forecast_abs_error",
+            "Absolute error of past forecasts once the actual value was read from Prometheus, "
+            "by horizon step, in model units (demand / capacity)",
+            _LABELS + ("step",),
+            buckets=(0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5),
+            registry=registry,
+        )
+        self.forecast_residual = Gauge(
+            "predictive_scaler_forecast_residual",
+            "Latest (actual - forecast) for the first horizon step, in model units; "
+            "what the circuit breaker watches",
+            _LABELS, registry=registry,
+        )
+        self.breaker_open = Gauge(
+            "predictive_scaler_breaker_open",
+            "1 while the circuit breaker keeps the forecast out of the decision (reactive "
+            "scaling on observed demand); retraining excludes these intervals",
+            _LABELS, registry=registry,
+        )
+        self.breaker_trips = Counter(
+            "predictive_scaler_breaker_trips_total",
+            "Circuit breaker trips by signal: residual (forecast wrong now), level (far from "
+            "one season ago), jump (a step the history never contained)",
+            _LABELS + ("reason",), registry=registry,
+        )
+        self.breaker_bypass = Counter(
+            "predictive_scaler_breaker_bypass_total",
+            "Decisions that had a forecast and reported observed demand instead because the "
+            "breaker was open",
+            _LABELS, registry=registry,
+        )
         self.forecast_latency = Histogram(
             "predictive_scaler_forecast_latency_seconds",
             "Latency of calls to the forecast service",

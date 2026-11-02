@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import mlflow
 import mlflow.sklearn
@@ -55,6 +55,7 @@ from .model import (CANDIDATES, DEFAULT_UNDER_WEIGHT, Candidate, CandidateResult
 log = logging.getLogger("forecast-training")
 
 META_ARTIFACT = "forecast_meta.json"
+CHANNELS_ARTIFACT = "channels.pkl"   # under scaler/: one MinMaxScaler per channel (multivariate models)
 BASELINES = ("persistence", "seasonal", "best")
 
 
@@ -73,6 +74,8 @@ class TrainConfig:
     min_fresh_windows: int = 48      # 4 hours of 5-minute data
     under_weight: float = DEFAULT_UNDER_WEIGHT   # cost of a unit of shortfall, in idle units
     baseline: str = "persistence"    # the winner must beat: persistence | seasonal | best
+    reason: str = "scheduled"        # why this run exists: scheduled | the alert that triggered it
+    channels: Tuple[str, ...] = ()   # names of the series in `values` when there are several; [0] the target
     refit: bool = True
     dry_run: bool = False
     candidates: List[str] = field(default_factory=lambda: [c.name for c in CANDIDATES])
@@ -114,15 +117,19 @@ def load_champion(client: MlflowClient, name: str, alias: str) -> Optional[tuple
     model = mlflow.sklearn.load_model(f"models:/{name}@{alias}")
     tmp = tempfile.mkdtemp()
     scaler_dir = client.download_artifacts(mv.run_id, "scaler", dst_path=tmp)
-    with open(os.path.join(scaler_dir, sorted(os.listdir(scaler_dir))[0]), "rb") as f:
-        scaler = pickle.load(f)
+    with open(os.path.join(scaler_dir, "scaler.pkl"), "rb") as f:
+        scaler = pickle.load(f)                      # the target channel's
+    scalers = [scaler]
+    if os.path.exists(os.path.join(scaler_dir, CHANNELS_ARTIFACT)):
+        with open(os.path.join(scaler_dir, CHANNELS_ARTIFACT), "rb") as f:
+            scalers = pickle.load(f)                 # one per channel, target first
     try:
         meta_path = client.download_artifacts(mv.run_id, META_ARTIFACT, dst_path=tmp)
         with open(meta_path) as f:
             meta = ForecastMeta.from_dict(json.load(f))
     except (MlflowException, OSError):
         meta = LEGACY_META   # registered by the notebook, before this contract
-    return ForecastBundle(model=model, scaler=scaler, meta=meta), mv.version, dict(mv.tags or {})
+    return ForecastBundle(model=model, scaler=scaler, meta=meta, scalers=scalers), mv.version, dict(mv.tags or {})
 
 
 # ── pipeline ───────────────────────────────────────────────────────────────────
@@ -132,8 +139,13 @@ def _log_bundle(bundle: ForecastBundle) -> None:
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "scaler.pkl")
         with open(path, "wb") as f:
-            pickle.dump(bundle.scaler, f)
+            pickle.dump(bundle.scaler, f)           # the target channel's: older serving reads this
         mlflow.log_artifact(path, "scaler")
+        if len(bundle.scalers) > 1:
+            path = os.path.join(d, CHANNELS_ARTIFACT)
+            with open(path, "wb") as f:
+                pickle.dump(bundle.scalers, f)
+            mlflow.log_artifact(path, "scaler")
     mlflow.log_dict(json.loads(bundle.meta.to_json()), META_ARTIFACT)
 
 
@@ -142,7 +154,12 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
     """`timestamps` (unix seconds, aligned with `values`) enable the fresh-data
     comparison against the champion and are recorded on the registered version."""
     client = MlflowClient()
-    if timestamps is not None and len(timestamps) != len(values):
+    values = np.asarray(values, dtype=np.float64)
+    n_points = values.shape[-1]
+    if values.ndim == 2 and len(cfg.channels) != values.shape[0]:
+        raise ValueError(f"{values.shape[0]} channels of values need {values.shape[0]} names in "
+                         f"TrainConfig.channels, got {cfg.channels}")
+    if timestamps is not None and len(timestamps) != n_points:
         raise ValueError("timestamps and values differ in length")
     by_name = {c.name: c for c in CANDIDATES}
     unknown = set(cfg.candidates) - set(by_name)
@@ -154,7 +171,8 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
     run_name = "retrain-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     with mlflow.start_run(run_name=run_name) as parent:
         mlflow.log_params({
-            "source": source, "n_points": len(values), "filled_points": filled_points,
+            "source": source, "n_points": n_points, "filled_points": filled_points,
+            "channels": ",".join(cfg.channels) if values.ndim == 2 else "",
             "time_steps": cfg.time_steps, "horizon": cfg.horizon,
             "step_seconds": cfg.step_seconds, "period_seconds": cfg.period_seconds,
             "test_fraction": cfg.test_fraction,
@@ -162,10 +180,12 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
             "under_weight": cfg.under_weight, "baseline": cfg.baseline,
             "candidates": ",".join(cfg.candidates),
         })
+        mlflow.set_tag("reason", cfg.reason)
 
         results, split = train_and_select(values, cfg.time_steps, cfg.horizon, cfg.step_seconds,
                                           cfg.test_fraction, cfg.min_tracking, candidates,
-                                          timestamps, cfg.period_seconds, cfg.under_weight)
+                                          timestamps, cfg.period_seconds, cfg.under_weight,
+                                          cfg.channels if values.ndim == 2 else ())
         for r in results:
             with mlflow.start_run(run_name=r.candidate.name, nested=True):
                 mlflow.log_params({**r.candidate.params, "features": r.candidate.features,
@@ -203,13 +223,15 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
 
         if outcome.promoted and not cfg.dry_run:
             final = (fit_bundle(values, best.candidate, cfg.time_steps, cfg.horizon,
-                                cfg.step_seconds, timestamps, cfg.period_seconds)
+                                cfg.step_seconds, timestamps, cfg.period_seconds,
+                                cfg.channels if values.ndim == 2 else ())
                      if cfg.refit else best.bundle)
-            fitted_until = len(values) if cfg.refit else split
+            fitted_until = n_points if cfg.refit else split
             _log_bundle(final)
             mv = mlflow.register_model(f"runs:/{parent.info.run_id}/model", cfg.model_name)
             client.set_registered_model_alias(cfg.model_name, cfg.alias, mv.version)
-            tags = {"candidate": best.candidate.name, "horizon": cfg.horizon,
+            tags = {"candidate": best.candidate.name, "horizon": cfg.horizon, "reason": cfg.reason,
+                    "channels": ",".join(best.bundle.meta.channels),
                     "holdout_rmse": f"{best.score.rmse:.6f}",
                     "holdout_cost": f"{best.score.cost:.6f}",
                     "holdout_coverage": f"{best.score.coverage:.4f}",
@@ -251,6 +273,12 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
                                    f"cost {best.score.cost:.4f}", metrics=metrics)
 
     champ_bundle, champ_version, champ_tags = champ
+    if tuple(champ_bundle.meta.channels) != tuple(best.bundle.meta.channels):
+        # the input contract changed (channels added or removed): the champion
+        # cannot be scored on this data, and serving could not feed it either
+        return Outcome("promoted", f"champion v{champ_version} takes channels "
+                                   f"{list(champ_bundle.meta.channels) or 'one series'}, the data now has "
+                                   f"{list(best.bundle.meta.channels) or 'one series'}", metrics=metrics)
     champ_tracking = level_tracking(champ_bundle, values, split, timestamps)
     metrics["champion_level_tracking"] = champ_tracking
     if champ_tracking < cfg.min_tracking:
@@ -266,8 +294,9 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
         note = " (champion has no data_end_ts tag; it may have been fitted to this holdout)"
     steps = min(champ_bundle.meta.horizon, best.bundle.meta.horizon)
     t = max(champ_bundle.meta.input_length, best.bundle.meta.input_length)
-    fresh = len(values) - max(compare_from, t) - max(champ_bundle.meta.horizon,
-                                                     best.bundle.meta.horizon) + 1
+    n_points = np.asarray(values).shape[-1]
+    fresh = n_points - max(compare_from, t) - max(champ_bundle.meta.horizon,
+                                                  best.bundle.meta.horizon) + 1
     metrics["fresh_windows"] = float(max(fresh, 0))
     if fresh < cfg.min_fresh_windows:
         return Outcome("kept_champion", f"only {max(fresh, 0)} windows of data newer than "
@@ -290,14 +319,21 @@ def _decide(client, cfg: TrainConfig, values, timestamps, split, best: Candidate
     return Outcome("kept_champion", vs, metrics=metrics)
 
 
-def reload_serving(url: str, timeout: float = 30.0, token: Optional[str] = None) -> bool:
+def reload_serving(url: str, timeout: float = 30.0, token: Optional[str] = None,
+                   tls_dir: Optional[str] = None) -> bool:
     """Ask forecast-serving to load the new champion. Failure is logged, not raised.
-    `token` goes into X-Reload-Token (forecast-serving's RELOAD_TOKEN)."""
+    `token` goes into X-Reload-Token (forecast-serving's RELOAD_TOKEN); `tls_dir`
+    (SERVING_TLS_DIR) holds the client certificate for an https URL."""
     headers = {"X-Reload-Token": token} if token else {}
     req = urllib.request.Request(f"{url.rstrip('/')}/reload", data=b"", method="POST",
                                  headers=headers)
+    context = None
+    if tls_dir:
+        import ssl
+        context = ssl.create_default_context(cafile=os.path.join(tls_dir, "ca.crt"))
+        context.load_cert_chain(os.path.join(tls_dir, "tls.crt"), os.path.join(tls_dir, "tls.key"))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:  # noqa: S310
             log.info("serving reloaded: %s", resp.read().decode()[:200])
             return True
     except (urllib.error.URLError, OSError) as exc:

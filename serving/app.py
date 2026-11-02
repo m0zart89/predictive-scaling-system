@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException
@@ -22,7 +22,8 @@ import mlflow.sklearn
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
-from forecast_training.features import FEATURE_KINDS, TARGET_KINDS, build_features, from_target
+from forecast_training.features import (FEATURE_KINDS, TARGET_KINDS, build_features_mv, from_target,
+                                        target_channel)
 from quality import ForecastTracker
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -44,10 +45,22 @@ FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
 # cluster has no champion until the first training run; this picks it up
 # without anyone having to call /reload.
 MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "30"))
+# Once a model is loaded, check the registry alias this often and reload when
+# it moved (0 disables). Pull, not push: with several replicas a POST /reload
+# reaches one pod; every pod polling the alias reaches all of them.
+MODEL_REFRESH_SECONDS = float(os.getenv("MODEL_REFRESH_SECONDS", "60"))
+# Last-known-good copy of the loaded model (model/, scaler.pkl, meta and
+# tags). A pod that restarts while MLflow is down serves from it, with
+# model_stage="cache", until the registry answers again. Empty: no cache.
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "")
 # When set, POST /reload requires the same value in the X-Reload-Token header
 # (the chart generates one and hands it to the training jobs). Empty: open,
 # for local runs only.
 RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")
+# With the API behind mTLS (uvicorn --ssl-cert-reqs 2) Prometheus cannot scrape
+# /metrics without a client certificate; set this to serve the same registry
+# over plain HTTP on a second port (0 = off, /metrics on the API port only).
+METRICS_PORT = int(os.getenv("METRICS_PORT", "0"))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -109,12 +122,49 @@ TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_M
 # scaled values in, one value out.
 LEGACY_FORECAST_META = {"time_steps": TIME_STEPS, "horizon": 1, "step_seconds": 300,
                         "features": "window", "target": "level", "period_seconds": 86400,
-                        "season_steps": 0}
+                        "season_steps": 0, "channels": []}
 
 
 def input_length(meta: Dict[str, object]) -> int:
     """Samples a caller must send: the window, preceded by one season for seasonal models."""
     return int(meta["time_steps"]) + int(meta.get("season_steps", 0))
+
+
+def channel_names(meta: Dict[str, object]) -> List[str]:
+    """Names of the model's input channels, the target first; [] for a one-series model."""
+    return [str(c) for c in (meta.get("channels") or [])]
+
+
+def prepare_channels(values, meta: Dict[str, object]):
+    """
+    A request's `values` (one list, or {channel: list}) → (input, filled,
+    window): the model input as (channels, input_length) for a multivariate
+    model or (input_length,) for a one-series one, the number of interpolated
+    samples, and the target channel's window (the last time_steps values).
+    Raises ValueError with a message fit for a 422.
+    """
+    time_steps, length = int(meta["time_steps"]), input_length(meta)
+    names = channel_names(meta)
+    if len(names) > 1:
+        if not isinstance(values, dict):
+            raise ValueError(f"This model takes {len(names)} channels {names}: send values as "
+                             "{channel: [...]}.")
+        missing = [n for n in names if n not in values]
+        if missing:
+            raise ValueError(f"Missing channel(s) {missing}; the model takes {names}.")
+        rows, filled = [], 0
+        for n in names:
+            arr, f = prepare_input(values[n], time_steps, length)
+            rows.append(arr)
+            filled += f
+        return np.stack(rows), filled, [float(v) for v in rows[0][-time_steps:]]
+    if isinstance(values, dict):
+        if len(values) != 1 or (names and names[0] not in values):
+            raise ValueError(f"This model takes one series{(' named ' + repr(names[0])) if names else ''}; "
+                             f"got channels {sorted(values)}.")
+        values = next(iter(values.values()))
+    arr, filled = prepare_input(values, time_steps, length)
+    return arr, filled, [float(v) for v in arr[-time_steps:]]
 
 
 def prepare_input(values: List[Optional[float]], time_steps: int, length: int):
@@ -146,23 +196,30 @@ class Bundle:
     """Everything a forecast needs, swapped atomically on (re)load so a request
     never pairs a new model with the old scaler or metadata."""
     model: object
-    scaler: object
+    scaler: object                # the target channel's MinMaxScaler
     meta: Dict[str, object]       # forecast_meta.json merged over the legacy defaults
     info: Dict[str, str]          # operational metadata (version, run_id, loaded_at)
+    scalers: tuple = ()           # one per channel, the target first (multivariate models)
 
     def forecast(self, values, timestamp: Optional[float] = None) -> List[float]:
-        """Raw input (`input_length` values, see prepare_input) → forecast for each
-        step of the model's horizon (raw units). `timestamp`: unix time of the last
-        value, used by time-of-day features (defaults to now, which is right for a
-        caller sending live windows)."""
-        arr    = np.asarray(values, dtype=float).reshape(-1, 1)
-        scaled = self.scaler.transform(arr).reshape(1, -1)
+        """Raw input (`input_length` values, or (channels, input_length) for a
+        multivariate model; see prepare_channels) → forecast for each step of the
+        model's horizon (raw units). `timestamp`: unix time of the last value, used
+        by time-of-day features (defaults to now, which is right for a caller
+        sending live windows)."""
+        arr = np.asarray(values, dtype=float)
+        scalers = self.scalers or (self.scaler,)
+        if arr.ndim == 1:
+            scaled = self.scaler.transform(arr.reshape(-1, 1)).reshape(1, -1)
+        else:
+            scaled = np.stack([sc.transform(row.reshape(-1, 1)).ravel()
+                               for sc, row in zip(scalers, arr)])[None, :, :]
         last_ts = np.array([timestamp if timestamp is not None else time.time()])
-        out    = self.model.predict(build_features(scaled, self.meta["features"], last_ts,
-                                                   int(self.meta.get("period_seconds", 86400)),
-                                                   int(self.meta["time_steps"]),
-                                                   int(self.meta["horizon"])))
-        out    = from_target(scaled, out, self.meta["target"])
+        out    = self.model.predict(build_features_mv(scaled, self.meta["features"], last_ts,
+                                                      int(self.meta.get("period_seconds", 86400)),
+                                                      int(self.meta["time_steps"]),
+                                                      int(self.meta["horizon"])))
+        out    = from_target(target_channel(scaled), out, self.meta["target"])
         return [float(v) for v in self.scaler.inverse_transform(out.reshape(-1, 1)).ravel()]
 
 
@@ -206,9 +263,14 @@ def load_model() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         scaler_dir  = client.download_artifacts(run_id, "scaler", dst_path=tmp)
-        scaler_path = os.path.join(scaler_dir, sorted(os.listdir(scaler_dir))[0])
+        names = sorted(os.listdir(scaler_dir))
+        scaler_path = os.path.join(scaler_dir, "scaler.pkl" if "scaler.pkl" in names else names[0])
         with open(scaler_path, "rb") as f:
             loaded_scaler = pickle.load(f)
+        loaded_scalers = (loaded_scaler,)
+        if "channels.pkl" in names:                    # multivariate: one scaler per channel
+            with open(os.path.join(scaler_dir, "channels.pkl"), "rb") as f:
+                loaded_scalers = tuple(pickle.load(f))
 
         try:
             meta_path = client.download_artifacts(run_id, META_ARTIFACT, dst_path=tmp)
@@ -216,9 +278,6 @@ def load_model() -> None:
                 loaded_meta = {**LEGACY_FORECAST_META, **json.load(f)}
         except (MlflowException, OSError):
             loaded_meta = dict(LEGACY_FORECAST_META)
-    if loaded_meta["features"] not in FEATURE_KINDS or loaded_meta["target"] not in TARGET_KINDS:
-        raise RuntimeError(f"Unsupported {META_ARTIFACT}: {loaded_meta}")
-
     info = {
         "model_name":    MODEL_NAME,
         "model_stage":   selector,
@@ -226,11 +285,30 @@ def load_model() -> None:
         "run_id":        run_id,
         # which candidate the pipeline promoted (version tag; "" for notebook models)
         "candidate":     (v.tags or {}).get("candidate", ""),
-        "loaded_at":     datetime.now(timezone.utc).isoformat(),
     }
+    _install(loaded_model, loaded_scaler, loaded_meta, info, dict(v.tags or {}), loaded_scalers)
+    if MODEL_CACHE_DIR:
+        try:
+            _write_cache(loaded_model, loaded_scalers, loaded_meta, info, dict(v.tags or {}))
+        except Exception as exc:      # the cache is a convenience, never a reason to fail a load
+            log.warning("could not write the model cache at %s: %s", MODEL_CACHE_DIR, exc)
+
+
+def _install(model, scaler, meta: Dict[str, object], info: Dict[str, str], tags: Dict[str, str],
+             scalers: tuple = ()) -> None:
+    """Swap the served bundle and refresh the model metrics."""
+    global _bundle
+    if meta["features"] not in FEATURE_KINDS or meta["target"] not in TARGET_KINDS:
+        raise RuntimeError(f"Unsupported {META_ARTIFACT}: {meta}")
+    scalers = tuple(scalers) or (scaler,)
+    if len(scalers) != max(1, len(channel_names(meta))):
+        raise RuntimeError(f"{len(scalers)} scaler(s) for channels {channel_names(meta)}")
+    info = {**info, "loaded_at": datetime.now(timezone.utc).isoformat()}
+    version, selector, run_id = info["model_version"], info["model_stage"], info["run_id"]
+
     previous = _bundle
     # One assignment: requests in flight keep the bundle they started with.
-    _bundle = Bundle(loaded_model, loaded_scaler, loaded_meta, info)
+    _bundle = Bundle(model, scalers[0], meta, info, scalers)
     if previous is not None and previous.info["run_id"] != run_id:
         # Forecasts the old model made are not the new model's errors.
         TRACKER.reset(pending_only=True)
@@ -238,9 +316,9 @@ def load_model() -> None:
     MODEL_LOADED.set(1)
     MODEL_INFO.clear()   # one series only: drop the previous version's labels
     MODEL_INFO.labels(model_name=MODEL_NAME, model_version=version, model_stage=selector,
-                      run_id=run_id, horizon=str(loaded_meta["horizon"])).set(1)
+                      run_id=run_id, horizon=str(meta["horizon"])).set(1)
     MODEL_HOLDOUT_MAE.clear()
-    for key, raw in (v.tags or {}).items():
+    for key, raw in tags.items():
         if key.startswith("holdout_mae_step_"):
             try:
                 MODEL_HOLDOUT_MAE.labels(horizon_step=key.rsplit("_", 1)[1]).set(float(raw))
@@ -249,9 +327,50 @@ def load_model() -> None:
     MODEL_RELOADS.labels(result="success").inc()
     log.info(
         "Model loaded: name=%s %s version=%s run_id=%s time_steps=%s horizon=%s target=%s",
-        MODEL_NAME, selector, version, run_id, loaded_meta["time_steps"],
-        loaded_meta["horizon"], loaded_meta["target"],
+        MODEL_NAME, selector, version, run_id, meta["time_steps"], meta["horizon"], meta["target"],
     )
+
+
+# ── Last-known-good cache ──────────────────────────────────────────────────────
+def _write_cache(model, scalers, meta, info, tags) -> None:
+    """Write the loaded model next to its scaler, meta, info and tags; atomically
+    (a new directory renamed over the old one) so a crash mid-write leaves the
+    previous cache intact."""
+    import shutil
+
+    final = os.path.join(MODEL_CACHE_DIR, "champion")
+    tmp = os.path.join(MODEL_CACHE_DIR, ".champion.tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    mlflow.sklearn.save_model(model, os.path.join(tmp, "model"))
+    with open(os.path.join(tmp, "scaler.pkl"), "wb") as f:
+        pickle.dump(list(scalers), f)                 # every channel's, the target first
+    with open(os.path.join(tmp, "cache.json"), "w") as f:
+        json.dump({"meta": meta, "info": info, "tags": tags}, f)
+    old = final + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.isdir(final):
+        os.rename(final, old)
+    os.rename(tmp, final)
+    shutil.rmtree(old, ignore_errors=True)
+    log.info("model cache written: %s (v%s)", final, info["model_version"])
+
+
+def load_cached_model() -> None:
+    """Serve the last-known-good model from MODEL_CACHE_DIR (model_stage="cache")."""
+    if not MODEL_CACHE_DIR:
+        raise RuntimeError("MODEL_CACHE_DIR is not set")
+    final = os.path.join(MODEL_CACHE_DIR, "champion")
+    with open(os.path.join(final, "cache.json")) as f:
+        saved = json.load(f)
+    model = mlflow.sklearn.load_model(os.path.join(final, "model"))
+    with open(os.path.join(final, "scaler.pkl"), "rb") as f:
+        scalers = pickle.load(f)
+    scalers = tuple(scalers) if isinstance(scalers, (list, tuple)) else (scalers,)
+    info = {**saved["info"], "model_stage": "cache"}
+    _install(model, scalers[0], {**LEGACY_FORECAST_META, **saved["meta"]}, info, saved["tags"], scalers)
+    log.warning("serving model v%s from the cache at %s; the registry is unavailable",
+                info["model_version"], final)
 
 
 # ── Startup model load ─────────────────────────────────────────────────────────
@@ -276,11 +395,47 @@ def _load_model_until_available() -> None:
             if attempt == 1:
                 log.warning("Model not available at startup (%s). Service running in degraded "
                             "state; retrying every %gs, or POST /reload.", exc, MODEL_RETRY_SECONDS)
+                if MODEL_CACHE_DIR:
+                    try:
+                        load_cached_model()        # serve the last known good; keep retrying
+                    except Exception as cache_exc:
+                        log.info("no usable model cache at %s (%s)", MODEL_CACHE_DIR, cache_exc)
             elif attempt % 10 == 0:
                 log.warning("Still no model after %d attempts: %s", attempt, exc)
         if MODEL_RETRY_SECONDS <= 0:
             return
         _stop_loading.wait(MODEL_RETRY_SECONDS)
+
+
+def _refresh_model_forever() -> None:
+    """
+    Every MODEL_REFRESH_SECONDS, ask the registry which version the alias points
+    at and reload when it differs from the one in memory (or when the one in
+    memory came from the cache). Errors are logged and the current model keeps
+    serving: a registry outage must never unload a working model.
+    """
+    while not _stop_loading.is_set() and MODEL_REFRESH_SECONDS > 0:
+        _stop_loading.wait(MODEL_REFRESH_SECONDS)
+        if not _stop_loading.is_set():
+            refresh_model()
+
+
+def refresh_model() -> bool:
+    """One registry check: reload if the alias points elsewhere than what is
+    served, or if the served model came from the cache. True when reloaded."""
+    b = _bundle
+    if b is None:
+        return False                                    # the loader thread owns this case
+    try:
+        v, _, _ = _resolve_version(MlflowClient(tracking_uri=MLFLOW_TRACKING_URI))
+        if str(v.version) != b.info["model_version"] or b.info["model_stage"] == "cache":
+            log.info("registry alias moved to v%s (serving v%s %s); reloading",
+                     v.version, b.info["model_version"], b.info["model_stage"])
+            load_model()
+            return True
+    except Exception as exc:
+        log.warning("model refresh check failed (%s); keeping v%s", exc, b.info["model_version"])
+    return False
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -294,6 +449,11 @@ async def lifespan(application: FastAPI):
     # immediately; /ready holds traffic until a model is in memory.
     _stop_loading.clear()
     threading.Thread(target=_load_model_until_available, name="model-loader", daemon=True).start()
+    threading.Thread(target=_refresh_model_forever, name="model-refresh", daemon=True).start()
+    if METRICS_PORT:
+        from prometheus_client import start_http_server
+        start_http_server(METRICS_PORT)
+        log.info("Plain-HTTP /metrics on :%d (the API port may require client certificates)", METRICS_PORT)
     log.info("Model loading initiated in background. Traffic held until /ready returns 200.")
 
     yield
@@ -326,8 +486,9 @@ class PredictRequest(BaseModel):
     # (see /model-info), raw (unscaled); the service applies the stored
     # MinMaxScaler. Longer histories are fine (the tail is used). The final
     # `time_steps` values must be present; older ones may be null where the
-    # caller has a gap, and are interpolated.
-    values: List[Optional[float]]
+    # caller has a gap, and are interpolated. A multivariate model takes one
+    # such list per channel: {"cpu": [...], "rps": [...]} (names in /model-info).
+    values: Union[List[Optional[float]], Dict[str, List[Optional[float]]]]
     # Optional, for forecast quality tracking: which series this window belongs
     # to (callers forecasting several workloads should pass a distinct key per
     # workload), the unix time of the last value (default: arrival time) and
@@ -339,14 +500,19 @@ class PredictRequest(BaseModel):
 
     @field_validator("values")
     @classmethod
-    def values_must_be_finite(cls, v: List[Optional[float]]) -> List[Optional[float]]:
-        if not v:
+    def values_must_be_finite(cls, v):
+        series = v.items() if isinstance(v, dict) else [("", v)]
+        if not series:
             raise ValueError("values must not be empty")
-        if v[-1] is None:
-            raise ValueError("the last value must be present")
-        for i, x in enumerate(v):
-            if x is not None and not math.isfinite(x):
-                raise ValueError(f"values[{i}] is not finite: {x!r}")
+        for name, row in series:
+            where = f"values[{name!r}]" if name else "values"
+            if not row:
+                raise ValueError(f"{where} must not be empty")
+            if row[-1] is None:
+                raise ValueError(f"the last value of {where} must be present")
+            for i, x in enumerate(row):
+                if x is not None and not math.isfinite(x):
+                    raise ValueError(f"{where}[{i}] is not finite: {x!r}")
         return v
 
     @field_validator("timestamp")
@@ -418,6 +584,8 @@ def model_info():
         # values a /predict call must carry: time_steps, plus a season for seasonal models
         "input_length": input_length(meta),
         "season_steps": meta.get("season_steps", 0),
+        # [] for a one-series model; else the channel names, the target first
+        "channels": channel_names(meta),
         "horizon":      meta["horizon"],
         "step_seconds": meta["step_seconds"],
         "features":     meta["features"],
@@ -448,15 +616,13 @@ def predict(req: PredictRequest):
     if b is None:
         raise HTTPException(status_code=503, detail="Model not loaded. POST /reload to recover.")
 
-    time_steps = int(b.meta["time_steps"])
     try:
-        model_input, filled = prepare_input(req.values, time_steps, input_length(b.meta))
+        model_input, filled, window = prepare_channels(req.values, b.meta)
     except ValueError as exc:
         PREDICTION_FAILURES.labels(reason="validation").inc()
         raise HTTPException(status_code=422, detail=str(exc))
     if filled:
         INPUT_FILLED.inc(filled)
-    window = [float(v) for v in model_input[-time_steps:]]
 
     PREDICTION_REQUESTS.inc()
 

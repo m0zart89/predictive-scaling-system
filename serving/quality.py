@@ -100,8 +100,8 @@ class ForecastTracker:
         `predictions` for scoring later. Returns how many (forecast, step)
         pairs were resolved by this window.
         """
-        if step_seconds <= 0 or not predictions:
-            return 0
+        if step_seconds <= 0 or not predictions or self.max_series <= 0:
+            return 0      # max_series=0: tracking off (the scaler scores forecasts itself)
         now = float(timestamp) if timestamp is not None else self._clock()
         with self._lock:
             queue = self._pending.get(series)

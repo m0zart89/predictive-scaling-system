@@ -1,0 +1,149 @@
+{{- $t := .Values.training.trigger }}
+{{- if and $t.enabled .Values.training.cronjob.enabled }}
+{{- $image := include "predictive-stack.image" (dict "image" .Values.training.image "global" .Values.global) }}
+{{- /*
+Alert-driven retraining (forecast_training.trigger): Alertmanager posts firing
+ForecastDriftHigh / ForecastBreakerOpenLong alerts here with a bearer token;
+the receiver clones the retraining CronJob's template into a Job, excluding
+the intervals in which the scaler's circuit breaker was open. The token is
+generated once and shared with Alertmanager (templates/alertmanager.yaml).
+*/ -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace "retrain-trigger-token").data | default dict }}
+{{- $token := $t.token | default (get $existing "token" | b64dec) | default (randAlphaNum 40) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: retrain-trigger-token
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+stringData:
+  token: {{ $token | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: retrain-trigger
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+---
+# get the CronJob to clone; list (dedup) and create Jobs. Nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: retrain-trigger
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [batch]
+    resources: [cronjobs]
+    verbs: [get]
+    resourceNames: [forecast-retrain]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [list, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: retrain-trigger
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: retrain-trigger
+subjects:
+  - kind: ServiceAccount
+    name: retrain-trigger
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrain-trigger
+  labels:
+    app: retrain-trigger
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: retrain-trigger
+  template:
+    metadata:
+      labels:
+        app: retrain-trigger
+      annotations:
+        checksum/token: {{ $token | sha256sum }}
+    spec:
+      serviceAccountName: retrain-trigger
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trigger
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.training.image.pullPolicy }}
+          command: ["python", "-m", "forecast_training.trigger"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CRONJOB
+              value: forecast-retrain
+            - name: PROMETHEUS_URL
+              value: {{ include "predictive-stack.trainingPrometheusUrl" . | quote }}
+            - name: MIN_GAP_HOURS
+              value: {{ $t.minGapHours | quote }}
+            - name: ALERT_NAMES
+              value: {{ join "," $t.alerts | quote }}
+            - name: EXCLUDE_PAD_SECONDS
+              value: {{ $t.excludePadSeconds | quote }}
+            - name: TRIGGER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: retrain-trigger-token
+                  key: token
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+          resources:
+            {{- toYaml $t.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: retrain-trigger
+  labels:
+    app: retrain-trigger
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: retrain-trigger
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- end }}

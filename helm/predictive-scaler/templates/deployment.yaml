@@ -1,3 +1,4 @@
+{{- $tls := include "predictive-scaler.tls" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +7,10 @@ metadata:
     {{- include "predictive-scaler.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "predictive-scaler.selectorLabels" . | nindent 6 }}
@@ -22,6 +27,10 @@ spec:
       # The scaler never talks to the Kubernetes API: KEDA calls it, it calls
       # Prometheus and forecast-serving over HTTP.
       automountServiceAccountToken: false
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -38,6 +47,11 @@ spec:
             - name: metrics
               containerPort: 9100
               protocol: TCP
+            {{- if $tls }}
+            - name: health
+              containerPort: 6001
+              protocol: TCP
+            {{- end }}
           env:
             - name: GRPC_PORT
               value: "6000"
@@ -47,10 +61,33 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: STREAM_INTERVAL_SECONDS
               value: {{ .Values.streamIntervalSeconds | quote }}
+            {{- if $tls }}
+            - name: TLS_DIR
+              value: /etc/scaler-tls
+            - name: HEALTH_PORT
+              value: "6001"
+            {{- end }}
+          {{- if $tls }}
+          {{- /* the kubelet's grpc probe is plaintext: a health-only server answers on 6001 */}}
+          livenessProbe:
+            grpc:
+              port: 6001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            grpc:
+              port: 6001
+              service: externalscaler.ExternalScaler
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          {{- else }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
@@ -59,6 +96,16 @@ spec:
             capabilities:
               drop:
                 - ALL
+          {{- if $tls }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/scaler-tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+          {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -69,5 +116,9 @@ spec:
       {{- end }}
       {{- with .Values.affinity }}
       affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}

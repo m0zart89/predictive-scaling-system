@@ -13,7 +13,7 @@ data:
       - name: Prometheus
         uid: prometheus        # dashboards in monitoring/dashboards/ reference this uid
         type: prometheus
-        url: http://prometheus:9090
+        url: {{ include "predictive-stack.prometheusUrl" . }}
         access: proxy
         isDefault: true
 ---

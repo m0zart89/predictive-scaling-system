@@ -1,7 +1,9 @@
 {{- if .Values.security.networkPolicy.enabled }}
+{{- $np := .Values.security.networkPolicy }}
+{{- $ns := .Release.Namespace }}
+# Needs a CNI that enforces NetworkPolicy (kind's default kindnet does not).
 # Only the scaler, the training jobs, Prometheus and the ingress controller
 # may talk to forecast-serving; everything else in the cluster is refused.
-# Needs a CNI that enforces NetworkPolicy (kind's default kindnet does not).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -26,12 +28,214 @@ spec:
               app: train-bootstrap
         - podSelector:
             matchLabels:
+              app: retrain-trigger
+        - podSelector:
+            matchLabels:
               app: prometheus
-        {{- with .Values.security.networkPolicy.ingressNamespace }}
+        - podSelector:
+            matchExpressions:
+              - {key: prometheus, operator: Exists}
+        {{- with $np.ingressNamespace }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ . }}
         {{- end }}
       ports:
         - port: 8080
+        - port: 8443
+        - port: 9100
+{{- if $np.defaultDeny }}
+---
+# Default deny for ingress in the namespace: every pod below lists who may
+# reach it. Egress stays open (KEDA, MLflow and the training jobs need the
+# API server, the registry's object store and the cluster DNS; locking that
+# down is cluster-specific).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# predictive-scaler: gRPC from KEDA's operator, metrics from Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: predictive-scaler
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: predictive-scaler
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: keda-operator
+      ports:
+        - port: 6000
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+        - podSelector:
+            matchExpressions:
+              - {key: prometheus, operator: Exists}
+      ports:
+        - port: 9100
+        - port: 6001
+---
+# Prometheus: the scaler, the training jobs, Grafana, the retrain trigger and
+# the ingress controller query it; the operator's pods carry the `prometheus`
+# label instead of app=prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [prometheus]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+        {{- with $np.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-operated
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: prometheus, operator: Exists}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+        {{- with $np.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - port: 9090
+        - port: 10901
+---
+# MLflow: serving, the training jobs, Prometheus and the ingress controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mlflow
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: mlflow
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: forecast-serving
+        - podSelector:
+            matchLabels:
+              app: forecast-retrain
+        - podSelector:
+            matchLabels:
+              app: train-bootstrap
+        - podSelector:
+            matchLabels:
+              app: prometheus
+        - podSelector:
+            matchExpressions:
+              - {key: prometheus, operator: Exists}
+        {{- with $np.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - port: 5000
+---
+# Grafana: the ingress controller only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: grafana
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- with $np.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- else }}
+        - podSelector: {}
+        {{- end }}
+      ports:
+        - port: 3000
+---
+# KEDA's metrics API server and admission webhooks are called by the API
+# server (outside any pod selector) and must stay reachable; the operator is
+# scraped. Anything may reach them: they authenticate their callers themselves.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keda-open
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [keda-operator, keda-operator-metrics-apiserver, keda-admission-webhooks]}
+  policyTypes: [Ingress]
+  ingress:
+    - {}
+---
+# Scaled workloads (the demo and .Values.workloads): reachable from anything in
+# the namespace (load generators, Prometheus) and from the ingress controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: scaled-workloads
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [cpu-burner, bench-load, retrain-trigger, alertmanager{{ range .Values.workloads }}, {{ .deployment }}{{ end }}]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+        {{- with $np.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+{{- end }}
 {{- end }}

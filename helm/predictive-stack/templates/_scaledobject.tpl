@@ -64,10 +64,14 @@ spec:
       metricType: AverageValue
       metadata:
         scalerAddress: predictive-scaler.{{ $root.Release.Namespace }}.svc.cluster.local:6000
-        prometheusServerAddress: {{ $w.prometheusServerAddress | default (printf "http://prometheus.%s.svc.cluster.local:9090" $root.Release.Namespace) }}
-        # Total demand, independent of replica count (aggregate to one series).
-        query: {{ $w.query | quote }}
-        forecastServiceURL: http://forecast-serving.{{ $root.Release.Namespace }}.svc.cluster.local:8080
+        prometheusServerAddress: {{ $w.prometheusServerAddress | default (include "predictive-stack.prometheusUrl" $root) }}
+        # Total demand, independent of replica count (aggregate to one series);
+        # the recorded workload:demand series with prometheus.recordDemand.
+        query: {{ include "predictive-stack.demandQuery" (dict "root" $root "name" $w.name "query" $w.query) | quote }}
+        forecastServiceURL: {{ if $root.Values.global.tls.enabled }}https{{ else }}http{{ end }}://forecast-serving.{{ $root.Release.Namespace }}.svc.cluster.local:8080
+        {{- if $root.Values.global.tls.enabled }}
+        enableTLS: "true"
+        {{- end }}
         targetValue: {{ $w.targetValue | quote }}
         # model input = demand / capacity: the model is trained on that series
         # (training.workload), so the two must agree
@@ -83,6 +87,37 @@ spec:
         activationValue: {{ $w.activationValue | default $d.activationValue | quote }}
         cacheSeconds: {{ $w.cacheSeconds | default $d.cacheSeconds | quote }}
         timeoutSeconds: {{ $w.timeoutSeconds | default $d.timeoutSeconds | quote }}
+        {{- with $w.channels }}
+        # extra input series for a multivariate model (channel name -> PromQL),
+        # sent next to the demand series under targetChannel; the CronJob trains
+        # on the same channels (training.workload)
+        channels: {{ . | toJson | quote }}
+        targetChannel: {{ $w.targetChannel | default $d.targetChannel | quote }}
+        {{- end }}
+        # mode=max guard: the forecast may exceed observed demand by at most this factor
+        forecastSurgeFactor: {{ $w.forecastSurgeFactor | default $d.forecastSurgeFactor | quote }}
+        # circuit breaker: reactive scaling while the series does not resemble the history
+        breaker: {{ $w.breaker | default $d.breaker | quote }}
+        breakerResidualZ: {{ $w.breakerResidualZ | default $d.breakerResidualZ | quote }}
+        breakerLevelShift: {{ $w.breakerLevelShift | default $d.breakerLevelShift | quote }}
+        breakerJumpFactor: {{ $w.breakerJumpFactor | default $d.breakerJumpFactor | quote }}
+        breakerJumpMinSamples: {{ $w.breakerJumpMinSamples | default $d.breakerJumpMinSamples | quote }}
+        breakerMinOpenSeconds: {{ $w.breakerMinOpenSeconds | default $d.breakerMinOpenSeconds | quote }}
+        breakerCalmPolls: {{ $w.breakerCalmPolls | default $d.breakerCalmPolls | quote }}
+{{- if $root.Values.global.tls.enabled }}
+      authenticationRef:
+        name: predictive-scaler-mtls
+{{- end }}
+{{- $floor := $w.reactiveFloor | default $d.reactiveFloor }}
+{{- if $floor.enabled }}
+    # Reactive floor: a plain CPU trigger next to the predictive one. KEDA takes
+    # the larger desired count, so the workload still scales on CPU when the
+    # breaker is open or the scaler is in trouble.
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: {{ $floor.cpuUtilization | quote }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -95,12 +130,12 @@ capacity (as a YAML-encoded dict, decode with fromYaml).
 {{- $name := .Values.training.workload }}
 {{- range .Values.workloads }}
 {{- if or (and $name (eq .name $name)) (and (not $name) (not $found)) }}
-{{- $found = dict "name" .name "query" .query "capacity" (.capacity | default $.Values.scalerDefaults.capacity) }}
+{{- $found = dict "name" .name "query" .query "capacity" (.capacity | default $.Values.scalerDefaults.capacity) "channels" (.channels | default dict) "targetChannel" (.targetChannel | default $.Values.scalerDefaults.targetChannel) }}
 {{- end }}
 {{- end }}
 {{- if and $name (not $found) }}{{ fail (printf "training.workload %q is not in .Values.workloads" $name) }}{{ end }}
 {{- if and (not $found) .Values.demo.enabled }}
-{{- $found = dict "name" "cpu-burner" "query" .Values.demo.query "capacity" .Values.demo.predictive.capacity }}
+{{- $found = dict "name" "cpu-burner" "query" .Values.demo.query "capacity" .Values.demo.predictive.capacity "channels" dict "targetChannel" .Values.scalerDefaults.targetChannel }}
 {{- end }}
 {{- $found | toYaml }}
 {{- end }}

@@ -297,7 +297,7 @@ def test_reload_requires_the_token_when_one_is_configured(registry, serving, mon
         def read(self):
             return b"{}"
 
-    def fake_urlopen(req, timeout):
+    def fake_urlopen(req, timeout, context=None):
         seen["token"] = req.get_header("X-reload-token")
         return Resp()
 
@@ -321,3 +321,121 @@ def test_serving_exports_the_models_holdout_mae_for_the_drift_alert(registry, se
         got = REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": str(step)})
         assert got == pytest.approx(float(tags[f"holdout_mae_step_{step}"]))
     assert REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": "4"}) is None
+
+
+def test_cache_serves_the_last_known_good_model_while_the_registry_is_down(registry, serving, monkeypatch, tmp_path):
+    """A pod restarting while MLflow is unreachable loads the cached champion
+    (model_stage "cache") and keeps answering; the refresh check reloads from
+    the registry once it is back."""
+    from prometheus_client import REGISTRY
+
+    monkeypatch.setattr(serving_app, "MODEL_CACHE_DIR", str(tmp_path / "cache"))
+    (tmp_path / "cache").mkdir()
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()                                  # writes the cache
+    window = [float(v) for v in values[-10:]]
+    expected = serving.post("/predict", json={"values": window}).json()["predictions"]
+    assert (tmp_path / "cache" / "champion" / "cache.json").exists()
+
+    # registry gone, process restarted (fail fast instead of MLflow's retry backoff)
+    resolve = serving_app._resolve_version
+
+    def registry_down(client):
+        raise ConnectionError("mlflow unreachable")
+
+    monkeypatch.setattr(serving_app, "_resolve_version", registry_down)
+    monkeypatch.setattr(serving_app, "MODEL_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(serving_app, "_bundle", None)
+    serving_app._stop_loading.clear()                         # an earlier TestClient's shutdown set it
+    serving_app._load_model_until_available()                 # fails on MLflow, falls back to the cache
+    info = serving.get("/model-info").json()
+    assert info["model_stage"] == "cache" and info["model_version"] == "1"
+    assert serving.post("/predict", json={"values": window}).json()["predictions"] == expected
+    assert REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": "1"}) is not None
+    assert REGISTRY.get_sample_value("forecast_model_info", {
+        "model_name": "cpu-forecasting", "model_version": "1", "model_stage": "cache",
+        "run_id": info["run_id"], "horizon": "2"}) == 1
+
+    assert serving_app.refresh_model() is False                # registry still down: keep serving
+    assert serving.get("/model-info").json()["model_stage"] == "cache"
+    monkeypatch.setattr(serving_app, "_resolve_version", resolve)
+    assert serving_app.refresh_model() is True                 # back: the registry copy replaces the cache
+    assert serving.get("/model-info").json()["model_stage"] == "@champion"
+
+
+def test_refresh_follows_the_alias_without_a_reload_call(registry, serving):
+    """Pull-based refresh: when the pipeline moves @champion to a new version,
+    every replica picks it up on its next check; nothing POSTs /reload."""
+    ts, values = demand(days=12)
+    first = int(len(values) * 0.8)
+    run_pipeline(values[:first], TrainConfig(horizon=2, candidates=["hgb_delta"], min_fresh_windows=24),
+                 "test", timestamps=ts[:first])
+    serving_app.load_model()
+    assert serving.get("/model-info").json()["model_version"] == "1"
+    assert serving_app.refresh_model() is False                # alias unchanged
+
+    out = run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"], min_fresh_windows=24,
+                                           min_improvement=-1.0), "test", timestamps=ts)
+    assert out.version == "2"
+    assert serving.get("/model-info").json()["model_version"] == "1"   # until the check runs
+    assert serving_app.refresh_model() is True
+    assert serving.get("/model-info").json()["model_version"] == "2"
+
+
+def test_quality_tracking_can_be_switched_off(registry, serving):
+    from quality import ForecastTracker
+    from prometheus_client import CollectorRegistry
+
+    off = ForecastTracker(CollectorRegistry(), max_series=0)
+    assert off.record("x", [0.5] * 10, [0.5], 300, timestamp=1_700_000_000) == 0
+    assert off.record("x", [0.5] * 9 + [0.7], [0.5], 300, timestamp=1_700_000_300) == 0
+    assert off.snapshot() == {}
+
+
+def test_multivariate_model_takes_one_list_per_channel(registry, serving):
+    """A model trained on cpu + rps is served from {"cpu": [...], "rps": [...]}:
+    per-channel scalers, the pipeline's exact forecast, 422 without a channel,
+    and a one-series model still takes a plain list (or its one channel by name)."""
+    rng = np.random.default_rng(3)
+    ts, cpu = demand(days=8)
+    rps = np.roll(cpu, -2) * 300 + rng.normal(0, 3, len(cpu))
+    values = np.stack([cpu, rps])
+    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta"], channels=("cpu", "rps")),
+                       "test", timestamps=ts)
+    assert out.promoted
+    serving_app.load_model()
+    info = serving.get("/model-info").json()
+    assert info["channels"] == ["cpu", "rps"] and info["input_length"] == 10
+
+    from mlflow.tracking import MlflowClient
+    bundle, _, _ = load_champion(MlflowClient(), "cpu-forecasting", "champion")
+    assert len(bundle.scalers) == 2
+    body = {"values": {"cpu": [float(v) for v in cpu[-10:]], "rps": [float(v) for v in rps[-10:]]}}
+    resp = serving.post("/predict", json=body)
+    assert resp.status_code == 200, resp.text
+    np.testing.assert_allclose(resp.json()["predictions"], bundle.predict(values[:, -10:][None, :, :])[0],
+                               rtol=1e-9)
+    # a longer rps history with a gap in its older part is fine; its tail is used
+    body["values"]["rps"] = [None, 5.0] + body["values"]["rps"]
+    assert serving.post("/predict", json=body).status_code == 200
+    r = serving.post("/predict", json={"values": {"cpu": body["values"]["cpu"]}})
+    assert r.status_code == 422 and "Missing channel(s) ['rps']" in r.json()["detail"]
+    r = serving.post("/predict", json={"values": body["values"]["cpu"]})
+    assert r.status_code == 422 and "takes 2 channels" in r.json()["detail"]
+    r = serving.post("/predict", json={"values": {"cpu": [0.1] * 10, "rps": [0.1] * 9 + [None]}})
+    assert r.status_code == 422                                   # the last value must be present
+
+    # the quality tracker scores the target channel
+    serving.post("/predict", json={**body, "series": "x", "timestamp": int(ts[-1])})
+    assert serving.get("/model-info").json()["rolling_mae"] == {}
+
+    # back to a one-series model: a list, or a dict with its single channel
+    run_pipeline(cpu, TrainConfig(horizon=2, candidates=["hgb_delta"], min_improvement=-1.0,
+                                  min_fresh_windows=1), "test", timestamps=ts)
+    serving_app.refresh_model()
+    info = serving.get("/model-info").json()
+    assert info["channels"] == [] and info["model_version"] == "2"
+    plain = serving.post("/predict", json={"values": [0.3] * 10}).json()["predictions"]
+    assert serving.post("/predict", json={"values": {"cpu": [0.3] * 10}}).json()["predictions"] == plain
+    assert serving.post("/predict", json={"values": {"cpu": [0.3] * 10, "rps": [1.0] * 10}}).status_code == 422

@@ -6,9 +6,39 @@
 
 replicaCount: 1
 
+# Production: 2 replicas, maxUnavailable 1, required anti-affinity (see
+# helm/predictive-stack/values-prod.yaml). Replicas share nothing: the
+# decision cache is per pod and bounded by cacheSeconds, and each replica
+# scores the forecasts it made from the history it fetches.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: ""
+  maxUnavailable: 1
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+priorityClassName: ""
+# Finish in-flight GetMetrics calls before SIGKILL.
+terminationGracePeriodSeconds: 20
+topologySpreadConstraints: []
+
 # Set by the predictive-stack umbrella chart; standalone installs use image.tag.
+# global.tls.enabled: mutual TLS on the gRPC port and towards forecast-serving.
 global:
   imageTag: ""
+  tls:
+    enabled: false
+
+# Mutual TLS: the gRPC server presents tls.secretName's certificate and
+# requires one from KEDA (TriggerAuthentication with caCert/tlsClientCert/
+# tlsClientKey, trigger metadata enableTLS); the same directory holds the
+# client certificate the scaler shows forecast-serving (https URLs only;
+# Prometheus stays plain HTTP). Enabled by global.tls.enabled or tls.enabled.
+tls:
+  enabled: false
+  secretName: predictive-scaler-tls
 
 image:
   repository: ghcr.io/m0zart89/predictive-scaling-system/predictive-scaler

@@ -1,0 +1,131 @@
+{{- if and .Values.prometheus.enabled (eq .Values.prometheus.mode "operator") }}
+{{- $o := .Values.prometheus.operator }}
+# Prometheus Operator objects: an HA pair (replica label for Thanos dedup), an
+# optional Thanos sidecar shipping blocks to the object store, PodMonitors for
+# the stack's pods and a PrometheusRule with the same rules the builtin
+# Prometheus loads from monitoring/. The Service `prometheus` (prometheus.yaml)
+# fronts these pods for the scaler, Grafana and the training jobs.
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: {{ $o.name }}
+  labels:
+    app: prometheus
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $o.replicas }}
+  replicaExternalLabelName: prometheus_replica
+  {{- with $o.externalLabels }}
+  externalLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  retention: {{ $o.retention }}
+  retentionSize: {{ $o.retentionSize }}
+  scrapeInterval: {{ .Values.prometheus.scrapeInterval }}
+  evaluationInterval: {{ .Values.prometheus.evaluationInterval }}
+  serviceAccountName: prometheus
+  storage:
+    volumeClaimTemplate:
+      spec:
+        {{- with $o.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $o.size }}
+  {{- if $o.thanos.enabled }}
+  thanos:
+    image: {{ $o.thanos.image | quote }}
+    objectStorageConfig:
+      name: {{ $o.thanos.objectStorageSecret }}
+      key: {{ $o.thanos.objectStorageKey }}
+  {{- end }}
+  {{- if .Values.alertmanager.enabled }}
+  alerting:
+    alertmanagers:
+      - namespace: {{ .Release.Namespace }}
+        name: alertmanager
+        port: http
+  {{- end }}
+  podMonitorSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMonitorNamespaceSelector: {}
+  ruleSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  ruleNamespaceSelector: {}
+  resources:
+    {{- toYaml .Values.prometheus.resources | nindent 4 }}
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              prometheus: {{ $o.name }}
+          topologyKey: kubernetes.io/hostname
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+---
+# Pods labelled app.kubernetes.io/name (forecast-serving, predictive-scaler):
+# `job` = that label, as the builtin scrape config does.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: predictive-stack-components
+  labels:
+    app: prometheus
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchExpressions:
+      - {key: app.kubernetes.io/name, operator: Exists}
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+    - port: metrics
+      path: /metrics
+  podTargetLabels: [app.kubernetes.io/name]
+  jobLabel: app.kubernetes.io/name
+---
+# Pods labelled app (cpu-burner, the benchmark's load job, mlflow).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: predictive-stack-apps
+  labels:
+    app: prometheus
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchExpressions:
+      - {key: app, operator: Exists}
+      - {key: app.kubernetes.io/name, operator: DoesNotExist}
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+    - port: metrics
+      path: /metrics
+  podTargetLabels: [app]
+  jobLabel: app
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: predictive-stack
+  labels:
+    app: prometheus
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  groups:
+{{- range $path, $_ := .Files.Glob "files/rules/*.yml" }}
+{{ (($.Files.Get $path) | fromYaml).groups | toYaml | indent 4 }}
+{{- end }}
+{{ (include "predictive-stack.demandRules" . | fromYaml).groups | toYaml | indent 4 }}
+{{- end }}

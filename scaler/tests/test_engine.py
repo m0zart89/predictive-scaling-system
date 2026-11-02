@@ -233,3 +233,159 @@ def test_default_history_equals_the_window_and_the_call_is_unchanged(metrics):
     fc = FakeForecast(lambda v: 0.9)
     engine_with(metrics, FakePrometheus([0.5] * 12), fc).decide(NS, NAME, make_config())
     assert fc.calls[0] == [0.5] * 10                          # exactly timeSteps values, no nulls
+
+
+# ── forecast quality scored by the scaler ──────────────────────────────────────
+
+def test_scaler_scores_its_own_forecasts_from_the_next_history(metrics, registry):
+    """A forecast made at t for t+1..t+3 is scored once the history fetched at a
+    later poll holds those instants: exact matching, no serving state, and it
+    works whichever replica polled in between."""
+    fc = FakeForecast(lambda v: [0.5, 0.6, 0.7])              # model units; capacity 2 → 1.0, 1.2, 1.4
+    prom = FakePrometheus([0.2] * 10)
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(capacity="2", stepSeconds="30", cacheSeconds="0")
+    eng.decide(NS, NAME, cfg)
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) == pytest.approx(1.2)
+    assert eng.ledger.pending() == 1
+
+    # two steps later: the history now holds the actuals for steps 1 and 2
+    prom.values = [0.2] * 10 + [1.1, 1.3]                       # query units
+    prom.NOW = FakePrometheus.NOW + 60
+    eng.decide(NS, NAME, cfg)
+    def count(step):
+        return registry.get_sample_value("predictive_scaler_forecast_abs_error_count", labels(step=step))
+
+    def total(step):
+        return registry.get_sample_value("predictive_scaler_forecast_abs_error_sum", labels(step=step))
+    assert count("1") == 1 and total("1") == pytest.approx(abs(1.1 / 2 - 0.5))
+    assert count("2") == 1 and total("2") == pytest.approx(abs(1.3 / 2 - 0.6))
+    assert count("3") is None                                   # not yet
+    assert registry.get_sample_value("predictive_scaler_forecast_residual", labels()) == pytest.approx(1.1 / 2 - 0.5)
+
+    # the same poll again (cache off, same newest sample): nothing is scored twice
+    eng.decide(NS, NAME, cfg)
+    assert count("1") == 1 and count("2") == 1
+
+    # one more step: step 3 resolves and the forecast leaves the ledger
+    prom.values = [0.2] * 10 + [1.1, 1.3, 1.5]
+    prom.NOW = FakePrometheus.NOW + 90
+    eng.decide(NS, NAME, cfg)
+    assert count("3") == 1 and total("3") == pytest.approx(abs(1.5 / 2 - 0.7))
+    assert eng.ledger.pending() == 2                             # the two forecasts made at +60 and +90
+
+
+def test_fallback_drops_the_per_step_forecast_series(metrics, registry):
+    prom = FakePrometheus(WINDOW)
+    fc = FakeForecast(lambda v: [0.9, 0.8])
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(cacheSeconds="0")
+    eng.decide(NS, NAME, cfg)
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) == pytest.approx(0.8)
+    fc.exc = ForecastError("down")
+    eng.decide(NS, NAME, cfg)
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="1")) is None
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) is None
+
+
+# ── circuit breaker and surge cap ──────────────────────────────────────────────
+
+def test_breaker_opens_on_a_jump_and_the_decision_turns_reactive(metrics, registry):
+    """A one-step jump the history never contained: the forecast is still made
+    and recorded, but the reported value is observed demand until the breaker
+    closes; metrics say so and retraining can exclude the interval."""
+    fc = FakeForecast(lambda v: 2.0)                 # model units; capacity 1
+    history = [0.2, 0.25, 0.2, 0.3, 0.25, 0.2, 0.3, 0.25, 0.2, 0.3]
+    prom = FakePrometheus(history)
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(cacheSeconds="0", breakerJumpMinSamples="5")
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "forecast" and d.value == pytest.approx(0.9)    # 2.0 capped at 3 x 0.3
+    assert registry.get_sample_value("predictive_scaler_breaker_open", labels()) == 0
+
+    prom.values = history + [1.5]                    # +1.2 against a largest rise of 0.1
+    prom.NOW += 300
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "observed" and d.value == pytest.approx(1.5)
+    assert d.predicted is not None                   # the forecast was made, not used
+    assert "breaker" in d.reason and "jump" in d.reason
+    assert registry.get_sample_value("predictive_scaler_breaker_open", labels()) == 1
+    assert registry.get_sample_value("predictive_scaler_breaker_trips_total", labels(reason="jump")) == 1
+    assert registry.get_sample_value("predictive_scaler_breaker_bypass_total", labels()) == 1
+    assert registry.get_sample_value("predictive_scaler_decisions_total", labels(source="observed")) == 1
+
+    # still open on the next poll (hold time), reactive again
+    prom.values = history + [1.5, 1.5]
+    prom.NOW += 300
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "observed" and "open" in d.reason
+
+
+def test_breaker_off_keeps_the_forecast_and_surge_cap_can_be_disabled(metrics):
+    fc = FakeForecast(lambda v: 2.0)
+    history = [0.2] * 9 + [0.3]
+    prom = FakePrometheus(history + [1.5])
+    eng = engine_with(metrics, prom, fc)
+    d = eng.decide(NS, NAME, make_config(breaker="off", forecastSurgeFactor="0"))
+    assert d.source == "forecast" and d.value == pytest.approx(2.0)   # uncapped, unbroken
+
+
+def test_surge_cap_limits_how_far_the_forecast_may_exceed_observed(metrics):
+    fc = FakeForecast(lambda v: 5.0)
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    d = eng.decide(NS, NAME, make_config(forecastSurgeFactor="2"))
+    assert d.predicted == pytest.approx(0.8) and "capped at 2x" in d.reason
+    d = eng.decide(NS, NAME, make_config(forecastSurgeFactor="2", mode="forecast"))
+    assert d.predicted == pytest.approx(5.0)        # the cap is a mode=max guard only
+
+
+# ── multivariate channels ──────────────────────────────────────────────────────
+
+def test_extra_channels_are_fetched_on_the_targets_grid_and_sent_by_name(metrics):
+    import json
+
+    fc = FakeForecast(lambda v: 0.9)
+    rps = [100.0] * 8 + [None, 150.0]                     # a hole, then the newest sample
+    prom = FakePrometheus(WINDOW, by_query={"sum(rate(http_requests_total[1m]))": rps})
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(capacity="2", channels=json.dumps({"rps": "sum(rate(http_requests_total[1m]))"}),
+                      targetChannel="cpu")
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "forecast"
+    sent = fc.calls[0]
+    assert set(sent) == {"cpu", "rps"}
+    assert sent["cpu"] == [v / 2 for v in WINDOW]           # the target, scaled by capacity
+    assert sent["rps"] == rps                               # raw units, hole kept (serving fills it)
+    assert prom.calls[1]["query"] == "sum(rate(http_requests_total[1m]))"
+    assert prom.calls[1]["now"] == pytest.approx(FakePrometheus.NOW)   # up to the target's newest sample
+
+
+def test_a_lagging_channel_is_carried_forward_and_a_failing_one_is_an_error(metrics, registry):
+    import json
+
+    class Lagging(FakePrometheus):
+        def fetch_history(self, address, query, points, step_seconds, timeout, now=None):
+            ts, vals = super().fetch_history(address, query, points, step_seconds, timeout, now)
+            if query == "rps":                              # newest sample one step old
+                return ts[:-1], vals[:-1]
+            return ts, vals
+
+    fc = FakeForecast(lambda v: 0.9)
+    prom = Lagging(WINDOW, by_query={"rps": [1.0] * 8 + [7.0, 9.0]})   # 9.0 not scraped yet
+    eng = engine_with(metrics, prom, fc)
+    eng.decide(NS, NAME, make_config(channels=json.dumps({"rps": "rps"})))
+    assert fc.calls[0]["rps"] == [1.0] * 8 + [7.0, 7.0]      # on the target grid, last value carried
+
+    prom = FakePrometheus(WINDOW, by_query={"rps": []})
+    prom.exc = None
+    eng = engine_with(metrics, prom, FakeForecast(lambda v: 0.9))
+
+    def failing(address, query, points, step_seconds, timeout, now=None):
+        if query == "rps":
+            raise PrometheusError("rps query failed")
+        return FakePrometheus.fetch_history(prom, address, query, points, step_seconds, timeout, now)
+
+    prom.fetch_history = failing
+    with pytest.raises(PrometheusError):
+        eng.decide(NS, NAME, make_config(channels=json.dumps({"rps": "rps"})))
+    assert registry.get_sample_value("predictive_scaler_prometheus_failures_total", labels()) == 1

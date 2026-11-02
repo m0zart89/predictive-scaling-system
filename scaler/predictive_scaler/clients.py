@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -29,8 +31,26 @@ class ForecastError(RuntimeError):
         self.reason = reason
 
 
+def ssl_context(tls_dir: str) -> Optional[ssl.SSLContext]:
+    """
+    Client-side mTLS from a mounted cert-manager Secret (tls.crt, tls.key,
+    ca.crt): forecast-serving's certificate must chain to ca.crt and this
+    scaler presents its own. Empty: plain HTTP (local runs). Prometheus is
+    reached over plain HTTP either way; the context only applies to https URLs.
+    """
+    if not tls_dir:
+        return None
+    ctx = ssl.create_default_context(cafile=os.path.join(tls_dir, "ca.crt"))
+    ctx.load_cert_chain(os.path.join(tls_dir, "tls.crt"), os.path.join(tls_dir, "tls.key"))
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+_SSL = ssl_context(os.getenv("TLS_DIR", ""))
+
+
 def _read_json(req: urllib.request.Request, timeout: float) -> dict:
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (URL comes from operator config)
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as resp:  # noqa: S310 (operator config)
         return json.loads(resp.read().decode("utf-8"))
 
 

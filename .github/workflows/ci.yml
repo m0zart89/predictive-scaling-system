@@ -43,6 +43,7 @@ jobs:
         env:
           # Fast-fail MLflow connection attempts during tests (no live MLflow server in CI)
           MLFLOW_HTTP_REQUEST_TIMEOUT: "3"
+          MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
           MLFLOW_TRACKING_URI: "http://127.0.0.1:1"
 
   test-training:
@@ -109,6 +110,10 @@ jobs:
           - name: forecast-training
             context: ./training
             file: ./training/Dockerfile
+          # upstream MLflow + PostgreSQL driver + S3 client (production backends)
+          - name: mlflow-server
+            context: ./mlflow
+            file: ./mlflow/Dockerfile
     env:
       # Images are published to GHCR under the repository:
       #   ghcr.io/<owner>/predictive-scaling-system/<name>:{<sha>,latest}
@@ -217,6 +222,26 @@ jobs:
           test "$(grep -c '^kind: ScaledObject$' /tmp/workloads.yaml)" = 2
           grep -Fq 'container=\"worker\"}[2m]))) / 1"' /tmp/workloads.yaml
           grep -q 'stepSeconds: "60"' /tmp/workloads.yaml
+          # the worker's extra channel reaches its ScaledObject and the CronJob as valid
+          # JSON (the query's own quotes survive two layers of escaping)
+          python3 - <<'PY'
+          import json, yaml
+          docs = [d for d in yaml.safe_load_all(open("/tmp/workloads.yaml")) if d]
+          so = [d for d in docs if d["kind"] == "ScaledObject" and d["metadata"]["name"] == "worker"][0]
+          meta = so["spec"]["triggers"][0]["metadata"]
+          assert json.loads(meta["channels"]) == {"rps": 'sum(rate(http_requests_total{container="worker"}[2m]))'}, meta["channels"]
+          assert meta["targetChannel"] == "cpu"
+          cj = [d for d in docs if d["kind"] == "CronJob"][0]
+          env = {e["name"]: e.get("value") for e in cj["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+          assert json.loads(env["TRAIN_CHANNELS"]) == {"rps": 'sum(rate(http_requests_total{container="worker"}[2m]))'}
+          assert env["TRAIN_TARGET_CHANNEL"] == "cpu"
+          api = [d for d in docs if d["kind"] == "ScaledObject" and d["metadata"]["name"] == "api"][0]
+          assert "channels" not in api["spec"]["triggers"][0]["metadata"]
+          print("channels ok")
+          PY
+          if grep -q 'name: TRAIN_CHANNELS' /tmp/stack.yaml; then
+            echo "::error::TRAIN_CHANNELS rendered for a workload without channels"; exit 1
+          fi
           # history follows each workload's own step: 10 + 86400/60 for the worker
           grep -q 'historySteps: "1450"' /tmp/workloads.yaml
           grep -q 'historySteps: "298"' /tmp/workloads.yaml
@@ -227,6 +252,100 @@ jobs:
           test "$(grep -c 'name: forecast-reload-token' /tmp/stack.yaml)" -ge 4
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
+          # production profile: PDBs, anti-affinity, HA KEDA, read-only images
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml > /tmp/prod.yaml
+          test "$(grep -c '^kind: PodDisruptionBudget$' /tmp/prod.yaml)" -ge 2
+          test "$(grep -c 'podAntiAffinity' /tmp/prod.yaml)" -ge 2
+          grep -q 'minAvailable: 2' /tmp/prod.yaml
+          grep -q 'MODEL_REFRESH_SECONDS' /tmp/prod.yaml
+          grep -q 'startupProbe' /tmp/prod.yaml
+          # MLflow on an external backend: DSN from a Secret, S3 artifacts, rolling
+          # updates, the db-upgrade hook, and no PVC
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml \
+            --set mlflow.backendStore.existingSecret=mlflow-backend \
+            --set mlflow.artifacts.destination=s3://bucket/mlflow --set mlflow.replicas=2 > /tmp/mlflow.yaml
+          grep -q -- '--backend-store-uri=$(MLFLOW_BACKEND_STORE_URI)' /tmp/mlflow.yaml
+          grep -q -- '--artifacts-destination=s3://bucket/mlflow' /tmp/mlflow.yaml
+          grep -q 'name: mlflow-db-upgrade-' /tmp/mlflow.yaml
+          grep -q 'helm.sh/hook: pre-install,pre-upgrade' /tmp/mlflow.yaml
+          if grep -q 'claimName: mlflow' /tmp/mlflow.yaml; then
+            echo "::error::MLflow still mounts a PVC with an external backend store"; exit 1
+          fi
+          # Prometheus modes: operator renders the CR, PodMonitors and a PrometheusRule
+          # with the demand recording rule, no Deployment; external renders nothing
+          # and points the scaler, Grafana and the training job at the URL
+          grep -q '^kind: Prometheus$' /tmp/prod.yaml
+          grep -q '^kind: PrometheusRule$' /tmp/prod.yaml
+          grep -q 'alert: ForecastDriftHigh' /tmp/prod.yaml
+          # the demand rule needs workloads: the PrometheusRule carries one per entry
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml \
+            -f helm/predictive-stack/ci/workloads-values.yaml | grep -c 'record: workload:demand' | grep -qx 2
+          if grep -q 'name: prometheus-config' /tmp/prod.yaml; then
+            echo "::error::the builtin Prometheus was rendered in operator mode"; exit 1
+          fi
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set prometheus.mode=external --set prometheus.external.url=http://thanos-query.monitoring.svc:9090 \
+            --set prometheus.recordDemand=true > /tmp/external.yaml
+          grep -q 'prometheusServerAddress: http://thanos-query.monitoring.svc:9090' /tmp/external.yaml
+          grep -q 'url: http://thanos-query.monitoring.svc:9090' /tmp/external.yaml
+          grep -q 'value: "http://thanos-query.monitoring.svc:9090"' /tmp/external.yaml
+          grep -Fq 'query: "workload:demand{workload=\"cpu-burner\"}"' /tmp/external.yaml
+          grep -Fq '(workload:demand{workload=\"cpu-burner\"}) / 2.5' /tmp/external.yaml
+          if grep -q '^kind: Prometheus$\|name: prometheus-config' /tmp/external.yaml; then
+            echo "::error::a Prometheus was rendered in external mode"; exit 1
+          fi
+          # the builtin default still carries the demand rule next to the alert rules
+          grep -q 'record: workload:demand' /tmp/stack.yaml
+          # replicas > 1 on SQLite must be refused
+          if helm template predictive helm/predictive-stack/ -n predictive --set mlflow.replicas=2 > /dev/null 2>&1; then
+            echo "::error::mlflow.replicas=2 on SQLite rendered"; exit 1
+          fi
+          # mutual TLS: five Certificates, KEDA's TriggerAuthentication and enableTLS,
+          # https towards serving, uvicorn with client-cert verification, the scaler's
+          # TLS_DIR and plaintext health port, the forecast ingress with backend mTLS
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set global.tls.enabled=true --set global.tls.issuerRef.name=internal-ca > /tmp/tls.yaml
+          test "$(grep -c '^kind: Certificate$' /tmp/tls.yaml)" = 5
+          grep -q '^kind: TriggerAuthentication$' /tmp/tls.yaml
+          grep -q 'enableTLS: "true"' /tmp/tls.yaml
+          grep -q 'name: predictive-scaler-mtls' /tmp/tls.yaml
+          grep -q 'forecastServiceURL: https://forecast-serving' /tmp/tls.yaml
+          grep -q -- '--ssl-cert-reqs' /tmp/tls.yaml
+          grep -q 'name: TLS_DIR' /tmp/tls.yaml
+          grep -q 'name: HEALTH_PORT' /tmp/tls.yaml
+          grep -q 'name: SERVING_TLS_DIR' /tmp/tls.yaml
+          grep -q 'backend-protocol: "HTTPS"' /tmp/tls.yaml
+          grep -q 'prometheus.io/port: "9100"' /tmp/tls.yaml
+          if grep -q 'forecastServiceURL: http://' /tmp/tls.yaml; then
+            echo "::error::a plaintext forecastServiceURL was rendered under TLS"; exit 1
+          fi
+          if helm template predictive helm/predictive-stack/ -n predictive --set global.tls.enabled=true > /dev/null 2>&1; then
+            echo "::error::global.tls.enabled without an issuer rendered"; exit 1
+          fi
+          # alert-driven retraining: Alertmanager routes the two alerts to the trigger,
+          # the trigger has the CronJob/Jobs RBAC and the shared token, Prometheus
+          # knows the Alertmanager (builtin config and the operator CR)
+          grep -q 'alertmanager:9093' /tmp/prod.yaml || grep -q 'name: alertmanager' /tmp/prod.yaml
+          grep -q 'url: http://retrain-trigger:8080/alertmanager' /tmp/prod.yaml
+          grep -q 'alertname =~ "ForecastDriftHigh|ForecastBreakerOpenLong"' /tmp/prod.yaml
+          grep -q 'forecast_training.trigger' /tmp/prod.yaml
+          grep -q 'resourceNames: \[forecast-retrain\]' /tmp/prod.yaml
+          test "$(grep -c 'name: retrain-trigger-token' /tmp/prod.yaml)" -ge 2
+          grep -q 'secretName: retrain-trigger-token' /tmp/prod.yaml
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set alertmanager.enabled=true --set training.trigger.enabled=true | grep -q 'targets: \[alertmanager:9093\]'
+          # default-deny ingress with the pilot profile
+          helm template predictive helm/predictive-stack/ -n predictive -f helm/predictive-stack/values-pilot.yaml \
+            -f helm/predictive-stack/ci/workloads-values.yaml > /tmp/pilot.yaml
+          grep -q 'name: default-deny-ingress' /tmp/pilot.yaml
+          test "$(grep -c '^kind: NetworkPolicy$' /tmp/pilot.yaml)" -ge 8
+          # the default profile renders no PDB (single replicas) but the same probes
+          if grep -q '^kind: PodDisruptionBudget$' /tmp/stack.yaml; then
+            echo "::error::a PodDisruptionBudget was rendered for single-replica defaults"; exit 1
+          fi
           # nothing to train on yet (pilot before its workloads are added): no CronJob,
           # no broken query — the release must still install so KEDA's CRDs land
           helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /tmp/empty.yaml

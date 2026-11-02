@@ -5,6 +5,39 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 
 ## Unreleased
 
+### Production (PR #9) — docs/production-blueprint.md applied
+
+- **HA without shared state.** The scaler scores its own forecasts from the
+  history it fetches (`predictive_scaler_forecast_abs_error{step}`,
+  `ForecastDriftHigh` reads it); serving polls the registry alias
+  (`MODEL_REFRESH_SECONDS`) and keeps a last-known-good model cache
+  (`MODEL_CACHE_DIR`); subcharts 0.3.0 with PDBs, rolling-update strategy,
+  anti-affinity, spread, startup probes, read-only root; `values-prod.yaml`.
+- **MLflow on PostgreSQL + object storage** (`mlflow.backendStore`,
+  `mlflow.artifacts`, replicas, PDB, `mlflow db upgrade` hook, basic-auth,
+  client credentials); `mlflow/Dockerfile` → `mlflow-server` image.
+- **Prometheus modes:** builtin, Prometheus Operator CR with Thanos sidecar,
+  external (Thanos Query / VictoriaMetrics); `workload:demand` recording
+  rules per workload and `prometheus.recordDemand`; `prometheus.trainingUrl`.
+- **Circuit breaker** in the scaler (residual, level, jump signals; open /
+  half-open / closed with hold and backoff), `forecastSurgeFactor`,
+  `reactiveFloor` CPU trigger, `ForecastBreakerOpenLong` alert and runbook,
+  `SPIKE` in the benchmark load generator.
+- **Mutual TLS** on both loops from cert-manager (`global.tls`): scaler gRPC
+  server with a plaintext health port, scaler and training clients, uvicorn
+  with client-certificate verification and a plain metrics port, the
+  forecast ingress with backend mTLS, KEDA `TriggerAuthentication`;
+  default-deny ingress network policies; cert-manager in `up.sh TLS=1` and
+  the kind e2e.
+- **Alert-driven retraining:** `forecast_training.trigger` (Alertmanager
+  webhook → Job cloned from the CronJob, breaker intervals excluded,
+  `TRAIN_REASON` tag), `training.trigger` and `alertmanager` in the chart.
+- **Multivariate channels:** `channels` in the model contract (format 4),
+  per-channel scalers, `--channel NAME=PromQL`, `/predict` with one list per
+  channel, scaler `channels`/`targetChannel`, `workloads[].channels`.
+
+### Models (PR #8)
+
 - **Selection by cost, not RMSE.** Candidates are ranked by an asymmetric
   cost: a unit of demand the forecast missed is worth `--under-weight`
   (default 3) idle units; `coverage` is logged next to RMSE and MAE. The

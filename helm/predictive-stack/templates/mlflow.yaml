@@ -1,5 +1,12 @@
 {{- if .Values.mlflow.enabled }}
-{{- if .Values.mlflow.persistence.enabled }}
+{{- $m := .Values.mlflow }}
+{{- $external := ne $m.backendStore.existingSecret "" }}
+{{- $volume := and $m.persistence.enabled (not $external) }}
+{{- $image := printf "%s:%s" $m.image.repository ($m.image.tag | default .Values.global.imageTag) }}
+{{- if and (gt (int $m.replicas) 1) (not $external) }}
+{{- fail "mlflow.replicas > 1 needs mlflow.backendStore.existingSecret (SQLite is single-writer)" }}
+{{- end }}
+{{- if $volume }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -9,14 +16,26 @@ metadata:
     {{- include "predictive-stack.labels" . | nindent 4 }}
 spec:
   accessModes: [ReadWriteOnce]
-  {{- with .Values.mlflow.persistence.storageClass }}
+  {{- with $m.persistence.storageClass }}
   storageClassName: {{ . | quote }}
   {{- end }}
   resources:
     requests:
-      storage: {{ .Values.mlflow.persistence.size }}
+      storage: {{ $m.persistence.size }}
 ---
 {{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mlflow
+  labels:
+    app: mlflow
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+  {{- with $m.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,9 +44,15 @@ metadata:
     app: mlflow
     {{- include "predictive-stack.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ $m.replicas }}
   strategy:
+    {{- if $external }}
+    # stateless against Postgres + object store: ordinary rolling update
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+    {{- else }}
     type: Recreate        # the PVC is ReadWriteOnce and SQLite is single-writer
+    {{- end }}
   selector:
     matchLabels:
       app: mlflow
@@ -36,20 +61,58 @@ spec:
       labels:
         app: mlflow
     spec:
+      serviceAccountName: mlflow
+      automountServiceAccountToken: false
+      {{- if $external }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: {app: mlflow}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
       containers:
         - name: mlflow
-          image: {{ .Values.mlflow.image | quote }}
+          image: {{ $image | quote }}
           command:
             - mlflow
             - server
             - --host=0.0.0.0
             - --port=5000
+            - --workers={{ $m.workers }}
+            {{- if $external }}
+            - --backend-store-uri=$(MLFLOW_BACKEND_STORE_URI)
+            {{- else }}
             - --backend-store-uri=sqlite:////mlflow/mlflow.db
+            {{- end }}
             # Clients upload artifacts through the server (no shared volume,
-            # no node IP): mlflow-artifacts:/ resolves against the tracking URI.
+            # no node IP, no object-store credentials outside this pod):
+            # mlflow-artifacts:/ resolves against the tracking URI.
             - --default-artifact-root=mlflow-artifacts:/
             - --serve-artifacts
-            - --artifacts-destination=/mlflow/artifacts
+            - --artifacts-destination={{ $m.artifacts.destination }}
+            {{- if $m.auth.enabled }}
+            - --app-name=basic-auth
+            {{- end }}
+          env:
+            {{- if $external }}
+            - name: MLFLOW_BACKEND_STORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $m.backendStore.existingSecret }}
+                  key: {{ $m.backendStore.secretKey }}
+            {{- end }}
+            {{- if $m.auth.enabled }}
+            - name: MLFLOW_AUTH_CONFIG_PATH
+              value: /etc/mlflow-auth/basic_auth.ini
+            {{- end }}
+          {{- with $m.artifacts.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 5000
@@ -67,18 +130,36 @@ spec:
             initialDelaySeconds: 60
             periodSeconds: 20
           resources:
-            {{- toYaml .Values.mlflow.resources | nindent 12 }}
+            {{- toYaml $m.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
+            {{- if not $external }}
             - name: storage
               mountPath: /mlflow
+            {{- end }}
+            {{- if $m.auth.enabled }}
+            - name: auth
+              mountPath: /etc/mlflow-auth
+              readOnly: true
+            {{- end }}
       volumes:
+        {{- if not $external }}
         - name: storage
-          {{- if .Values.mlflow.persistence.enabled }}
+          {{- if $volume }}
           persistentVolumeClaim:
             claimName: mlflow
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
+        {{- if $m.auth.enabled }}
+        - name: auth
+          secret:
+            secretName: {{ required "mlflow.auth.existingSecret is required with mlflow.auth.enabled" $m.auth.existingSecret }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -95,4 +176,63 @@ spec:
     - name: http
       port: 5000
       targetPort: http
+{{- if $m.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mlflow
+  labels:
+    app: mlflow
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ $m.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: mlflow
+{{- end }}
+{{- if and $external $m.dbUpgradeHook }}
+---
+# Pre-upgrade: migrate the backend store schema with the same image the servers
+# run, before any new server starts. Fails the upgrade (and keeps the old
+# release) if the migration fails.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mlflow-db-upgrade-{{ .Release.Revision }}
+  labels:
+    app: mlflow-db-upgrade
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app: mlflow-db-upgrade
+    spec:
+      restartPolicy: Never
+      serviceAccountName: mlflow
+      automountServiceAccountToken: false
+      containers:
+        - name: upgrade
+          image: {{ $image | quote }}
+          command: ["mlflow", "db", "upgrade", "$(MLFLOW_BACKEND_STORE_URI)"]
+          env:
+            - name: MLFLOW_BACKEND_STORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $m.backendStore.existingSecret }}
+                  key: {{ $m.backendStore.secretKey }}
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+{{- end }}
 {{- end }}
