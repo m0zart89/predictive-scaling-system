@@ -101,6 +101,7 @@ spec:
         breakerResidualZ: {{ $w.breakerResidualZ | default $d.breakerResidualZ | quote }}
         breakerLevelShift: {{ $w.breakerLevelShift | default $d.breakerLevelShift | quote }}
         breakerJumpFactor: {{ $w.breakerJumpFactor | default $d.breakerJumpFactor | quote }}
+        breakerJumpMinSamples: {{ $w.breakerJumpMinSamples | default $d.breakerJumpMinSamples | quote }}
         breakerMinOpenSeconds: {{ $w.breakerMinOpenSeconds | default $d.breakerMinOpenSeconds | quote }}
         breakerCalmPolls: {{ $w.breakerCalmPolls | default $d.breakerCalmPolls | quote }}
 {{- if $root.Values.global.tls.enabled }}

@@ -15,7 +15,8 @@ class Clock:
 
 def breaker(**kw):
     clock = Clock()
-    cfg = BreakerConfig(**{"residual_min": 4, "calm_polls": 2, "min_open_seconds": 60, **kw})
+    cfg = BreakerConfig(**{"residual_min": 4, "calm_polls": 2, "min_open_seconds": 60,
+                           "jump_min_samples": 8, **kw})
     return CircuitBreaker(cfg, clock=clock), clock
 
 
@@ -112,3 +113,16 @@ def test_config_rejects_bad_breaker_values():
         make_config(breaker="maybe")
     with pytest.raises(ConfigError, match="breakerLevelShift"):
         make_config(breakerLevelShift="1")
+
+
+def test_jump_needs_enough_history_to_know_what_a_normal_rise_is():
+    """A workload minutes old (the e2e, a fresh ScaledObject): every ramp would be
+    a "jump" against a history that holds nothing yet. The signal waits for
+    jump_min_samples known samples."""
+    b, _ = breaker(jump_min_samples=20)
+    short = [None] * 10 + [1.0, 1.1, 1.0, 1.05, 1.0]              # 5 known samples
+    b.observe("a", 1.0, short, 0)
+    assert b.observe("a", 5.0, short + [5.0], 0).use_forecast        # not enough history: no verdict
+    long = [1.0, 1.1] * 10                                           # 20 known samples
+    b.observe("b", 1.0, long, 0)
+    assert b.observe("b", 5.0, long + [5.0], 0).tripped == "jump"

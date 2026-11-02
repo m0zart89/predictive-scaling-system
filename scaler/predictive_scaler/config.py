@@ -67,6 +67,7 @@ class ScalerConfig:
     breaker_residual_z: float = 4.0
     breaker_level_shift: float = 2.5
     breaker_jump_factor: float = 2.0
+    breaker_jump_min_samples: int = 48
     breaker_min_open_seconds: float = 600.0
     breaker_calm_polls: int = 6
 
@@ -182,6 +183,7 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
         breaker_residual_z=_positive_float(meta, "breakerResidualZ", default=4.0),
         breaker_level_shift=level_shift,
         breaker_jump_factor=_positive_float(meta, "breakerJumpFactor", default=2.0),
+        breaker_jump_min_samples=_positive_int(meta, "breakerJumpMinSamples", default=48),
         breaker_min_open_seconds=_positive_float(meta, "breakerMinOpenSeconds", default=600.0),
         breaker_calm_polls=_positive_int(meta, "breakerCalmPolls", default=6),
     )

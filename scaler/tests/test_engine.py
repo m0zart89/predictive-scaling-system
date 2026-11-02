@@ -298,7 +298,7 @@ def test_breaker_opens_on_a_jump_and_the_decision_turns_reactive(metrics, regist
     history = [0.2, 0.25, 0.2, 0.3, 0.25, 0.2, 0.3, 0.25, 0.2, 0.3]
     prom = FakePrometheus(history)
     eng = engine_with(metrics, prom, fc)
-    cfg = make_config(cacheSeconds="0")
+    cfg = make_config(cacheSeconds="0", breakerJumpMinSamples="5")
     d = eng.decide(NS, NAME, cfg)
     assert d.source == "forecast" and d.value == pytest.approx(0.9)    # 2.0 capped at 3 x 0.3
     assert registry.get_sample_value("predictive_scaler_breaker_open", labels()) == 0

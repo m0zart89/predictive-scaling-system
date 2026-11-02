@@ -110,7 +110,8 @@ class PredictiveEngine:
                 enabled=cfg.breaker, residual_z=cfg.breaker_residual_z,
                 residual_z_hard=2 * cfg.breaker_residual_z,
                 level_shift_high=cfg.breaker_level_shift, level_shift_low=1 / cfg.breaker_level_shift,
-                jump_factor=cfg.breaker_jump_factor, min_open_seconds=cfg.breaker_min_open_seconds,
+                jump_factor=cfg.breaker_jump_factor, jump_min_samples=cfg.breaker_jump_min_samples,
+                min_open_seconds=cfg.breaker_min_open_seconds,
                 max_open_seconds=max(cfg.breaker_min_open_seconds, 3600.0),
                 calm_polls=cfg.breaker_calm_polls), clock=time.time)
         return self._breakers[bk]

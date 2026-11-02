@@ -50,6 +50,8 @@ class BreakerConfig:
     level_shift_low: float = 0.4
     level_shift_polls: int = 3
     jump_factor: float = 2.0           # vs the largest one-step rise in the history
+    jump_min_samples: int = 48         # samples the history must hold before a rise can be "unusual"
+                                       # (a workload minutes old has no normal to compare with)
     min_open_seconds: float = 600.0
     max_open_seconds: float = 3600.0
     calm_polls: int = 6
@@ -122,8 +124,9 @@ class CircuitBreaker:
         else:
             st.hot_level = 0
 
-        # 3. a jump the history never contained
-        if st.last_observed is not None:
+        # 3. a jump the history never contained (once the history is long enough to know)
+        known = sum(1 for v in history if v is not None)
+        if st.last_observed is not None and known >= cfg.jump_min_samples:
             rise = observed - st.last_observed
             biggest = _max_rise(history)
             if biggest > 0 and rise > cfg.jump_factor * biggest:

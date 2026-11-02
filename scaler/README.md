@@ -32,6 +32,7 @@ query (at least the `timeSteps` window), sends them to `forecast-serving`'s
 | `breakerResidualZ` | no | `4` | residual signal: robust z-score of (actual − forecast made for now) that trips on two consecutive polls (twice it trips at once) |
 | `breakerLevelShift` | no | `2.5` | level signal: observed / value one season ago above this (or below its inverse) for `breakerCalmPolls` polls |
 | `breakerJumpFactor` | no | `2` | jump signal: a one-step rise larger than this × the largest rise in the fetched history |
+| `breakerJumpMinSamples` | no | `48` | the jump signal waits until the history holds this many samples (a workload minutes old has no normal to compare with) |
 | `breakerMinOpenSeconds` | no | `600` | minimum time the breaker stays open; doubles on a re-trip while half-open (up to 1 h) |
 | `breakerCalmPolls` | no | `6` | consecutive calm polls needed to close from half-open |
 | `channels` | no | — | multivariate models: JSON object of extra input series, channel name → PromQL, sent next to the demand series (`/model-info` lists the model's channels) |

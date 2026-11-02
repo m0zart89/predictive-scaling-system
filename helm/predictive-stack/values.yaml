@@ -244,6 +244,7 @@ scalerDefaults:
   breakerResidualZ: "4"
   breakerLevelShift: "2.5"
   breakerJumpFactor: "2"
+  breakerJumpMinSamples: "48"   # history needed before a rise can count as unusual (4 h at 5 min)
   breakerMinOpenSeconds: "600"
   breakerCalmPolls: "6"
   # Name of the demand series when a workload lists extra channels (see

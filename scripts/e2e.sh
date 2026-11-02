@@ -105,9 +105,17 @@ max_pods=$(promq "max_over_time((count(up{app=\"cpu-burner\"} == 1))[$((LOAD_SEC
 replicas_after=$(k get deploy cpu-burner -o jsonpath='{.status.replicas}')
 rescales=$(k get events --field-selector reason=SuccessfulRescale -o name 2>/dev/null | wc -l)
 mae=$(promq 'max(forecast_rolling_mae)')
+failures=$(icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query" --data-urlencode 'query=sum by (reason) (predictive_scaler_forecast_failures_total)' \
+  | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(", ".join(f"{x[\"metric\"].get(\"reason\",\"?\")}={x[\"value\"][1]}" for x in r) or "none")' 2>/dev/null || echo "n/a")
+trips=$(icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query" --data-urlencode 'query=sum by (reason) (predictive_scaler_breaker_trips_total)' \
+  | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(", ".join(f"{x[\"metric\"].get(\"reason\",\"?\")}={x[\"value\"][1]}" for x in r) or "none")' 2>/dev/null || echo "n/a")
+breaker_open=$(promq 'max(predictive_scaler_breaker_open) or vector(0)')
+scaler_mae=$(promq 'max(rate(predictive_scaler_forecast_abs_error_sum[10m]) / rate(predictive_scaler_forecast_abs_error_count[10m]))')
 
 {
   echo "forecast decisions: $before_forecast -> $after_forecast (observed-demand decisions: $observed)"
+  echo "forecast failures by reason: $failures; breaker trips by reason: $trips; breaker open now: ${breaker_open:-n/a}"
+  echo "scaler-side forecast MAE, step max over 10m (model units): ${scaler_mae:-n/a}"
   echo "desired replicas (max): ${max_desired:-n/a}; scraped cpu-burner pods (max): ${max_pods:-n/a}"
   echo "cpu-burner replicas: $replicas_before -> $replicas_after; SuccessfulRescale events: $rescales"
   echo "forecast rolling MAE (max over steps): ${mae:-n/a}"
