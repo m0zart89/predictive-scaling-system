@@ -297,7 +297,7 @@ def test_reload_requires_the_token_when_one_is_configured(registry, serving, mon
         def read(self):
             return b"{}"
 
-    def fake_urlopen(req, timeout):
+    def fake_urlopen(req, timeout, context=None):
         seen["token"] = req.get_header("X-reload-token")
         return Resp()
 
