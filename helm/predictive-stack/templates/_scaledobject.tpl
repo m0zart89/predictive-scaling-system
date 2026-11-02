@@ -64,9 +64,10 @@ spec:
       metricType: AverageValue
       metadata:
         scalerAddress: predictive-scaler.{{ $root.Release.Namespace }}.svc.cluster.local:6000
-        prometheusServerAddress: {{ $w.prometheusServerAddress | default (printf "http://prometheus.%s.svc.cluster.local:9090" $root.Release.Namespace) }}
-        # Total demand, independent of replica count (aggregate to one series).
-        query: {{ $w.query | quote }}
+        prometheusServerAddress: {{ $w.prometheusServerAddress | default (include "predictive-stack.prometheusUrl" $root) }}
+        # Total demand, independent of replica count (aggregate to one series);
+        # the recorded workload:demand series with prometheus.recordDemand.
+        query: {{ include "predictive-stack.demandQuery" (dict "root" $root "name" $w.name "query" $w.query) | quote }}
         forecastServiceURL: http://forecast-serving.{{ $root.Release.Namespace }}.svc.cluster.local:8080
         targetValue: {{ $w.targetValue | quote }}
         # model input = demand / capacity: the model is trained on that series
@@ -83,6 +84,25 @@ spec:
         activationValue: {{ $w.activationValue | default $d.activationValue | quote }}
         cacheSeconds: {{ $w.cacheSeconds | default $d.cacheSeconds | quote }}
         timeoutSeconds: {{ $w.timeoutSeconds | default $d.timeoutSeconds | quote }}
+        # mode=max guard: the forecast may exceed observed demand by at most this factor
+        forecastSurgeFactor: {{ $w.forecastSurgeFactor | default $d.forecastSurgeFactor | quote }}
+        # circuit breaker: reactive scaling while the series does not resemble the history
+        breaker: {{ $w.breaker | default $d.breaker | quote }}
+        breakerResidualZ: {{ $w.breakerResidualZ | default $d.breakerResidualZ | quote }}
+        breakerLevelShift: {{ $w.breakerLevelShift | default $d.breakerLevelShift | quote }}
+        breakerJumpFactor: {{ $w.breakerJumpFactor | default $d.breakerJumpFactor | quote }}
+        breakerMinOpenSeconds: {{ $w.breakerMinOpenSeconds | default $d.breakerMinOpenSeconds | quote }}
+        breakerCalmPolls: {{ $w.breakerCalmPolls | default $d.breakerCalmPolls | quote }}
+{{- $floor := $w.reactiveFloor | default $d.reactiveFloor }}
+{{- if $floor.enabled }}
+    # Reactive floor: a plain CPU trigger next to the predictive one. KEDA takes
+    # the larger desired count, so the workload still scales on CPU when the
+    # breaker is open or the scaler is in trouble.
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: {{ $floor.cpuUtilization | quote }}
+{{- end }}
 {{- end }}
 
 {{/*

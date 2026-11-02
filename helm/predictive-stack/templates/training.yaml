@@ -3,7 +3,7 @@
 {{- $tw := include "predictive-stack.trainingWorkload" . | fromYaml }}
 {{- $query := $t.cronjob.query }}
 {{- if and (not $query) $tw.query }}
-{{- $query = printf "(%s) / %s" $tw.query $tw.capacity }}
+{{- $query = printf "(%s) / %s" (include "predictive-stack.demandQuery" (dict "root" . "name" $tw.name "query" $tw.query)) $tw.capacity }}
 {{- end }}
 {{- /* No query and no workload (a pilot before its workloads are added): no
        CronJob rather than one that would fail every night. NOTES.txt says so. */}}
@@ -49,7 +49,7 @@ spec:
                 - name: MLFLOW_TRACKING_URI
                   value: http://mlflow:5000
                 - name: TRAIN_PROMETHEUS_URL
-                  value: http://prometheus:9090
+                  value: {{ include "predictive-stack.trainingPrometheusUrl" . | quote }}
                 # Model units: the scaler feeds the model demand / capacity, so the
                 # model is trained on exactly that series of training.workload.
                 - name: TRAIN_QUERY

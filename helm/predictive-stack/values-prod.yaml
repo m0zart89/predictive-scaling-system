@@ -110,7 +110,23 @@ mlflow:
     limits: {cpu: "1", memory: 1Gi}
 
 # ── platform ───────────────────────────────────────────────────────────────────
+# Prometheus Operator: an HA pair; add the Thanos sidecar (Secret
+# thanos-objstore with objstore.yml) for history beyond local retention and
+# point the training jobs at Thanos Query. Without the operator in the
+# cluster set mode: builtin (a single Prometheus on a 50Gi volume, 30 days).
 prometheus:
+  mode: operator
+  operator:
+    replicas: 2
+    retention: 15d
+    retentionSize: 80GB
+    size: 100Gi
+    externalLabels: {}
+    thanos:
+      enabled: false
+      # objectStorageSecret: thanos-objstore
+  # trainingUrl: http://thanos-query.monitoring.svc:9090
+  recordDemand: true
   retention: 30d
   persistence:
     enabled: true
@@ -138,5 +154,15 @@ training:
   resources:
     requests: {cpu: "1", memory: 1Gi}
     limits: {cpu: "4", memory: 2Gi}
+
+scalerDefaults:
+  stepSeconds: "300"
+  mode: max
+  forecastAggregation: max
+  forecastSurgeFactor: "3"
+  breaker: "on"
+  reactiveFloor:
+    enabled: true           # KEDA scales on CPU as well; the forecast only adds capacity earlier
+    cpuUtilization: "70"
 
 workloads: []

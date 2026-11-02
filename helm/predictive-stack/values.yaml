@@ -96,6 +96,38 @@ mlflow:
 
 prometheus:
   enabled: true
+  # builtin:  the chart's own single Prometheus (Deployment, PVC, rules ConfigMap).
+  # operator: a Prometheus CR for the Prometheus Operator — an HA pair with an
+  #           optional Thanos sidecar — plus PodMonitors and a PrometheusRule
+  #           carrying the same rules. The chart still renders the `prometheus`
+  #           Service the other components use.
+  # external: nothing is deployed; the scaler, the training jobs and Grafana use
+  #           external.url (Thanos Query, VictoriaMetrics, a central Prometheus).
+  mode: builtin
+  external:
+    url: ""                 # e.g. http://thanos-query.monitoring.svc:9090
+  operator:
+    name: predictive
+    replicas: 2
+    retention: 15d          # local; the object store keeps the rest
+    retentionSize: 80GB
+    storageClass: ""
+    size: 100Gi
+    externalLabels: {}      # cluster: prod-eu-1
+    thanos:
+      enabled: false
+      image: quay.io/thanos/thanos:v0.37.2
+      objectStorageSecret: thanos-objstore    # key objstore.yml
+      objectStorageKey: objstore.yml
+  # Where the training jobs read history: "" = the same endpoint the scaler
+  # uses. Point it at Thanos Query to train on history beyond local retention.
+  trainingUrl: ""
+  # Record every workload's demand query as workload:demand{workload="<name>"}
+  # (evaluated every minute) and point the ScaledObjects and the training job
+  # at the recorded series instead of the raw query: cheap over 30 days,
+  # identical from local TSDB or the store gateway, and scaler and model read
+  # the same numbers by construction. The rules are rendered either way.
+  recordDemand: false
   image: prom/prometheus:v2.51.0
   scrapeInterval: 15s
   evaluationInterval: 30s
@@ -168,6 +200,25 @@ scalerDefaults:
   forecastAggregation: max
   activationValue: "0"
   cacheSeconds: "15"
+  # mode=max guard: the forecast may exceed observed demand by at most this
+  # factor ("0" = no cap).
+  forecastSurgeFactor: "3"
+  # Circuit breaker (scaler/README.md): while the series does not resemble the
+  # history the model learned — a jump larger than any in the fetched history,
+  # a level far from one season ago, forecasts wrong by more than the noise —
+  # the scaler reports observed demand only and exports
+  # predictive_scaler_breaker_open=1 so retraining can exclude the interval.
+  breaker: "on"
+  breakerResidualZ: "4"
+  breakerLevelShift: "2.5"
+  breakerJumpFactor: "2"
+  breakerMinOpenSeconds: "600"
+  breakerCalmPolls: "6"
+  # Always-on reactive floor: a plain CPU trigger on the same ScaledObject
+  # (KEDA takes the larger desired count). Needs CPU requests on the pods.
+  reactiveFloor:
+    enabled: false
+    cpuUtilization: "70"
   timeoutSeconds: "3"
   pollingInterval: 15
   cooldownPeriod: 300

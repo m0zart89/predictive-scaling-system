@@ -43,6 +43,7 @@ jobs:
         env:
           # Fast-fail MLflow connection attempts during tests (no live MLflow server in CI)
           MLFLOW_HTTP_REQUEST_TIMEOUT: "3"
+          MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
           MLFLOW_TRACKING_URI: "http://127.0.0.1:1"
 
   test-training:
@@ -252,6 +253,29 @@ jobs:
           if grep -q 'claimName: mlflow' /tmp/mlflow.yaml; then
             echo "::error::MLflow still mounts a PVC with an external backend store"; exit 1
           fi
+          # Prometheus modes: operator renders the CR, PodMonitors and a PrometheusRule
+          # with the demand recording rule, no Deployment; external renders nothing
+          # and points the scaler, Grafana and the training job at the URL
+          grep -q '^kind: Prometheus$' /tmp/prod.yaml
+          grep -q '^kind: PrometheusRule$' /tmp/prod.yaml
+          grep -q 'record: workload:demand' /tmp/prod.yaml
+          grep -q 'alert: ForecastDriftHigh' /tmp/prod.yaml
+          if grep -q 'name: prometheus-config' /tmp/prod.yaml; then
+            echo "::error::the builtin Prometheus was rendered in operator mode"; exit 1
+          fi
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set prometheus.mode=external --set prometheus.external.url=http://thanos-query.monitoring.svc:9090 \
+            --set prometheus.recordDemand=true > /tmp/external.yaml
+          grep -q 'prometheusServerAddress: http://thanos-query.monitoring.svc:9090' /tmp/external.yaml
+          grep -q 'url: http://thanos-query.monitoring.svc:9090' /tmp/external.yaml
+          grep -q 'value: "http://thanos-query.monitoring.svc:9090"' /tmp/external.yaml
+          grep -Fq 'query: "workload:demand{workload=\"cpu-burner\"}"' /tmp/external.yaml
+          grep -Fq '(workload:demand{workload=\"cpu-burner\"}) / 2.5' /tmp/external.yaml
+          if grep -q '^kind: Prometheus$\|name: prometheus-config' /tmp/external.yaml; then
+            echo "::error::a Prometheus was rendered in external mode"; exit 1
+          fi
+          # the builtin default still carries the demand rule next to the alert rules
+          grep -q 'record: workload:demand' /tmp/stack.yaml
           # replicas > 1 on SQLite must be refused
           if helm template predictive helm/predictive-stack/ -n predictive --set mlflow.replicas=2 > /dev/null 2>&1; then
             echo "::error::mlflow.replicas=2 on SQLite rendered"; exit 1

@@ -1,5 +1,6 @@
-{{- if .Values.prometheus.enabled }}
-{{- if .Values.prometheus.persistence.enabled }}
+{{- if and .Values.prometheus.enabled (ne .Values.prometheus.mode "external") }}
+{{- $builtin := eq .Values.prometheus.mode "builtin" }}
+{{- if and $builtin .Values.prometheus.persistence.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -17,6 +18,7 @@ spec:
       storage: {{ .Values.prometheus.persistence.size }}
 ---
 {{- end }}
+{{- if $builtin }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -79,7 +81,11 @@ metadata:
 data:
   # Synced from monitoring/prometheus-rules.yaml by `python monitoring/render.py`.
 {{ (.Files.Glob "files/rules/*.yml").AsConfig | indent 2 }}
+  # Demand of every scaled workload, recorded once a minute (see prometheus.recordDemand).
+  demand.yml: |
+{{ include "predictive-stack.demandRules" . | indent 4 }}
 ---
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -114,6 +120,7 @@ subjects:
   - kind: ServiceAccount
     name: prometheus
     namespace: {{ .Release.Namespace }}
+{{- if $builtin }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -186,7 +193,10 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+{{- end }}
 ---
+# The address every component uses; with mode=operator it fronts the pods the
+# operator runs for the Prometheus CR (labelled prometheus=<name>).
 apiVersion: v1
 kind: Service
 metadata:
@@ -197,9 +207,13 @@ metadata:
 spec:
   type: ClusterIP
   selector:
+    {{- if $builtin }}
     app: prometheus
+    {{- else }}
+    prometheus: {{ .Values.prometheus.operator.name }}
+    {{- end }}
   ports:
     - name: http
       port: 9090
-      targetPort: http
+      targetPort: {{ if $builtin }}http{{ else }}9090{{ end }}
 {{- end }}

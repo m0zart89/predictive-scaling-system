@@ -338,8 +338,13 @@ def test_cache_serves_the_last_known_good_model_while_the_registry_is_down(regis
     expected = serving.post("/predict", json={"values": window}).json()["predictions"]
     assert (tmp_path / "cache" / "champion" / "cache.json").exists()
 
-    # registry gone, process restarted
-    monkeypatch.setattr(serving_app, "MLFLOW_TRACKING_URI", "http://127.0.0.1:1")
+    # registry gone, process restarted (fail fast instead of MLflow's retry backoff)
+    resolve = serving_app._resolve_version
+
+    def registry_down(client):
+        raise ConnectionError("mlflow unreachable")
+
+    monkeypatch.setattr(serving_app, "_resolve_version", registry_down)
     monkeypatch.setattr(serving_app, "MODEL_RETRY_SECONDS", 0.0)
     monkeypatch.setattr(serving_app, "_bundle", None)
     serving_app._stop_loading.clear()                         # an earlier TestClient's shutdown set it
@@ -354,7 +359,7 @@ def test_cache_serves_the_last_known_good_model_while_the_registry_is_down(regis
 
     assert serving_app.refresh_model() is False                # registry still down: keep serving
     assert serving.get("/model-info").json()["model_stage"] == "cache"
-    monkeypatch.setattr(serving_app, "MLFLOW_TRACKING_URI", registry)
+    monkeypatch.setattr(serving_app, "_resolve_version", resolve)
     assert serving_app.refresh_model() is True                 # back: the registry copy replaces the cache
     assert serving.get("/model-info").json()["model_stage"] == "@champion"
 
