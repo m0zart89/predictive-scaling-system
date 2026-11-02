@@ -6,6 +6,24 @@
 
 replicaCount: 1
 
+# Production: 2 replicas, maxUnavailable 1, required anti-affinity (see
+# helm/predictive-stack/values-prod.yaml). Replicas share nothing: the
+# decision cache is per pod and bounded by cacheSeconds, and each replica
+# scores the forecasts it made from the history it fetches.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: ""
+  maxUnavailable: 1
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+priorityClassName: ""
+# Finish in-flight GetMetrics calls before SIGKILL.
+terminationGracePeriodSeconds: 20
+topologySpreadConstraints: []
+
 # Set by the predictive-stack umbrella chart; standalone installs use image.tag.
 global:
   imageTag: ""

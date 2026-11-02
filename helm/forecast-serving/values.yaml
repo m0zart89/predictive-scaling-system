@@ -3,6 +3,30 @@
 
 replicaCount: 1
 
+# Production: 3 replicas, minAvailable 2, required anti-affinity (see
+# helm/predictive-stack/values-prod.yaml). The service is stateless: every
+# replica follows the registry alias itself (model.refreshSeconds) and keeps
+# a last-known-good copy of the model in an emptyDir.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: ""        # e.g. 2; empty = maxUnavailable
+  maxUnavailable: 1
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+priorityClassName: ""
+terminationGracePeriodSeconds: 30
+topologySpreadConstraints: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Extra environment for the container (list of EnvVar), and Secrets/ConfigMaps
+# to load whole (list of EnvFromSource), e.g. MLflow client credentials.
+extraEnv: []
+extraEnvFrom: []
+
 # Set by the predictive-stack umbrella chart; standalone installs use image.tag.
 global:
   imageTag: ""
@@ -80,6 +104,28 @@ model:
   stage: "Production"
   # Window size for legacy models only; newer models carry it in forecast_meta.json
   timeSteps: "10"
+  # Check the alias this often and reload when it moved ("0" = only on /reload).
+  refreshSeconds: "60"
+
+# Last-known-good model cache (emptyDir at /cache): a pod that restarts while
+# MLflow is down serves the cached champion (model_stage "cache").
+cache:
+  sizeLimit: 256Mi
+
+# forecast-serving's in-process scoring of its forecasts (forecast_rolling_mae).
+# Exact with one replica only; with several, the scaler's own scoring
+# (predictive_scaler_forecast_abs_error) is the source and this is set to "0".
+quality:
+  maxSeries: "64"
+
+# Model download + unpickle can take a while on a cold registry; the startup
+# probe keeps liveness from killing the pod meanwhile.
+startupProbe:
+  httpGet:
+    path: /live
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 60
 
 # /live — process is running (does not require model to be loaded)
 # /ready — model is loaded and inference is possible

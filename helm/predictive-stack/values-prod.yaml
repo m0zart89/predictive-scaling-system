@@ -1,0 +1,142 @@
+# Production profile: the pilot profile plus high availability, resource
+# envelopes, hardening and the platform settings from docs/production-blueprint.md.
+#
+#   helm dependency build helm/predictive-stack
+#   helm upgrade --install predictive helm/predictive-stack -n predictive --create-namespace \
+#     -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml \
+#     --set global.imageTag=<sha>
+#
+# Secrets referenced here (mlflow-backend, mlflow-basic-auth, mlflow-client,
+# thanos-objstore) are expected to exist, e.g. from External Secrets Operator;
+# nothing in this file carries a credential.
+
+demo:
+  enabled: false
+
+# ── forecast-serving: 3 replicas, 2 must stay up, one per node ─────────────────
+forecast-serving:
+  replicaCount: 3
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "2", memory: 1Gi}        # no CPU throttling of inference on a spike
+  priorityClassName: ""                    # e.g. platform-critical, if the cluster defines it
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: {app.kubernetes.io/name: forecast-serving}
+          topologyKey: kubernetes.io/hostname
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels: {app.kubernetes.io/name: forecast-serving}
+  model:
+    refreshSeconds: "60"
+  # With several replicas the scaler's own scoring is the source of the live
+  # error (predictive_scaler_forecast_abs_error); the in-process tracker is off.
+  quality:
+    maxSeries: "0"
+
+# ── predictive-scaler: 2 replicas, one per node ────────────────────────────────
+predictive-scaler:
+  replicaCount: 2
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  priorityClassName: ""
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: {app.kubernetes.io/name: predictive-scaler}
+          topologyKey: kubernetes.io/hostname
+
+# ── KEDA: leader-elected operator pair, two metrics API servers ────────────────
+# The metrics API server is on every HPA's hot path; a single replica stalls
+# all of them during its restarts.
+keda:
+  operator:
+    replicaCount: 2
+  metricsServer:
+    replicaCount: 2
+  webhooks:
+    replicaCount: 2
+  resources:
+    operator:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+    metricServer:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+
+# ── MLflow: stateless servers on PostgreSQL + object store ─────────────────────
+# Create the Secrets first (e.g. External Secrets Operator):
+#   mlflow-backend     MLFLOW_BACKEND_STORE_URI=postgresql+psycopg2://mlflow:***@host:5432/mlflow?sslmode=require
+#   mlflow-basic-auth  basic_auth.ini (admin_username, admin_password, database_uri=postgresql://...)
+#   mlflow-client      MLFLOW_TRACKING_USERNAME / MLFLOW_TRACKING_PASSWORD (training + serving)
+# and uncomment backendStore.existingSecret. Until then this profile keeps
+# SQLite on the PVC so it still installs on a cluster without a database.
+mlflow:
+  image:
+    repository: ghcr.io/m0zart89/predictive-scaling-system/mlflow-server
+    tag: ""                 # global.imageTag
+  # replicas: 2
+  workers: 4
+  # backendStore:
+  #   existingSecret: mlflow-backend
+  # artifacts:
+  #   destination: s3://acme-mlops-prod/predictive-scaling/mlflow
+  # serviceAccount:
+  #   annotations:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/mlflow-artifacts
+  # auth:
+  #   enabled: true
+  #   existingSecret: mlflow-basic-auth
+  # client:
+  #   existingSecret: mlflow-client
+  # podDisruptionBudget:
+  #   enabled: true
+  #   minAvailable: 1
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+# ── platform ───────────────────────────────────────────────────────────────────
+prometheus:
+  retention: 30d
+  persistence:
+    enabled: true
+    size: 50Gi
+  resources:
+    requests: {cpu: 500m, memory: 2Gi}
+    limits: {memory: 4Gi}
+
+grafana:
+  anonymous: false
+  adminPassword: ""        # set it, or put Grafana behind the organisation's OIDC proxy
+
+security:
+  networkPolicy:
+    enabled: true
+    ingressNamespace: ingress-nginx
+
+training:
+  cronjob:
+    days: "28"             # four weeks: every weekday seen four times
+    stepSeconds: "300"
+    periodSeconds: "86400"
+    underWeight: "3"
+    baseline: persistence
+  resources:
+    requests: {cpu: "1", memory: 1Gi}
+    limits: {cpu: "4", memory: 2Gi}
+
+workloads: []

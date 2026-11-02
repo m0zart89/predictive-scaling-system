@@ -44,6 +44,14 @@ FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
 # cluster has no champion until the first training run; this picks it up
 # without anyone having to call /reload.
 MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "30"))
+# Once a model is loaded, check the registry alias this often and reload when
+# it moved (0 disables). Pull, not push: with several replicas a POST /reload
+# reaches one pod; every pod polling the alias reaches all of them.
+MODEL_REFRESH_SECONDS = float(os.getenv("MODEL_REFRESH_SECONDS", "60"))
+# Last-known-good copy of the loaded model (model/, scaler.pkl, meta and
+# tags). A pod that restarts while MLflow is down serves from it, with
+# model_stage="cache", until the registry answers again. Empty: no cache.
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "")
 # When set, POST /reload requires the same value in the X-Reload-Token header
 # (the chart generates one and hands it to the training jobs). Empty: open,
 # for local runs only.
@@ -216,9 +224,6 @@ def load_model() -> None:
                 loaded_meta = {**LEGACY_FORECAST_META, **json.load(f)}
         except (MlflowException, OSError):
             loaded_meta = dict(LEGACY_FORECAST_META)
-    if loaded_meta["features"] not in FEATURE_KINDS or loaded_meta["target"] not in TARGET_KINDS:
-        raise RuntimeError(f"Unsupported {META_ARTIFACT}: {loaded_meta}")
-
     info = {
         "model_name":    MODEL_NAME,
         "model_stage":   selector,
@@ -226,11 +231,26 @@ def load_model() -> None:
         "run_id":        run_id,
         # which candidate the pipeline promoted (version tag; "" for notebook models)
         "candidate":     (v.tags or {}).get("candidate", ""),
-        "loaded_at":     datetime.now(timezone.utc).isoformat(),
     }
+    _install(loaded_model, loaded_scaler, loaded_meta, info, dict(v.tags or {}))
+    if MODEL_CACHE_DIR:
+        try:
+            _write_cache(loaded_model, loaded_scaler, loaded_meta, info, dict(v.tags or {}))
+        except Exception as exc:      # the cache is a convenience, never a reason to fail a load
+            log.warning("could not write the model cache at %s: %s", MODEL_CACHE_DIR, exc)
+
+
+def _install(model, scaler, meta: Dict[str, object], info: Dict[str, str], tags: Dict[str, str]) -> None:
+    """Swap the served bundle and refresh the model metrics."""
+    global _bundle
+    if meta["features"] not in FEATURE_KINDS or meta["target"] not in TARGET_KINDS:
+        raise RuntimeError(f"Unsupported {META_ARTIFACT}: {meta}")
+    info = {**info, "loaded_at": datetime.now(timezone.utc).isoformat()}
+    version, selector, run_id = info["model_version"], info["model_stage"], info["run_id"]
+
     previous = _bundle
     # One assignment: requests in flight keep the bundle they started with.
-    _bundle = Bundle(loaded_model, loaded_scaler, loaded_meta, info)
+    _bundle = Bundle(model, scaler, meta, info)
     if previous is not None and previous.info["run_id"] != run_id:
         # Forecasts the old model made are not the new model's errors.
         TRACKER.reset(pending_only=True)
@@ -238,9 +258,9 @@ def load_model() -> None:
     MODEL_LOADED.set(1)
     MODEL_INFO.clear()   # one series only: drop the previous version's labels
     MODEL_INFO.labels(model_name=MODEL_NAME, model_version=version, model_stage=selector,
-                      run_id=run_id, horizon=str(loaded_meta["horizon"])).set(1)
+                      run_id=run_id, horizon=str(meta["horizon"])).set(1)
     MODEL_HOLDOUT_MAE.clear()
-    for key, raw in (v.tags or {}).items():
+    for key, raw in tags.items():
         if key.startswith("holdout_mae_step_"):
             try:
                 MODEL_HOLDOUT_MAE.labels(horizon_step=key.rsplit("_", 1)[1]).set(float(raw))
@@ -249,9 +269,49 @@ def load_model() -> None:
     MODEL_RELOADS.labels(result="success").inc()
     log.info(
         "Model loaded: name=%s %s version=%s run_id=%s time_steps=%s horizon=%s target=%s",
-        MODEL_NAME, selector, version, run_id, loaded_meta["time_steps"],
-        loaded_meta["horizon"], loaded_meta["target"],
+        MODEL_NAME, selector, version, run_id, meta["time_steps"], meta["horizon"], meta["target"],
     )
+
+
+# ── Last-known-good cache ──────────────────────────────────────────────────────
+def _write_cache(model, scaler, meta, info, tags) -> None:
+    """Write the loaded model next to its scaler, meta, info and tags; atomically
+    (a new directory renamed over the old one) so a crash mid-write leaves the
+    previous cache intact."""
+    import shutil
+
+    final = os.path.join(MODEL_CACHE_DIR, "champion")
+    tmp = os.path.join(MODEL_CACHE_DIR, ".champion.tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    mlflow.sklearn.save_model(model, os.path.join(tmp, "model"))
+    with open(os.path.join(tmp, "scaler.pkl"), "wb") as f:
+        pickle.dump(scaler, f)
+    with open(os.path.join(tmp, "cache.json"), "w") as f:
+        json.dump({"meta": meta, "info": info, "tags": tags}, f)
+    old = final + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.isdir(final):
+        os.rename(final, old)
+    os.rename(tmp, final)
+    shutil.rmtree(old, ignore_errors=True)
+    log.info("model cache written: %s (v%s)", final, info["model_version"])
+
+
+def load_cached_model() -> None:
+    """Serve the last-known-good model from MODEL_CACHE_DIR (model_stage="cache")."""
+    if not MODEL_CACHE_DIR:
+        raise RuntimeError("MODEL_CACHE_DIR is not set")
+    final = os.path.join(MODEL_CACHE_DIR, "champion")
+    with open(os.path.join(final, "cache.json")) as f:
+        saved = json.load(f)
+    model = mlflow.sklearn.load_model(os.path.join(final, "model"))
+    with open(os.path.join(final, "scaler.pkl"), "rb") as f:
+        scaler = pickle.load(f)
+    info = {**saved["info"], "model_stage": "cache"}
+    _install(model, scaler, {**LEGACY_FORECAST_META, **saved["meta"]}, info, saved["tags"])
+    log.warning("serving model v%s from the cache at %s; the registry is unavailable",
+                info["model_version"], final)
 
 
 # ── Startup model load ─────────────────────────────────────────────────────────
@@ -276,11 +336,47 @@ def _load_model_until_available() -> None:
             if attempt == 1:
                 log.warning("Model not available at startup (%s). Service running in degraded "
                             "state; retrying every %gs, or POST /reload.", exc, MODEL_RETRY_SECONDS)
+                if MODEL_CACHE_DIR:
+                    try:
+                        load_cached_model()        # serve the last known good; keep retrying
+                    except Exception as cache_exc:
+                        log.info("no usable model cache at %s (%s)", MODEL_CACHE_DIR, cache_exc)
             elif attempt % 10 == 0:
                 log.warning("Still no model after %d attempts: %s", attempt, exc)
         if MODEL_RETRY_SECONDS <= 0:
             return
         _stop_loading.wait(MODEL_RETRY_SECONDS)
+
+
+def _refresh_model_forever() -> None:
+    """
+    Every MODEL_REFRESH_SECONDS, ask the registry which version the alias points
+    at and reload when it differs from the one in memory (or when the one in
+    memory came from the cache). Errors are logged and the current model keeps
+    serving: a registry outage must never unload a working model.
+    """
+    while not _stop_loading.is_set() and MODEL_REFRESH_SECONDS > 0:
+        _stop_loading.wait(MODEL_REFRESH_SECONDS)
+        if not _stop_loading.is_set():
+            refresh_model()
+
+
+def refresh_model() -> bool:
+    """One registry check: reload if the alias points elsewhere than what is
+    served, or if the served model came from the cache. True when reloaded."""
+    b = _bundle
+    if b is None:
+        return False                                    # the loader thread owns this case
+    try:
+        v, _, _ = _resolve_version(MlflowClient(tracking_uri=MLFLOW_TRACKING_URI))
+        if str(v.version) != b.info["model_version"] or b.info["model_stage"] == "cache":
+            log.info("registry alias moved to v%s (serving v%s %s); reloading",
+                     v.version, b.info["model_version"], b.info["model_stage"])
+            load_model()
+            return True
+    except Exception as exc:
+        log.warning("model refresh check failed (%s); keeping v%s", exc, b.info["model_version"])
+    return False
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -294,6 +390,7 @@ async def lifespan(application: FastAPI):
     # immediately; /ready holds traffic until a model is in memory.
     _stop_loading.clear()
     threading.Thread(target=_load_model_until_available, name="model-loader", daemon=True).start()
+    threading.Thread(target=_refresh_model_forever, name="model-refresh", daemon=True).start()
     log.info("Model loading initiated in background. Traffic held until /ready returns 200.")
 
     yield

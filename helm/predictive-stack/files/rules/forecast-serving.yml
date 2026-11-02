@@ -108,6 +108,9 @@ groups:
   - name: forecast-quality
     interval: 60s
     rules:
+      # Two sources of the live error: forecast-serving's in-process tracker
+      # (single replica) and the scaler's own scoring of its forecasts
+      # against the history it fetches (any replica count, model units).
       - alert: ForecastDriftHigh
         expr: |
           (
@@ -121,19 +124,31 @@ groups:
                 unless on (horizon_step) max by (horizon_step) (forecast_model_holdout_mae)
             ) > 0.25
           )
+          or
+          (
+            max by (horizon_step) (
+              label_replace(
+                sum by (step) (rate(predictive_scaler_forecast_abs_error_sum[1h]))
+                  / sum by (step) (rate(predictive_scaler_forecast_abs_error_count[1h])),
+                "horizon_step", "$1", "step", "(.+)")
+            )
+              > on (horizon_step) 2 * max by (horizon_step) (forecast_model_holdout_mae)
+          )
         for: 30m
         labels:
           severity: warning
           service: forecast-serving
         annotations:
           runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastDriftHigh.md
-          summary: "Forecast error is high (rolling MAE {{ $value | printf \"%.3f\" }} at horizon step {{ $labels.horizon_step }})"
+          summary: "Forecast error is high (MAE {{ $value | printf \"%.3f\" }} at horizon step {{ $labels.horizon_step }})"
           description: >
-            Rolling MAE for horizon step {{ $labels.horizon_step }} has been above
+            The live MAE for horizon step {{ $labels.horizon_step }} (serving's rolling
+            MAE, or the scaler's own scoring over the last hour) has been above
             twice the model's own holdout MAE (or 0.25 without a baseline) for
             30 minutes. The model no longer tracks the workload:
             check the Model quality dashboard, compare with the champion's
-            holdout RMSE in MLflow, and retrain (the forecast-retrain CronJob).
+            holdout cost in MLflow, and retrain (the forecast-retrain CronJob,
+            or the alert-driven trigger when it is deployed).
 
   # ── Predictive scaler ────────────────────────────────────────────────────
   - name: predictive-scaler

@@ -321,3 +321,68 @@ def test_serving_exports_the_models_holdout_mae_for_the_drift_alert(registry, se
         got = REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": str(step)})
         assert got == pytest.approx(float(tags[f"holdout_mae_step_{step}"]))
     assert REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": "4"}) is None
+
+
+def test_cache_serves_the_last_known_good_model_while_the_registry_is_down(registry, serving, monkeypatch, tmp_path):
+    """A pod restarting while MLflow is unreachable loads the cached champion
+    (model_stage "cache") and keeps answering; the refresh check reloads from
+    the registry once it is back."""
+    from prometheus_client import REGISTRY
+
+    monkeypatch.setattr(serving_app, "MODEL_CACHE_DIR", str(tmp_path / "cache"))
+    (tmp_path / "cache").mkdir()
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()                                  # writes the cache
+    window = [float(v) for v in values[-10:]]
+    expected = serving.post("/predict", json={"values": window}).json()["predictions"]
+    assert (tmp_path / "cache" / "champion" / "cache.json").exists()
+
+    # registry gone, process restarted
+    monkeypatch.setattr(serving_app, "MLFLOW_TRACKING_URI", "http://127.0.0.1:1")
+    monkeypatch.setattr(serving_app, "MODEL_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(serving_app, "_bundle", None)
+    serving_app._stop_loading.clear()                         # an earlier TestClient's shutdown set it
+    serving_app._load_model_until_available()                 # fails on MLflow, falls back to the cache
+    info = serving.get("/model-info").json()
+    assert info["model_stage"] == "cache" and info["model_version"] == "1"
+    assert serving.post("/predict", json={"values": window}).json()["predictions"] == expected
+    assert REGISTRY.get_sample_value("forecast_model_holdout_mae", {"horizon_step": "1"}) is not None
+    assert REGISTRY.get_sample_value("forecast_model_info", {
+        "model_name": "cpu-forecasting", "model_version": "1", "model_stage": "cache",
+        "run_id": info["run_id"], "horizon": "2"}) == 1
+
+    assert serving_app.refresh_model() is False                # registry still down: keep serving
+    assert serving.get("/model-info").json()["model_stage"] == "cache"
+    monkeypatch.setattr(serving_app, "MLFLOW_TRACKING_URI", registry)
+    assert serving_app.refresh_model() is True                 # back: the registry copy replaces the cache
+    assert serving.get("/model-info").json()["model_stage"] == "@champion"
+
+
+def test_refresh_follows_the_alias_without_a_reload_call(registry, serving):
+    """Pull-based refresh: when the pipeline moves @champion to a new version,
+    every replica picks it up on its next check; nothing POSTs /reload."""
+    ts, values = demand(days=12)
+    first = int(len(values) * 0.8)
+    run_pipeline(values[:first], TrainConfig(horizon=2, candidates=["hgb_delta"], min_fresh_windows=24),
+                 "test", timestamps=ts[:first])
+    serving_app.load_model()
+    assert serving.get("/model-info").json()["model_version"] == "1"
+    assert serving_app.refresh_model() is False                # alias unchanged
+
+    out = run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"], min_fresh_windows=24,
+                                           min_improvement=-1.0), "test", timestamps=ts)
+    assert out.version == "2"
+    assert serving.get("/model-info").json()["model_version"] == "1"   # until the check runs
+    assert serving_app.refresh_model() is True
+    assert serving.get("/model-info").json()["model_version"] == "2"
+
+
+def test_quality_tracking_can_be_switched_off(registry, serving):
+    from quality import ForecastTracker
+    from prometheus_client import CollectorRegistry
+
+    off = ForecastTracker(CollectorRegistry(), max_series=0)
+    assert off.record("x", [0.5] * 10, [0.5], 300, timestamp=1_700_000_000) == 0
+    assert off.record("x", [0.5] * 9 + [0.7], [0.5], 300, timestamp=1_700_000_300) == 0
+    assert off.snapshot() == {}

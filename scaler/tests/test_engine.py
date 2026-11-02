@@ -233,3 +233,56 @@ def test_default_history_equals_the_window_and_the_call_is_unchanged(metrics):
     fc = FakeForecast(lambda v: 0.9)
     engine_with(metrics, FakePrometheus([0.5] * 12), fc).decide(NS, NAME, make_config())
     assert fc.calls[0] == [0.5] * 10                          # exactly timeSteps values, no nulls
+
+
+# ── forecast quality scored by the scaler ──────────────────────────────────────
+
+def test_scaler_scores_its_own_forecasts_from_the_next_history(metrics, registry):
+    """A forecast made at t for t+1..t+3 is scored once the history fetched at a
+    later poll holds those instants: exact matching, no serving state, and it
+    works whichever replica polled in between."""
+    fc = FakeForecast(lambda v: [0.5, 0.6, 0.7])              # model units; capacity 2 → 1.0, 1.2, 1.4
+    prom = FakePrometheus([0.2] * 10)
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(capacity="2", stepSeconds="30", cacheSeconds="0")
+    eng.decide(NS, NAME, cfg)
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) == pytest.approx(1.2)
+    assert eng.ledger.pending() == 1
+
+    # two steps later: the history now holds the actuals for steps 1 and 2
+    prom.values = [0.2] * 10 + [1.1, 1.3]                       # query units
+    prom.NOW = FakePrometheus.NOW + 60
+    eng.decide(NS, NAME, cfg)
+    def count(step):
+        return registry.get_sample_value("predictive_scaler_forecast_abs_error_count", labels(step=step))
+
+    def total(step):
+        return registry.get_sample_value("predictive_scaler_forecast_abs_error_sum", labels(step=step))
+    assert count("1") == 1 and total("1") == pytest.approx(abs(1.1 / 2 - 0.5))
+    assert count("2") == 1 and total("2") == pytest.approx(abs(1.3 / 2 - 0.6))
+    assert count("3") is None                                   # not yet
+    assert registry.get_sample_value("predictive_scaler_forecast_residual", labels()) == pytest.approx(1.1 / 2 - 0.5)
+
+    # the same poll again (cache off, same newest sample): nothing is scored twice
+    eng.decide(NS, NAME, cfg)
+    assert count("1") == 1 and count("2") == 1
+
+    # one more step: step 3 resolves and the forecast leaves the ledger
+    prom.values = [0.2] * 10 + [1.1, 1.3, 1.5]
+    prom.NOW = FakePrometheus.NOW + 90
+    eng.decide(NS, NAME, cfg)
+    assert count("3") == 1 and total("3") == pytest.approx(abs(1.5 / 2 - 0.7))
+    assert eng.ledger.pending() == 2                             # the two forecasts made at +60 and +90
+
+
+def test_fallback_drops_the_per_step_forecast_series(metrics, registry):
+    prom = FakePrometheus(WINDOW)
+    fc = FakeForecast(lambda v: [0.9, 0.8])
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(cacheSeconds="0")
+    eng.decide(NS, NAME, cfg)
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) == pytest.approx(0.8)
+    fc.exc = ForecastError("down")
+    eng.decide(NS, NAME, cfg)
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="1")) is None
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="2")) is None

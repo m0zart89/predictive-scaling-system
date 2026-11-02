@@ -37,6 +37,7 @@ from typing import Callable, Dict, Optional, Tuple
 from .clients import ForecastClient, ForecastError, PrometheusClient, PrometheusError
 from .config import ScalerConfig
 from .metrics import ScalerMetrics
+from .quality import ForecastLedger
 
 log = logging.getLogger("predictive-scaler.engine")
 
@@ -71,6 +72,8 @@ class PredictiveEngine:
         self._clock = clock
         self._cache: Dict[Tuple[str, str, str], Tuple[float, Decision]] = {}
         self._lock = threading.Lock()
+        # past forecasts, scored against the history each decision fetches
+        self.ledger = ForecastLedger()
 
     # KEDA calls GetMetrics on every HPA sync and IsActive on every polling
     # interval, often for the same ScaledObject within seconds. Caching keeps
@@ -118,6 +121,13 @@ class PredictiveEngine:
 
         observed = max(0.0, values[-1])
         predicted: Optional[float] = None
+        key = f"{namespace}/{name}"
+
+        # Score the forecasts made earlier for instants this history now holds.
+        for r in self.ledger.score(key, grid_ts, history, cfg.capacity):
+            self.metrics.forecast_abs_error.labels(**labels, step=str(r.step)).observe(abs(r.error))
+            if r.step == 1:
+                self.metrics.forecast_residual.labels(**labels).set(r.error)
 
         if len(values) < cfg.time_steps:
             source = "observed"
@@ -146,6 +156,9 @@ class PredictiveEngine:
                 model_out = max(horizon) if cfg.forecast_aggregation == "max" else horizon[0]
                 predicted = max(0.0, model_out * cfg.capacity)
                 source = "forecast"
+                self.ledger.record(key, timestamps[-1], cfg.step_seconds, horizon)
+                for k, v in enumerate(horizon, start=1):
+                    self.metrics.forecast_demand.labels(**labels, step=str(k)).set(max(0.0, v * cfg.capacity))
                 reason = (f"forecast {predicted:.4g} ({cfg.forecast_aggregation} of "
                           f"{len(horizon)} step(s)), observed {observed:.4g}, mode={cfg.mode}")
             finally:
@@ -173,6 +186,11 @@ class PredictiveEngine:
                 self.metrics.predicted_demand.remove(namespace, name)
             except KeyError:
                 pass
+            for k in range(1, 65):
+                try:
+                    self.metrics.forecast_demand.remove(namespace, name, str(k))
+                except KeyError:
+                    break
         self.metrics.reported_demand.labels(**labels).set(value)
         self.metrics.desired_replicas.labels(**labels).set(decision.desired_replicas(cfg.target_value))
         self.metrics.decisions.labels(**labels, source=source).inc()

@@ -109,6 +109,10 @@ jobs:
           - name: forecast-training
             context: ./training
             file: ./training/Dockerfile
+          # upstream MLflow + PostgreSQL driver + S3 client (production backends)
+          - name: mlflow-server
+            context: ./mlflow
+            file: ./mlflow/Dockerfile
     env:
       # Images are published to GHCR under the repository:
       #   ghcr.io/<owner>/predictive-scaling-system/<name>:{<sha>,latest}
@@ -227,6 +231,35 @@ jobs:
           test "$(grep -c 'name: forecast-reload-token' /tmp/stack.yaml)" -ge 4
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
+          # production profile: PDBs, anti-affinity, HA KEDA, read-only images
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml > /tmp/prod.yaml
+          test "$(grep -c '^kind: PodDisruptionBudget$' /tmp/prod.yaml)" -ge 2
+          test "$(grep -c 'podAntiAffinity' /tmp/prod.yaml)" -ge 2
+          grep -q 'minAvailable: 2' /tmp/prod.yaml
+          grep -q 'MODEL_REFRESH_SECONDS' /tmp/prod.yaml
+          grep -q 'startupProbe' /tmp/prod.yaml
+          # MLflow on an external backend: DSN from a Secret, S3 artifacts, rolling
+          # updates, the db-upgrade hook, and no PVC
+          helm template predictive helm/predictive-stack/ -n predictive \
+            -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml \
+            --set mlflow.backendStore.existingSecret=mlflow-backend \
+            --set mlflow.artifacts.destination=s3://bucket/mlflow --set mlflow.replicas=2 > /tmp/mlflow.yaml
+          grep -q -- '--backend-store-uri=$(MLFLOW_BACKEND_STORE_URI)' /tmp/mlflow.yaml
+          grep -q -- '--artifacts-destination=s3://bucket/mlflow' /tmp/mlflow.yaml
+          grep -q 'name: mlflow-db-upgrade-' /tmp/mlflow.yaml
+          grep -q 'helm.sh/hook: pre-install,pre-upgrade' /tmp/mlflow.yaml
+          if grep -q 'claimName: mlflow' /tmp/mlflow.yaml; then
+            echo "::error::MLflow still mounts a PVC with an external backend store"; exit 1
+          fi
+          # replicas > 1 on SQLite must be refused
+          if helm template predictive helm/predictive-stack/ -n predictive --set mlflow.replicas=2 > /dev/null 2>&1; then
+            echo "::error::mlflow.replicas=2 on SQLite rendered"; exit 1
+          fi
+          # the default profile renders no PDB (single replicas) but the same probes
+          if grep -q '^kind: PodDisruptionBudget$' /tmp/stack.yaml; then
+            echo "::error::a PodDisruptionBudget was rendered for single-replica defaults"; exit 1
+          fi
           # nothing to train on yet (pilot before its workloads are added): no CronJob,
           # no broken query — the release must still install so KEDA's CRDs land
           helm template predictive helm/predictive-stack/ -n predictive --set demo.enabled=false > /tmp/empty.yaml
