@@ -145,6 +145,45 @@ projects (English, German, Japanese: the same daily shape at different UTC
 hours) and fails if no candidate beats persistence. Results and what they
 say about the candidates and the gate: [docs/traces.md](../docs/traces.md).
 
+## Channels (multivariate models)
+
+A model may take several series: the demand (the target, what the scaler
+scales on) plus exogenous inputs such as the request rate, which rises
+before CPU does. Each channel gets its own MinMaxScaler and contributes its
+anchored window; the target keeps the seasonal / time-of-day features and
+the level-tracking gate lifts the target only.
+
+```bash
+# live: extra channels as NAME=PromQL (TRAIN_CHANNELS as a JSON object in the CronJob)
+python -m forecast_training --prometheus http://prometheus:9090 \
+    --query 'workload:demand{workload="api"} / 4' \
+    --channel 'rps=sum(rate(http_requests_total{container="api"}[2m]))' --days 28
+# exports: NAME=path.json
+python -m forecast_training --export cpu.json --channel rps=rps.json --dry-run
+```
+
+The series are aligned on one grid (their intersection); `forecast_meta.json`
+carries `channels` (the target first), the registry gets `scaler/channels.pkl`
+next to the target's `scaler/scaler.pkl`, and `/predict` then takes
+`{"cpu": [...], "rps": [...]}`. A run whose channels differ from the
+champion's replaces it outright: the old model cannot be scored on, or fed
+with, the new input. In the chart, `workloads[].channels` reaches both the
+ScaledObject and the CronJob.
+
+## Alert-driven retraining
+
+`python -m forecast_training.trigger` (the training image) is an
+Alertmanager webhook receiver: a firing `ForecastDriftHigh` or
+`ForecastBreakerOpenLong` becomes a Job cloned from the `forecast-retrain`
+CronJob's template, with `TRAIN_REASON` set to the alert (an MLflow tag,
+also `--reason`), `TRAIN_MIN_IMPROVEMENT=0`, and `--exclude` for every
+interval in which the scaler's circuit breaker was open
+(`predictive_scaler_breaker_open == 1`, padded by a horizon) so the anomaly
+that caused the alert never enters the training window. One Job at a time,
+none within `MIN_GAP_HOURS` of the last. Standard library only; RBAC: get
+the CronJob, list and create Jobs. The chart deploys it with Alertmanager
+(`training.trigger`, `alertmanager`).
+
 ## Tests
 
 ```bash
