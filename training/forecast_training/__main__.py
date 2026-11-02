@@ -22,7 +22,8 @@ import logging
 import os
 import sys
 
-from .data import DataError, load_export, parse_exclude, query_prometheus, regularize
+from .data import (DataError, align_series, load_export, parse_exclude, query_prometheus,
+                   regularize)
 from .model import CANDIDATE_NAMES, DEFAULT_UNDER_WEIGHT
 from .registry import BASELINES, TrainConfig, reload_serving, run_pipeline
 
@@ -30,6 +31,23 @@ from .registry import BASELINES, TrainConfig, reload_serving, run_pipeline
 def _env(name: str, default=None):
     v = os.getenv(name)
     return v if v not in (None, "") else default
+
+
+def _channels_from_env():
+    raw = _env("TRAIN_CHANNELS")
+    if not raw:
+        return []
+    try:
+        return [f"{k}={v}" for k, v in json.loads(raw).items()]
+    except (ValueError, AttributeError) as exc:
+        raise SystemExit(f"TRAIN_CHANNELS must be a JSON object of name → source: {exc}")
+
+
+def _parse_channel(spec: str):
+    name, _, source = spec.partition("=")
+    if not name or not source:
+        raise ValueError(f"--channel must be NAME=SOURCE, got {spec!r}")
+    return name.strip(), source.strip()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="history to train on, with --prometheus (default 14)")
     p.add_argument("--exclude", action="append", default=[], metavar="START/END",
                    help="time range to treat as missing (ISO or unix); repeatable")
+    p.add_argument("--channel", action="append", default=_channels_from_env(), metavar="NAME=SOURCE",
+                   help="an extra input series: NAME=PromQL with --prometheus, NAME=path.json with "
+                        "--export (repeatable; env TRAIN_CHANNELS as a JSON object). The model then "
+                        "takes every channel; the demand series stays the target")
+    p.add_argument("--target-channel", default=_env("TRAIN_TARGET_CHANNEL", "cpu"),
+                   help="name of the demand series when channels are used (default cpu)")
 
     p.add_argument("--time-steps", type=int, default=int(_env("TRAIN_TIME_STEPS", 10)))
     p.add_argument("--horizon", type=int, default=int(_env("TRAIN_HORIZON", 6)),
@@ -117,6 +141,20 @@ def main(argv=None) -> int:
 
         series = regularize(points, args.step_seconds, exclude)
         log.info("series: %d points, %d filled", len(series), series.filled)
+        channels = [_parse_channel(c) for c in args.channel]
+        values, timestamps, filled, names = series.values, series.timestamps, series.filled, ()
+        if channels:
+            extra = {}
+            for name, src in channels:
+                if args.export:
+                    pts = load_export(src)
+                else:
+                    pts = query_prometheus(args.prometheus, src, args.days, args.step_seconds)
+                extra[name] = regularize(pts, args.step_seconds, exclude)
+            multi = align_series({args.target_channel: series, **extra})
+            values, timestamps, names = multi.values, multi.timestamps, multi.channels
+            filled = sum(multi.filled.values())
+            log.info("channels %s on a shared grid: %d points", ",".join(names), len(multi))
 
         cfg = TrainConfig(
             model_name=args.model_name, alias=args.alias, experiment=args.experiment,
@@ -124,10 +162,10 @@ def main(argv=None) -> int:
             period_seconds=args.period_seconds, test_fraction=args.test_fraction, min_tracking=args.min_tracking,
             min_improvement=args.min_improvement, min_fresh_windows=args.min_fresh_windows,
             under_weight=args.under_weight, baseline=args.baseline, reason=args.reason,
-            refit=not args.no_refit, dry_run=args.dry_run,
+            refit=not args.no_refit, dry_run=args.dry_run, channels=tuple(names),
             candidates=[c.strip() for c in args.candidates.split(",") if c.strip()],
         )
-        outcome = run_pipeline(series.values, cfg, source, series.filled, series.timestamps)
+        outcome = run_pipeline(values, cfg, source, filled, timestamps)
     except (DataError, ValueError, OSError) as exc:
         log.error("%s", exc)
         return 1

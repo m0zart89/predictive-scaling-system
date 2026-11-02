@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -43,6 +43,44 @@ class Series:
 
     def __len__(self) -> int:
         return len(self.values)
+
+
+@dataclass
+class MultiSeries:
+    """Several regularised series on one shared grid; channel 0 is the target."""
+    timestamps: np.ndarray  # int64 unix seconds, shared
+    values: np.ndarray      # (channels, n) float64
+    channels: Tuple[str, ...]
+    step_seconds: int
+    filled: Dict[str, int]  # imputed points per channel
+
+    def __len__(self) -> int:
+        return self.values.shape[1]
+
+
+def align_series(series: Mapping[str, Series]) -> MultiSeries:
+    """Intersect the grids of several Series (same step) and stack them, in the
+    mapping's order (the first is the target)."""
+    if not series:
+        raise DataError("no channels")
+    steps = {s.step_seconds for s in series.values()}
+    if len(steps) != 1:
+        raise DataError(f"channels have different steps: {sorted(steps)}")
+    t0 = max(int(s.timestamps[0]) for s in series.values())
+    t1 = min(int(s.timestamps[-1]) for s in series.values())
+    if t1 < t0:
+        raise DataError("the channels' time ranges do not overlap")
+    stacked, filled = [], {}
+    for name, s in series.items():
+        keep = (s.timestamps >= t0) & (s.timestamps <= t1)
+        stacked.append(s.values[keep])
+        filled[name] = s.filled
+    first = next(iter(series.values()))
+    grid = first.timestamps[(first.timestamps >= t0) & (first.timestamps <= t1)]
+    if any(len(v) != len(grid) for v in stacked):
+        raise DataError("the channels' grids differ")   # regularize() makes this impossible
+    return MultiSeries(timestamps=grid, values=np.stack(stacked), channels=tuple(series),
+                       step_seconds=first.step_seconds, filled=filled)
 
 
 # ── sources ────────────────────────────────────────────────────────────────────
@@ -180,3 +218,14 @@ def parse_exclude(spec: str) -> Tuple[int, int]:
     if end < start:
         raise ValueError(f"exclude range ends before it starts: {spec!r}")
     return start, end
+
+
+def query_channels(address: str, queries: Mapping[str, str], days: float, step_seconds: int,
+                   exclude: Iterable[Tuple[int, int]] = (), timeout: float = 30.0,
+                   now: float | None = None) -> MultiSeries:
+    """Fetch and regularise one series per entry of `queries` (name → PromQL),
+    aligned on one grid; the first entry is the target."""
+    series = {name: regularize(query_prometheus(address, q, days, step_seconds, timeout, now),
+                               step_seconds, exclude)
+              for name, q in queries.items()}
+    return align_series(series)

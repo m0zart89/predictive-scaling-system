@@ -80,3 +80,15 @@ def test_history_steps_defaults_to_time_steps_and_must_not_be_shorter():
         make_config(timeSteps="10", historySteps="9")
     with pytest.raises(ConfigError, match="historySteps"):
         make_config(historySteps="0")
+
+
+def test_channels_are_a_json_map_and_exclude_the_target():
+    cfg = make_config(channels='{"rps": "sum(rate(http_requests_total[1m]))", "mem": "avg(mem)"}')
+    assert cfg.channels == (("rps", "sum(rate(http_requests_total[1m]))"), ("mem", "avg(mem)"))
+    assert cfg.target_channel == "cpu" and make_config().channels == ()
+    assert make_config(targetChannel="demand").target_channel == "demand"
+    for bad in ('not json', '[]', '{}', '{"rps": ""}', '{"rps": 3}'):
+        with pytest.raises(ConfigError, match="channels"):
+            make_config(channels=bad)
+    with pytest.raises(ConfigError, match="target channel"):
+        make_config(channels='{"cpu": "x"}')

@@ -87,9 +87,12 @@ spec:
   renewBefore: {{ $t.renewBefore }}
   usages: [client auth]
   commonName: ingress-nginx
+{{- if or (and .Values.demo.enabled (eq .Values.demo.scaling "predictive")) .Values.workloads }}
 ---
 # KEDA presents keda-scaler-client to the scaler and verifies the scaler
-# against the CA (KEDA >= 2.16: enableTLS on the external trigger).
+# against the CA (KEDA >= 2.16: enableTLS on the external trigger). A KEDA
+# CRD: rendered with the ScaledObjects, i.e. in the second phase of an
+# install, once the KEDA subchart's CRDs exist.
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:
@@ -107,4 +110,5 @@ spec:
     - parameter: tlsClientKey
       name: keda-scaler-client
       key: tls.key
+{{- end }}
 {{- end }}

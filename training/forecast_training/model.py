@@ -36,8 +36,8 @@ from sklearn.linear_model import Ridge
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.preprocessing import MinMaxScaler
 
-from .features import (SEASONAL_FEATURE_KINDS, TIMED_FEATURE_KINDS, ForecastMeta, build_features,
-                       from_target, make_windows, seasonal_lags, to_target)
+from .features import (SEASONAL_FEATURE_KINDS, TIMED_FEATURE_KINDS, ForecastMeta, build_features_mv,
+                       from_target, make_windows_mv, seasonal_lags, target_channel, to_target)
 
 log = logging.getLogger("forecast-training")
 
@@ -114,23 +114,54 @@ CANDIDATE_NAMES = [c.name for c in CANDIDATES]
 
 @dataclass
 class ForecastBundle:
-    """A fitted model with everything needed to turn raw windows into forecasts."""
+    """A fitted model with everything needed to turn raw windows into forecasts.
+    `scaler` scales the target channel; `scalers` has one per channel (the
+    first is `scaler`), so a one-channel bundle looks as it always did."""
     model: BaseEstimator
     scaler: MinMaxScaler
     meta: ForecastMeta
+    scalers: List[MinMaxScaler] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.scalers:
+            self.scalers = [self.scaler]
+        self.scaler = self.scalers[0]
+
+    def scale(self, windows: np.ndarray) -> np.ndarray:
+        """(n, L) or (n, c, L) raw → scaled, each channel with its own scaler."""
+        windows = np.asarray(windows, dtype=np.float64)
+        if windows.ndim == 1:
+            windows = windows[None, :]
+        if windows.ndim == 2:
+            if self.meta.multivariate:
+                raise ValueError(f"model takes {self.meta.n_channels} channels {self.meta.channels}, "
+                                 "got a single series")
+            n, t = windows.shape
+            return self.scaler.transform(windows.reshape(-1, 1)).reshape(n, t)
+        n, c, t = windows.shape
+        if c != len(self.scalers):
+            raise ValueError(f"model takes {len(self.scalers)} channels, got {c}")
+        return np.stack([sc.transform(windows[:, j, :].reshape(-1, 1)).reshape(n, t)
+                         for j, sc in enumerate(self.scalers)], axis=1)
 
     def predict(self, windows: np.ndarray, last_ts=None) -> np.ndarray:
-        """windows (n, input_length) in original units → forecasts (n, horizon).
-        `last_ts` (n,): unix time of each window's last sample, for timed features."""
-        windows = np.atleast_2d(np.asarray(windows, dtype=np.float64))
-        n, t = windows.shape
-        scaled = self.scaler.transform(windows.reshape(-1, 1)).reshape(n, t)
-        out = self.model.predict(build_features(scaled, self.meta.features, last_ts,
-                                                self.meta.period_seconds, self.meta.time_steps,
-                                                self.meta.horizon))
-        out = from_target(scaled, out, self.meta.target)
+        """windows (n, input_length) or (n, channels, input_length) in original units →
+        forecasts (n, horizon) for the target channel. `last_ts` (n,): unix time of
+        each window's last sample, for timed features."""
+        scaled = self.scale(windows)
+        n = scaled.shape[0]
+        out = self.model.predict(build_features_mv(scaled, self.meta.features, last_ts,
+                                                   self.meta.period_seconds, self.meta.time_steps,
+                                                   self.meta.horizon))
+        out = from_target(target_channel(scaled), out, self.meta.target)
         h = out.shape[1]
         return self.scaler.inverse_transform(out.reshape(-1, 1)).reshape(n, h)
+
+
+def as_channels(values) -> np.ndarray:
+    """(n,) or (channels, n) → (channels, n) float array."""
+    v = np.asarray(values, dtype=np.float64)
+    return v[None, :] if v.ndim == 1 else v
 
 
 def _last_ts(timestamps, first_target: np.ndarray):
@@ -141,22 +172,31 @@ def _last_ts(timestamps, first_target: np.ndarray):
 
 
 def fit_bundle(values: np.ndarray, candidate: Candidate, time_steps: int, horizon: int,
-               step_seconds: int, timestamps=None, period_seconds: int = 86400) -> ForecastBundle:
+               step_seconds: int, timestamps=None, period_seconds: int = 86400,
+               channels=()) -> ForecastBundle:
+    """`values`: (n,) one series, or (channels, n) with the target first and
+    `channels` naming them."""
     if candidate.needs_time and timestamps is None:
         raise ValueError(f"candidate {candidate.name} needs timestamps")
     season = season_steps_for(candidate, period_seconds, step_seconds)
-    scaler = MinMaxScaler().fit(np.asarray(values).reshape(-1, 1))
-    scaled = scaler.transform(np.asarray(values).reshape(-1, 1)).ravel()
-    X, Y, first_target = make_windows(scaled, time_steps, horizon, season)
-    target = to_target(X, Y, candidate.target)
+    chans = as_channels(values)
+    channels = tuple(channels) if chans.shape[0] > 1 else tuple(channels[:1]) if channels else ()
+    if chans.shape[0] > 1 and len(channels) != chans.shape[0]:
+        raise ValueError(f"{chans.shape[0]} channels need {chans.shape[0]} names, got {channels}")
+    scalers = [MinMaxScaler().fit(ch.reshape(-1, 1)) for ch in chans]
+    scaled = np.stack([sc.transform(ch.reshape(-1, 1)).ravel() for sc, ch in zip(scalers, chans)])
+    X, Y, first_target = make_windows_mv(scaled, time_steps, horizon, season)
+    if X.shape[1] == 1:
+        X = X[:, 0, :]
+    target = to_target(target_channel(X), Y, candidate.target)
     model = candidate.factory(horizon)
-    feats = build_features(X, candidate.features, _last_ts(timestamps, first_target), period_seconds,
-                           time_steps, horizon)
+    feats = build_features_mv(X, candidate.features, _last_ts(timestamps, first_target), period_seconds,
+                              time_steps, horizon)
     model.fit(feats, target if horizon > 1 else target.ravel())
     meta = ForecastMeta(time_steps=time_steps, horizon=horizon, step_seconds=step_seconds,
                         features=candidate.features, target=candidate.target,
-                        period_seconds=period_seconds, season_steps=season)
-    return ForecastBundle(model=model, scaler=scaler, meta=meta)
+                        period_seconds=period_seconds, season_steps=season, channels=channels)
+    return ForecastBundle(model=model, scaler=scalers[0], meta=meta, scalers=scalers)
 
 
 @dataclass
@@ -203,8 +243,12 @@ def score(y_true: np.ndarray, y_pred: np.ndarray, steps: int | None = None,
 def holdout_windows(values: np.ndarray, split: int, time_steps: int, horizon: int,
                     timestamps=None, season_steps: int = 0):
     """Windows whose first target is at or after `split` (inputs may look back across it).
-    Returns X, Y and the last-sample timestamps (None without timestamps)."""
-    X, Y, first_target = make_windows(values, time_steps, horizon, season_steps)
+    Returns X ((n, L) for one series, (n, c, L) for channels), Y from the target
+    channel and the last-sample timestamps (None without timestamps)."""
+    chans = as_channels(values)
+    X, Y, first_target = make_windows_mv(chans, time_steps, horizon, season_steps)
+    if X.shape[1] == 1:
+        X = X[:, 0, :]
     keep = first_target >= split
     if not keep.any():
         raise ValueError("holdout is empty; lower --test-fraction or provide more data")
@@ -239,16 +283,24 @@ def level_tracking(bundle: ForecastBundle, values: np.ndarray, split: int,
     """
     X, _, last_ts = holdout_windows(values, split, bundle.meta.time_steps, bundle.meta.horizon,
                                     timestamps, bundle.meta.season_steps)
-    m = float(np.max(values[:split]))
+    m = float(np.max(as_channels(values)[0, :split]))
     if m <= 0:
         return 1.0
-    return float(np.mean(bundle.predict(X + 2 * m, last_ts) - bundle.predict(X + m, last_ts)) / m)
+    # lift the target channel only: the question is whether the forecast follows the demand level
+    up1, up2 = X.copy(), X.copy()
+    if X.ndim == 3:
+        up1[:, 0, :] += m
+        up2[:, 0, :] += 2 * m
+    else:
+        up1 += m
+        up2 += 2 * m
+    return float(np.mean(bundle.predict(up2, last_ts) - bundle.predict(up1, last_ts)) / m)
 
 
 def naive_score(values: np.ndarray, split: int, time_steps: int, horizon: int,
                 under_weight: float = DEFAULT_UNDER_WEIGHT) -> Score:
     """Persistence baseline: every future step equals the last observed value."""
-    X, Y, _ = holdout_windows(values, split, time_steps, horizon)
+    X, Y, _ = holdout_windows(as_channels(values)[0], split, time_steps, horizon)
     return score(Y, np.repeat(X[:, -1:], horizon, axis=1), under_weight=under_weight)
 
 
@@ -263,7 +315,7 @@ def seasonal_naive_score(values: np.ndarray, split: int, time_steps: int, horizo
     """
     if season_steps < horizon:
         raise ValueError("season_steps must be >= horizon")
-    X, Y, _ = holdout_windows(values, split, time_steps, horizon, season_steps=season_steps)
+    X, Y, _ = holdout_windows(as_channels(values)[0], split, time_steps, horizon, season_steps=season_steps)
     _, _, lag_next = seasonal_lags(X, time_steps, horizon)
     return score(Y, lag_next, under_weight=under_weight)
 
@@ -280,9 +332,11 @@ class CandidateResult:
 def train_and_select(values: np.ndarray, time_steps: int, horizon: int, step_seconds: int,
                      test_fraction: float, min_tracking: float = 0.5,
                      candidates: List[Candidate] | None = None, timestamps=None,
-                     period_seconds: int = 86400, under_weight: float = DEFAULT_UNDER_WEIGHT):
+                     period_seconds: int = 86400, under_weight: float = DEFAULT_UNDER_WEIGHT,
+                     channels=()):
     """
     Fit every candidate on the training part and score it on the holdout.
+    `values`: one series (n,) or channels (c, n) with the target first.
 
     A candidate is eligible only if its level tracking is at least
     `min_tracking`; the best eligible candidate by holdout cost wins. Returns
@@ -293,7 +347,9 @@ def train_and_select(values: np.ndarray, time_steps: int, horizon: int, step_sec
     a season plus a window.
     """
     candidates = candidates or CANDIDATES
-    split = int(len(values) * (1 - test_fraction))
+    values = as_channels(values)
+    n = values.shape[1]
+    split = int(n * (1 - test_fraction))
     if split < time_steps + horizon:
         raise ValueError("training part is too short for the requested window")
 
@@ -308,8 +364,8 @@ def train_and_select(values: np.ndarray, time_steps: int, horizon: int, step_sec
                         "steps before a window", cand.name, split, season)
             continue
         train_ts = timestamps[:split] if timestamps is not None else None
-        bundle = fit_bundle(values[:split], cand, time_steps, horizon, step_seconds, train_ts,
-                            period_seconds)
+        bundle = fit_bundle(values[:, :split], cand, time_steps, horizon, step_seconds, train_ts,
+                            period_seconds, channels)
         s = evaluate_bundle(bundle, values, split, timestamps=timestamps, under_weight=under_weight)
         tr = level_tracking(bundle, values, split, timestamps)
         ok = tr >= min_tracking

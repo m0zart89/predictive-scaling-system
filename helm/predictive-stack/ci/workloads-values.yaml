@@ -14,5 +14,7 @@ workloads:
     targetValue: "0.5"
     minReplicas: 2
     stepSeconds: "60"
+    channels:
+      rps: sum(rate(http_requests_total{container="worker"}[2m]))
 training:
   workload: worker

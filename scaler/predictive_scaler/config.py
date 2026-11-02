@@ -24,7 +24,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Tuple
 
 
 class ConfigError(ValueError):
@@ -56,6 +56,11 @@ class ScalerConfig:
     # (0 = no cap). A model asking for 10x current demand is wrong far more
     # often than demand is about to grow 10x.
     forecast_surge_factor: float = 3.0
+    # Multivariate models: extra input series by channel name → PromQL, sent
+    # next to the demand series (target_channel) as {name: [...]}. Must match the
+    # channels the model was trained on (/model-info). Empty: one series.
+    channels: Tuple[Tuple[str, str], ...] = ()
+    target_channel: str = "cpu"
     # Circuit breaker (see breaker.py): bypass the forecast while the series
     # does not resemble the history. Thresholds are in the breaker's units.
     breaker: bool = True
@@ -110,6 +115,24 @@ def _positive_int(meta: Mapping[str, str], key: str, default: int) -> int:
     return value
 
 
+def _channels(raw) -> Tuple[Tuple[str, str], ...]:
+    """metadata.channels: a JSON object {name: PromQL}, in order."""
+    if raw is None or str(raw).strip() == "":
+        return ()
+    try:
+        obj = json.loads(raw)
+    except ValueError as exc:
+        raise ConfigError(f"metadata.channels must be a JSON object of name -> PromQL: {exc}") from exc
+    if not isinstance(obj, dict) or not obj:
+        raise ConfigError("metadata.channels must be a non-empty JSON object of name -> PromQL")
+    out = []
+    for name, query in obj.items():
+        if not isinstance(query, str) or not query.strip() or not str(name).strip():
+            raise ConfigError(f"metadata.channels: {name!r} needs a non-empty PromQL string")
+        out.append((str(name).strip(), query.strip()))
+    return tuple(out)
+
+
 def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     """Validate ScaledObject trigger metadata. Raises ConfigError on bad input."""
     mode = (meta.get("mode") or "max").strip().lower()
@@ -125,6 +148,10 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     if history_steps < time_steps:
         raise ConfigError(f"metadata.historySteps must be >= timeSteps ({time_steps}), "
                           f"got {history_steps}")
+    channels = _channels(meta.get("channels"))
+    target_channel = (meta.get("targetChannel") or "cpu").strip()
+    if any(name == target_channel for name, _ in channels):
+        raise ConfigError(f"metadata.channels must not contain the target channel {target_channel!r}")
     breaker = (meta.get("breaker") or "on").strip().lower()
     if breaker not in ("on", "off", "true", "false"):
         raise ConfigError(f"metadata.breaker must be on|off, got {breaker!r}")
@@ -147,6 +174,8 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
         cache_seconds=_positive_float(meta, "cacheSeconds", default=15.0, allow_zero=True),
         timeout_seconds=_positive_float(meta, "timeoutSeconds", default=3.0),
         metric_name=(meta.get("metricName") or "predicted-demand").strip(),
+        channels=channels,
+        target_channel=target_channel,
         forecast_surge_factor=_positive_float(meta, "forecastSurgeFactor", default=3.0,
                                               allow_zero=True),
         breaker=breaker in ("on", "true"),

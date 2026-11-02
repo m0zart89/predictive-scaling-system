@@ -246,6 +246,9 @@ scalerDefaults:
   breakerJumpFactor: "2"
   breakerMinOpenSeconds: "600"
   breakerCalmPolls: "6"
+  # Name of the demand series when a workload lists extra channels (see
+  # workloads[].channels); the model's target channel.
+  targetChannel: cpu
   # Always-on reactive floor: a plain CPU trigger on the same ScaledObject
   # (KEDA takes the larger desired count). Needs CPU requests on the pods.
   reactiveFloor:
@@ -268,6 +271,11 @@ scalerDefaults:
 #     query: sum(rate(container_cpu_usage_seconds_total{container="api"}[2m]))
 #     targetValue: "0.7"              # demand one replica should carry (query units)
 #     maxReplicas: 20
+#     # extra input series for a multivariate model (request rate leads CPU):
+#     # the ScaledObject sends them next to the demand series and the CronJob
+#     # trains on them when this is training.workload
+#     channels:
+#       rps: sum(rate(http_requests_total{namespace="predictive", container="api"}[2m]))
 #     capacity: "4"
 workloads: []
 

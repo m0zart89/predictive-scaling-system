@@ -87,6 +87,13 @@ spec:
         activationValue: {{ $w.activationValue | default $d.activationValue | quote }}
         cacheSeconds: {{ $w.cacheSeconds | default $d.cacheSeconds | quote }}
         timeoutSeconds: {{ $w.timeoutSeconds | default $d.timeoutSeconds | quote }}
+        {{- with $w.channels }}
+        # extra input series for a multivariate model (channel name -> PromQL),
+        # sent next to the demand series under targetChannel; the CronJob trains
+        # on the same channels (training.workload)
+        channels: {{ . | toJson | quote }}
+        targetChannel: {{ $w.targetChannel | default $d.targetChannel | quote }}
+        {{- end }}
         # mode=max guard: the forecast may exceed observed demand by at most this factor
         forecastSurgeFactor: {{ $w.forecastSurgeFactor | default $d.forecastSurgeFactor | quote }}
         # circuit breaker: reactive scaling while the series does not resemble the history
@@ -122,12 +129,12 @@ capacity (as a YAML-encoded dict, decode with fromYaml).
 {{- $name := .Values.training.workload }}
 {{- range .Values.workloads }}
 {{- if or (and $name (eq .name $name)) (and (not $name) (not $found)) }}
-{{- $found = dict "name" .name "query" .query "capacity" (.capacity | default $.Values.scalerDefaults.capacity) }}
+{{- $found = dict "name" .name "query" .query "capacity" (.capacity | default $.Values.scalerDefaults.capacity) "channels" (.channels | default dict) "targetChannel" (.targetChannel | default $.Values.scalerDefaults.targetChannel) }}
 {{- end }}
 {{- end }}
 {{- if and $name (not $found) }}{{ fail (printf "training.workload %q is not in .Values.workloads" $name) }}{{ end }}
 {{- if and (not $found) .Values.demo.enabled }}
-{{- $found = dict "name" "cpu-burner" "query" .Values.demo.query "capacity" .Values.demo.predictive.capacity }}
+{{- $found = dict "name" "cpu-burner" "query" .Values.demo.query "capacity" .Values.demo.predictive.capacity "channels" dict "targetChannel" .Values.scalerDefaults.targetChannel }}
 {{- end }}
 {{- $found | toYaml }}
 {{- end }}

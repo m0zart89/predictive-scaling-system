@@ -337,3 +337,55 @@ def test_surge_cap_limits_how_far_the_forecast_may_exceed_observed(metrics):
     assert d.predicted == pytest.approx(0.8) and "capped at 2x" in d.reason
     d = eng.decide(NS, NAME, make_config(forecastSurgeFactor="2", mode="forecast"))
     assert d.predicted == pytest.approx(5.0)        # the cap is a mode=max guard only
+
+
+# ── multivariate channels ──────────────────────────────────────────────────────
+
+def test_extra_channels_are_fetched_on_the_targets_grid_and_sent_by_name(metrics):
+    import json
+
+    fc = FakeForecast(lambda v: 0.9)
+    rps = [100.0] * 8 + [None, 150.0]                     # a hole, then the newest sample
+    prom = FakePrometheus(WINDOW, by_query={"sum(rate(http_requests_total[1m]))": rps})
+    eng = engine_with(metrics, prom, fc)
+    cfg = make_config(capacity="2", channels=json.dumps({"rps": "sum(rate(http_requests_total[1m]))"}),
+                      targetChannel="cpu")
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "forecast"
+    sent = fc.calls[0]
+    assert set(sent) == {"cpu", "rps"}
+    assert sent["cpu"] == [v / 2 for v in WINDOW]           # the target, scaled by capacity
+    assert sent["rps"] == rps                               # raw units, hole kept (serving fills it)
+    assert prom.calls[1]["query"] == "sum(rate(http_requests_total[1m]))"
+    assert prom.calls[1]["now"] == pytest.approx(FakePrometheus.NOW)   # up to the target's newest sample
+
+
+def test_a_lagging_channel_is_carried_forward_and_a_failing_one_is_an_error(metrics, registry):
+    import json
+
+    class Lagging(FakePrometheus):
+        def fetch_history(self, address, query, points, step_seconds, timeout, now=None):
+            ts, vals = super().fetch_history(address, query, points, step_seconds, timeout, now)
+            if query == "rps":                              # newest sample one step old
+                return ts[:-1], vals[:-1]
+            return ts, vals
+
+    fc = FakeForecast(lambda v: 0.9)
+    prom = Lagging(WINDOW, by_query={"rps": [1.0] * 8 + [7.0, 9.0]})   # 9.0 not scraped yet
+    eng = engine_with(metrics, prom, fc)
+    eng.decide(NS, NAME, make_config(channels=json.dumps({"rps": "rps"})))
+    assert fc.calls[0]["rps"] == [1.0] * 8 + [7.0, 7.0]      # on the target grid, last value carried
+
+    prom = FakePrometheus(WINDOW, by_query={"rps": []})
+    prom.exc = None
+    eng = engine_with(metrics, prom, FakeForecast(lambda v: 0.9))
+
+    def failing(address, query, points, step_seconds, timeout, now=None):
+        if query == "rps":
+            raise PrometheusError("rps query failed")
+        return FakePrometheus.fetch_history(prom, address, query, points, step_seconds, timeout, now)
+
+    prom.fetch_history = failing
+    with pytest.raises(PrometheusError):
+        eng.decide(NS, NAME, make_config(channels=json.dumps({"rps": "rps"})))
+    assert registry.get_sample_value("predictive_scaler_prometheus_failures_total", labels()) == 1

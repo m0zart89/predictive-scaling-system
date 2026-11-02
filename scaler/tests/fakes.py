@@ -14,8 +14,9 @@ class FakePrometheus:
     """Returns a fixed history (None = missing sample; or raises) and records
     every call. Like the real client, the grid ends at the newest sample."""
 
-    def __init__(self, values=None, exc=None):
+    def __init__(self, values=None, exc=None, by_query=None):
         self.values = list(values or [])
+        self.by_query = dict(by_query or {})   # query → values for extra channels
         self.exc = exc
         self.calls = []
 
@@ -23,10 +24,10 @@ class FakePrometheus:
 
     def fetch_history(self, address, query, points, step_seconds, timeout, now=None):
         self.calls.append(dict(address=address, query=query, points=points,
-                               step_seconds=step_seconds, timeout=timeout))
+                               step_seconds=step_seconds, timeout=timeout, now=now))
         if self.exc:
             raise self.exc
-        values = self.values[-points:]
+        values = list(self.by_query.get(query, self.values))[-points:]
         timestamps = [self.NOW - (len(values) - 1 - i) * step_seconds for i in range(len(values))]
         return timestamps, values
 
@@ -51,7 +52,7 @@ class FakeForecast:
         self.calls = []
 
     def predict(self, base_url, values, timeout, series=None, timestamp=None, step_seconds=None):
-        self.calls.append(list(values))
+        self.calls.append(dict(values) if isinstance(values, dict) else list(values))
         self.kwargs = dict(series=series, timestamp=timestamp, step_seconds=step_seconds)
         if self.exc:
             raise self.exc

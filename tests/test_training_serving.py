@@ -391,3 +391,51 @@ def test_quality_tracking_can_be_switched_off(registry, serving):
     assert off.record("x", [0.5] * 10, [0.5], 300, timestamp=1_700_000_000) == 0
     assert off.record("x", [0.5] * 9 + [0.7], [0.5], 300, timestamp=1_700_000_300) == 0
     assert off.snapshot() == {}
+
+
+def test_multivariate_model_takes_one_list_per_channel(registry, serving):
+    """A model trained on cpu + rps is served from {"cpu": [...], "rps": [...]}:
+    per-channel scalers, the pipeline's exact forecast, 422 without a channel,
+    and a one-series model still takes a plain list (or its one channel by name)."""
+    rng = np.random.default_rng(3)
+    ts, cpu = demand(days=8)
+    rps = np.roll(cpu, -2) * 300 + rng.normal(0, 3, len(cpu))
+    values = np.stack([cpu, rps])
+    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta"], channels=("cpu", "rps")),
+                       "test", timestamps=ts)
+    assert out.promoted
+    serving_app.load_model()
+    info = serving.get("/model-info").json()
+    assert info["channels"] == ["cpu", "rps"] and info["input_length"] == 10
+
+    from mlflow.tracking import MlflowClient
+    bundle, _, _ = load_champion(MlflowClient(), "cpu-forecasting", "champion")
+    assert len(bundle.scalers) == 2
+    body = {"values": {"cpu": [float(v) for v in cpu[-10:]], "rps": [float(v) for v in rps[-10:]]}}
+    resp = serving.post("/predict", json=body)
+    assert resp.status_code == 200, resp.text
+    np.testing.assert_allclose(resp.json()["predictions"], bundle.predict(values[:, -10:][None, :, :])[0],
+                               rtol=1e-9)
+    # a longer rps history with a gap in its older part is fine; its tail is used
+    body["values"]["rps"] = [None, 5.0] + body["values"]["rps"]
+    assert serving.post("/predict", json=body).status_code == 200
+    r = serving.post("/predict", json={"values": {"cpu": body["values"]["cpu"]}})
+    assert r.status_code == 422 and "Missing channel(s) ['rps']" in r.json()["detail"]
+    r = serving.post("/predict", json={"values": body["values"]["cpu"]})
+    assert r.status_code == 422 and "takes 2 channels" in r.json()["detail"]
+    r = serving.post("/predict", json={"values": {"cpu": [0.1] * 10, "rps": [0.1] * 9 + [None]}})
+    assert r.status_code == 422                                   # the last value must be present
+
+    # the quality tracker scores the target channel
+    serving.post("/predict", json={**body, "series": "x", "timestamp": int(ts[-1])})
+    assert serving.get("/model-info").json()["rolling_mae"] == {}
+
+    # back to a one-series model: a list, or a dict with its single channel
+    run_pipeline(cpu, TrainConfig(horizon=2, candidates=["hgb_delta"], min_improvement=-1.0,
+                                  min_fresh_windows=1), "test", timestamps=ts)
+    serving_app.refresh_model()
+    info = serving.get("/model-info").json()
+    assert info["channels"] == [] and info["model_version"] == "2"
+    plain = serving.post("/predict", json={"values": [0.3] * 10}).json()["predictions"]
+    assert serving.post("/predict", json={"values": {"cpu": [0.3] * 10}}).json()["predictions"] == plain
+    assert serving.post("/predict", json={"values": {"cpu": [0.3] * 10, "rps": [1.0] * 10}}).status_code == 422

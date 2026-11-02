@@ -33,6 +33,16 @@ weekends and irregular days that a phase alone averages away. The input grows
 to `time_steps + season_steps` samples (`season_steps = period / step`); the
 scaler fetches that much history and serving fills gaps in the older part.
 
+Why channels ("channels" in the meta)
+-------------------------------------
+A workload's demand is one series, but other series lead it: the request
+rate climbs before CPU does, memory tells a leak from a cache warming up.
+A model may take several channels; channel 0 is the target (what the scaler
+scales on, what the horizon is forecast for), the rest are exogenous inputs.
+Each channel has its own MinMaxScaler and contributes its anchored window;
+the target channel also carries the seasonal / time-of-day features. The
+request body then holds one list per channel name instead of one list.
+
 Why a "delta" target
 --------------------
 A tree ensemble predicts by averaging training targets, so it can never forecast
@@ -46,10 +56,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from typing import Tuple
 
 import numpy as np
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 FEATURE_KINDS = ("window", "anchored", "anchored_tod", "anchored_season")
 TARGET_KINDS = ("level", "delta")
 # Feature kinds that need the timestamp of each window's last sample.
@@ -70,9 +81,14 @@ class ForecastMeta:
     period_seconds: int = 86400   # seasonal cycle for anchored_tod (a real day; 2400 in the benchmark)
     season_steps: int = 0      # anchored_season: samples per cycle (period / step); the input is
                                # time_steps + season_steps samples long. 0 for the other kinds.
+    channels: Tuple[str, ...] = ()   # () = one unnamed series; else channel names, [0] the target
     format_version: int = FORMAT_VERSION
 
     def __post_init__(self):
+        if not isinstance(self.channels, tuple):
+            object.__setattr__(self, "channels", tuple(self.channels or ()))
+        if len(set(self.channels)) != len(self.channels):
+            raise ValueError("channel names must be unique")
         if self.features not in FEATURE_KINDS:
             raise ValueError(f"features must be one of {FEATURE_KINDS}")
         if self.target not in TARGET_KINDS:
@@ -93,8 +109,16 @@ class ForecastMeta:
 
     @property
     def input_length(self) -> int:
-        """Samples a caller must send: the window, preceded by one season for seasonal kinds."""
+        """Samples a caller must send per channel: the window, preceded by one season for seasonal kinds."""
         return self.time_steps + self.season_steps
+
+    @property
+    def n_channels(self) -> int:
+        return max(1, len(self.channels))
+
+    @property
+    def multivariate(self) -> bool:
+        return len(self.channels) > 1
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -196,3 +220,45 @@ def from_target(X: np.ndarray, out: np.ndarray, kind: str) -> np.ndarray:
     if out.ndim == 1:
         out = out.reshape(-1, 1) if np.atleast_2d(X).shape[0] > 1 else out.reshape(1, -1)
     return out + np.atleast_2d(X)[:, -1:] if kind == "delta" else out
+
+
+def make_windows_mv(values: np.ndarray, time_steps: int, horizon: int, season_steps: int = 0):
+    """
+    make_windows over a (channels, n) array: X (n_windows, channels, input_length)
+    with every channel's samples for the same instants, Y (n_windows, horizon)
+    from channel 0, and first_target as make_windows returns it.
+    """
+    values = np.atleast_2d(np.asarray(values, dtype=np.float64))
+    xs = []
+    for ch in values:
+        X, Y0, first = make_windows(ch, time_steps, horizon, season_steps)
+        xs.append(X)
+        if len(xs) == 1:
+            Y, first_target = Y0, first
+    return np.stack(xs, axis=1), Y, first_target
+
+
+def build_features_mv(X: np.ndarray, kind: str, last_ts=None, period_seconds: int = 86400,
+                      time_steps: int | None = None, horizon: int | None = None) -> np.ndarray:
+    """
+    Features for a (n, channels, input_length) input: channel 0 gets the full
+    treatment of build_features (window shape, level, season or phase); every
+    other channel contributes its anchored window — its last time_steps samples
+    relative to its own last value, plus that value. A 2-D input is one channel.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim == 2:
+        return build_features(X, kind, last_ts, period_seconds, time_steps, horizon)
+    parts = [build_features(X[:, 0, :], kind, last_ts, period_seconds, time_steps, horizon)]
+    ts = time_steps or X.shape[2]
+    for j in range(1, X.shape[1]):
+        w = X[:, j, -ts:]
+        last = w[:, -1:]
+        parts.append(np.hstack([w[:, :-1] - last, last]))
+    return np.hstack(parts)
+
+
+def target_channel(X: np.ndarray) -> np.ndarray:
+    """The target channel's rows of a 2-D or 3-D input (n, input_length)."""
+    X = np.asarray(X, dtype=np.float64)
+    return X[:, 0, :] if X.ndim == 3 else np.atleast_2d(X)

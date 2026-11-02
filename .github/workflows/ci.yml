@@ -222,6 +222,13 @@ jobs:
           test "$(grep -c '^kind: ScaledObject$' /tmp/workloads.yaml)" = 2
           grep -Fq 'container=\"worker\"}[2m]))) / 1"' /tmp/workloads.yaml
           grep -q 'stepSeconds: "60"' /tmp/workloads.yaml
+          # the worker's extra channel reaches its ScaledObject and the CronJob (as JSON)
+          grep -Fq 'channels: "{\"rps\":\"sum(rate(http_requests_total{container=\"worker\"}[2m]))\"}"' /tmp/workloads.yaml
+          grep -q 'targetChannel: "cpu"' /tmp/workloads.yaml
+          grep -q 'name: TRAIN_CHANNELS' /tmp/workloads.yaml
+          if grep -q 'name: TRAIN_CHANNELS' /tmp/stack.yaml; then
+            echo "::error::TRAIN_CHANNELS rendered for a workload without channels"; exit 1
+          fi
           # history follows each workload's own step: 10 + 86400/60 for the worker
           grep -q 'historySteps: "1450"' /tmp/workloads.yaml
           grep -q 'historySteps: "298"' /tmp/workloads.yaml
@@ -313,7 +320,8 @@ jobs:
           grep -q 'alertname =~ "ForecastDriftHigh|ForecastBreakerOpenLong"' /tmp/prod.yaml
           grep -q 'forecast_training.trigger' /tmp/prod.yaml
           grep -q 'resourceNames: \[forecast-retrain\]' /tmp/prod.yaml
-          test "$(grep -c 'name: retrain-trigger-token' /tmp/prod.yaml)" -ge 3
+          test "$(grep -c 'name: retrain-trigger-token' /tmp/prod.yaml)" -ge 2
+          grep -q 'secretName: retrain-trigger-token' /tmp/prod.yaml
           helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
             --set alertmanager.enabled=true --set training.trigger.enabled=true | grep -q 'targets: \[alertmanager:9093\]'
           # default-deny ingress with the pilot profile

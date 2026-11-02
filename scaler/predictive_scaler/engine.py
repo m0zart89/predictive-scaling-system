@@ -78,6 +78,30 @@ class PredictiveEngine:
         # one breaker per ScaledObject; its thresholds come from the trigger metadata
         self._breakers: Dict[Tuple[str, str], CircuitBreaker] = {}
 
+    def _channels(self, cfg: ScalerConfig, grid_ts, length: int) -> Dict[str, list]:
+        """
+        Each extra channel's history, aligned to the target's grid: fetched up to
+        the target's newest instant, shifted onto its timestamps, holes as None.
+        A channel whose newest sample lags the target's (a slower scrape) is
+        carried forward over the trailing gap: a slightly stale rate is a fine
+        input, a missing one would cost the forecast.
+        """
+        out: Dict[str, list] = {}
+        newest = grid_ts[-1]
+        for name, query in cfg.channels:
+            ts, vals = self.prometheus.fetch_history(cfg.prometheus_address, query, cfg.history_steps,
+                                                     cfg.step_seconds, cfg.timeout_seconds, now=newest)
+            by_ts = {t: v for t, v in zip(ts, vals)}
+            row = [by_ts.get(t) for t in grid_ts[-length:]]
+            last = next((v for v in reversed(row) if v is not None), None)
+            if last is not None:
+                for i in range(len(row) - 1, -1, -1):
+                    if row[i] is not None:
+                        break
+                    row[i] = last
+            out[name] = row
+        return out
+
     def _breaker(self, key: str, cfg: ScalerConfig) -> CircuitBreaker:
         bk = (key, cfg.cache_key)
         if bk not in self._breakers:
@@ -166,6 +190,14 @@ class PredictiveEngine:
                 model_input = [None if v is None else v / cfg.capacity for v in history]
             else:
                 model_input = [v / cfg.capacity for v in values[-cfg.time_steps:]]
+            if cfg.channels:
+                # multivariate: the extra series on the target's grid, keyed by channel name
+                try:
+                    model_input = {cfg.target_channel: model_input,
+                                   **self._channels(cfg, grid_ts, len(model_input))}
+                except PrometheusError:
+                    self.metrics.prometheus_failures.labels(**labels).inc()
+                    raise
             started = time.perf_counter()
             try:
                 # series + the last sample's time let forecast-serving score this
