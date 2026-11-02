@@ -114,3 +114,59 @@ def test_unknown_candidate_is_an_error(mlflow_tmp, series):
     ts, values = series
     with pytest.raises(ValueError, match="unknown"):
         run_pipeline(values, cfg(candidates=["xgb"]), "test", timestamps=ts)
+
+
+def test_baselines_are_logged_and_the_chosen_one_gates_promotion(mlflow_tmp, series):
+    """Both baselines land in the summary; --baseline says which the winner must
+    beat. An impossible bar (persistence scored with an absurd weight is still
+    the same windows) is simulated by asking for the seasonal baseline on a
+    series where it is unbeatable: a noiseless repeat of one day."""
+    ts, values = series
+    out = run_pipeline(values, cfg(dry_run=True), "test", timestamps=ts)
+    m = out.metrics
+    assert {"winner_cost", "winner_coverage", "naive_cost", "seasonal_naive_cost",
+            "seasonal_naive_rmse"} <= set(m)
+    assert out.decision == "dry_run" and "cost" in out.reason
+
+    client = MlflowClient()
+    run = client.get_run(out.run_id)
+    assert run.data.params["under_weight"] == "3.0" and run.data.params["baseline"] == "persistence"
+    assert "seasonal_naive_cost" in run.data.metrics and "naive_coverage" in run.data.metrics
+
+    import numpy as np
+    day = values[:288]
+    exact = np.tile(day, 10)                      # every day identical: yesterday is perfect
+    out = run_pipeline(exact, cfg(baseline="seasonal", dry_run=True), "test", timestamps=ts[:2880])
+    assert out.decision == "rejected" and "seasonal persistence baseline" in out.reason
+    assert out.metrics["seasonal_naive_cost"] == pytest.approx(0.0)
+    out = run_pipeline(exact, cfg(baseline="persistence", dry_run=True), "test", timestamps=ts[:2880])
+    assert out.decision == "dry_run"              # the easy baseline is still beaten
+    with pytest.raises(ValueError, match="baseline"):
+        cfg(baseline="none")
+    with pytest.raises(ValueError, match="under_weight"):
+        cfg(under_weight=0)
+
+
+def test_registered_version_carries_cost_and_weight_tags(mlflow_tmp, series):
+    ts, values = series
+    out = run_pipeline(values, cfg(under_weight=2.0), "test", timestamps=ts)
+    tags = MlflowClient().get_model_version("cpu-forecasting", out.version).tags
+    assert tags["under_weight"] == "2" and float(tags["holdout_cost"]) > 0
+    assert 0.0 <= float(tags["holdout_coverage"]) <= 1.0
+    assert MlflowClient().get_run(out.run_id).data.params["under_weight"] == "2.0"
+
+
+def test_cli_accepts_under_weight_and_baseline(mlflow_tmp, tmp_path, capsys):
+    from conftest import daily_series
+    ts, values = daily_series(days=6)
+    export = tmp_path / "e.json"
+    export.write_text(json.dumps({"status": "success", "data": {"resultType": "matrix", "result": [
+        {"metric": {}, "values": [[int(t), str(v)] for t, v in zip(ts, values)]}]}}))
+    assert main(["--export", str(export), "--candidates", "hgb_delta", "--horizon", "2",
+                 "--under-weight", "1", "--baseline", "best", "--dry-run"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["decision"] == "dry_run" and "winner_cost" in printed["metrics"]
+    import mlflow
+    run = mlflow.search_runs(experiment_names=["cpu-forecasting"], output_format="list",
+                             filter_string="tags.decision = 'dry_run'")[0]
+    assert run.data.params["under_weight"] == "1.0" and run.data.params["baseline"] == "best"

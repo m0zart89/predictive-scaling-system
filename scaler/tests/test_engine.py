@@ -196,3 +196,40 @@ def test_forecast_call_carries_series_key_and_window_time(metrics):
     # the last sample's own time, so serving can match the actual later
     assert fc.kwargs["timestamp"] == pytest.approx(FakePrometheus.NOW, abs=1e-6)
     assert fc.kwargs["step_seconds"] == 300
+
+
+# ── history for seasonal models ────────────────────────────────────────────────
+
+def test_long_history_is_sent_whole_with_holes_as_none(metrics):
+    """historySteps > timeSteps: the forecast call carries the whole history,
+    scaled to model units, with None where Prometheus had no sample; the
+    decision itself still rests on the trailing window."""
+    history = [None, 0.6, None, 0.8] + [0.2] * 9 + [0.4]      # 14 samples, 10 contiguous at the end
+    fc = FakeForecast(lambda v: 0.9)
+    prom = FakePrometheus(history)
+    eng = engine_with(metrics, prom, fc)
+    d = eng.decide(NS, NAME, make_config(timeSteps="10", historySteps="14", capacity="2"))
+    assert prom.calls[0]["points"] == 14
+    assert fc.calls[0] == [None, 0.3, None, 0.4] + [0.1] * 9 + [0.2]
+    assert d.source == "forecast" and d.observed == pytest.approx(0.4)
+    assert fc.kwargs["timestamp"] == pytest.approx(FakePrometheus.NOW)
+    # history shorter than asked (a young cluster): the older part is simply absent
+    prom = FakePrometheus([0.2] * 9 + [0.4])
+    fc = FakeForecast(lambda v: 0.9)
+    engine_with(metrics, prom, fc).decide(NS, NAME, make_config(historySteps="298"))
+    assert len(fc.calls[0]) == 10 and prom.calls[0]["points"] == 298
+
+
+def test_a_hole_inside_the_window_still_means_observed_demand(metrics):
+    history = [0.2] * 20 + [None] + [0.3] * 5                 # only 5 contiguous samples at the end
+    fc = FakeForecast(lambda v: 0.9)
+    d = engine_with(metrics, FakePrometheus(history), fc).decide(
+        NS, NAME, make_config(timeSteps="10", historySteps="26"))
+    assert d.source == "observed" and d.value == pytest.approx(0.3)
+    assert "5/10 samples" in d.reason and fc.calls == []
+
+
+def test_default_history_equals_the_window_and_the_call_is_unchanged(metrics):
+    fc = FakeForecast(lambda v: 0.9)
+    engine_with(metrics, FakePrometheus([0.5] * 12), fc).decide(NS, NAME, make_config())
+    assert fc.calls[0] == [0.5] * 10                          # exactly timeSteps values, no nulls

@@ -42,13 +42,15 @@ jobs:
           PYTHONPATH=training python -m forecast_training.traces wikipedia \
             --project "${{ matrix.project }}" --days 30 --out traces/views.json
 
-      - name: "Train (dry run, SQLite MLflow): 24 h window, 6 h horizon, daily phase"
+      # The bar is the better of plain and seasonal persistence (the same hour
+      # yesterday): on daily traffic the seasonal one is the baseline worth beating.
+      - name: "Train (dry run, SQLite MLflow): 24 h window, 6 h horizon, daily season"
         env:
           MLFLOW_TRACKING_URI: sqlite:///${{ runner.temp }}/mlflow.db
         run: |
           PYTHONPATH=training python -m forecast_training --export traces/views.json \
             --step-seconds 3600 --time-steps 24 --horizon 6 --period-seconds 86400 \
-            --dry-run --summary traces/summary.json | tee traces/train.log
+            --baseline best --dry-run --summary traces/summary.json | tee traces/train.log
 
       - name: Check the outcome
         run: |
@@ -56,10 +58,15 @@ jobs:
           import json
           s = json.load(open("traces/summary.json"))
           print(json.dumps(s, indent=2))
-          assert s["decision"] in ("dry_run",), s["reason"]          # would promote: beats persistence
           m = s["metrics"]
-          print(f"winner rmse {m['winner_rmse']:.1f} vs persistence {m['naive_rmse']:.1f} "
-                f"({100 * (1 - m['winner_rmse'] / m['naive_rmse']):.0f}% better)")
+          def vs(key):
+              return f"{m[key]:.1f} ({100 * (1 - m['winner_cost'] / m[key]):+.0f}% cost)"
+          print(f"winner {s['winner']}: cost {m['winner_cost']:.1f}, rmse {m['winner_rmse']:.1f}, "
+                f"coverage {m['winner_coverage']:.2f}")
+          print(f"  persistence cost {vs('naive_cost')}, rmse {m['naive_rmse']:.1f}")
+          if "seasonal_naive_cost" in m:
+              print(f"  seasonal persistence cost {vs('seasonal_naive_cost')}, rmse {m['seasonal_naive_rmse']:.1f}")
+          assert s["decision"] in ("dry_run",), s["reason"]          # would promote: beats the baseline
           PY
 
       - name: Candidate table from MLflow
@@ -69,11 +76,17 @@ jobs:
           python - <<'PY' | tee traces/candidates.md
           import mlflow
           runs = mlflow.search_runs(experiment_names=["cpu-forecasting"], output_format="list")
-          rows = [(r.info.run_name, r.data.metrics) for r in runs if "holdout_rmse" in r.data.metrics]
-          print("| candidate | holdout RMSE | holdout MAE | level tracking |")
-          print("|---|---|---|---|")
-          for name, m in sorted(rows, key=lambda x: x[1]["holdout_rmse"]):
-              print(f"| {name} | {m['holdout_rmse']:.1f} | {m['holdout_mae']:.1f} | {m['level_tracking']:.2f} |")
+          rows = [(r.info.run_name, r.data.metrics) for r in runs if "holdout_cost" in r.data.metrics]
+          parent = [r.data.metrics for r in runs if "naive_cost" in r.data.metrics][0]
+          print("| candidate | holdout cost | coverage | holdout RMSE | holdout MAE | level tracking |")
+          print("|---|---|---|---|---|---|")
+          for name, m in sorted(rows, key=lambda x: x[1]["holdout_cost"]):
+              print(f"| {name} | {m['holdout_cost']:.1f} | {m['holdout_coverage']:.2f} | {m['holdout_rmse']:.1f} "
+                    f"| {m['holdout_mae']:.1f} | {m['level_tracking']:.2f} |")
+          for label, p in (("persistence", "naive_"), ("seasonal persistence", "seasonal_naive_")):
+              if p + "cost" in parent:
+                  print(f"| *{label}* | {parent[p + 'cost']:.1f} | {parent[p + 'coverage']:.2f} "
+                        f"| {parent[p + 'rmse']:.1f} | {parent[p + 'mae']:.1f} | — |")
           PY
 
       - name: Upload

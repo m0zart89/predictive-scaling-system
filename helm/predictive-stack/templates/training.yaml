@@ -66,6 +66,10 @@ spec:
                   value: {{ $t.cronjob.horizon | quote }}
                 - name: TRAIN_MIN_IMPROVEMENT
                   value: {{ $t.cronjob.minImprovement | quote }}
+                - name: TRAIN_UNDER_WEIGHT
+                  value: {{ $t.cronjob.underWeight | quote }}
+                - name: TRAIN_BASELINE
+                  value: {{ $t.cronjob.baseline | quote }}
                 - name: MODEL_NAME
                   value: cpu-forecasting
                 - name: MODEL_ALIAS
@@ -137,6 +141,8 @@ spec:
             - --step-seconds={{ $t.bootstrap.stepSeconds }}
             - --time-steps={{ $t.bootstrap.timeSteps }}
             - --horizon={{ $t.bootstrap.horizon }}
+            - --period-seconds={{ $t.cronjob.periodSeconds }}
+            - --under-weight={{ $t.cronjob.underWeight }}
             - --reload-url=http://forecast-serving:8080
           env:
             - name: MLFLOW_TRACKING_URI
