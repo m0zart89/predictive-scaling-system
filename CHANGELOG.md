@@ -5,6 +5,18 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 
 ## Unreleased
 
+### Model warm-up (PR #13)
+
+- **A model is warmed up before it is swapped in.** After the download
+  (registry or cache) and before the reference swap, `warm_up` runs one
+  forecast on a synthetic window shaped like a real request: the first
+  call's lazy state (prediction buffers, threadpools, the feature
+  pipeline's first allocation) is paid off the request path, and a version
+  that loads but cannot forecast (wrong horizon, non-finite output, an
+  exception) is rejected while the current model keeps serving
+  (`forecast_model_reloads_total{result="failure"}`).
+  `forecast_model_warmup_seconds` reports the last warm-up.
+
 ### Scaler metric conditioning (PR #12)
 
 - **EWMA on the forecast.** `smoothingAlpha` (0.3): `S = α·Y + (1−α)·S_prev`

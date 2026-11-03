@@ -438,3 +438,44 @@ def test_multivariate_model_takes_one_list_per_channel(registry, serving):
     plain = serving.post("/predict", json={"values": [0.3] * 10}).json()["predictions"]
     assert serving.post("/predict", json={"values": {"cpu": [0.3] * 10}}).json()["predictions"] == plain
     assert serving.post("/predict", json={"values": {"cpu": [0.3] * 10, "rps": [1.0] * 10}}).status_code == 422
+
+
+def test_a_new_model_is_warmed_up_before_it_is_swapped_in(registry, serving, monkeypatch):
+    """The warm-up forecast runs on the freshly loaded bundle while the store
+    still holds the previous (or no) model; only then is the reference swapped."""
+    from prometheus_client import REGISTRY
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    events = []
+    original = serving_app.warm_up
+
+    def spy(bundle):
+        events.append(("warm_up", serving_app.STORE.loaded, bundle.info["model_version"]))
+        return original(bundle)
+
+    monkeypatch.setattr(serving_app, "warm_up", spy)
+    serving_app.load_model()
+    assert events == [("warm_up", False, "1")]           # warmed up before the store had a model
+    assert serving.get("/readyz").json()["model_version"] == "1"
+    assert (REGISTRY.get_sample_value("forecast_model_warmup_seconds") or 0) > 0
+
+
+def test_a_model_that_cannot_forecast_is_rejected_and_the_old_one_keeps_serving(registry, serving, monkeypatch):
+    from prometheus_client import REGISTRY
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    failures_before = REGISTRY.get_sample_value("forecast_model_reloads_total", {"result": "failure"}) or 0
+
+    def broken(self, values, timestamp=None):
+        raise ValueError("feature shape mismatch")
+
+    with monkeypatch.context() as m:
+        m.setattr(serving_app.Bundle, "forecast", broken)
+        with pytest.raises(RuntimeError, match="warm-up forecast failed"):
+            serving_app.load_model()
+        assert REGISTRY.get_sample_value("forecast_model_reloads_total", {"result": "failure"}) == failures_before + 1
+        assert serving.get("/readyz").status_code == 200 and REGISTRY.get_sample_value("forecast_model_loaded") == 1
+    assert serving.post("/predict", json={"values": [0.3] * 10}).status_code == 200
