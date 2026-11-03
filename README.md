@@ -66,7 +66,7 @@ Versioned models with a `@champion` alias the pipeline moves atomically; artifac
 
 ### Inference service (`serving/`)
 
-A stateless FastAPI service: validates the input, applies the stored scaler(s) and the model's feature/target transform, returns the whole horizon, follows the registry alias on its own (every replica polls it, `/reload` is for operators), keeps a last-known-good copy of the model to serve from when MLflow is down at startup, and scores its own past forecasts (`serving/quality.py`: in the pod with one replica, in Redis with several — forecasts stored with a 24 h TTL, error windows as bounded Redis lists). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve. Under `global.tls.enabled` it requires client certificates.
+A stateless FastAPI service: validates the input, applies the stored scaler(s) and the model's feature/target transform, returns the whole horizon, follows the registry alias on its own (every replica polls it; a new version is warmed up with one forecast before it is swapped in, and rejected if it cannot forecast), keeps a last-known-good copy of the model to serve from when MLflow is down at startup, and scores its own past forecasts (`serving/quality.py`: in the pod with one replica, in Redis with several — forecasts stored with a 24 h TTL, error windows as bounded Redis lists). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve. Under `global.tls.enabled` it requires client certificates.
 
 ### Predictive scaler (`scaler/`)
 
@@ -333,7 +333,7 @@ Everything runs on a local [kind](https://kind.sigs.k8s.io/) cluster from one sc
 ./scripts/up.sh
 ```
 
-What it does: creates the cluster (with ingress-nginx and metrics-server), builds the four images and loads them into kind, installs the [`helm/predictive-stack`](helm/predictive-stack/) umbrella chart (MLflow, Prometheus, Grafana, forecast-serving, predictive-scaler, KEDA, the demo workload with its `ScaledObject`, the retraining CronJob), trains the first model from `notebooks/data-jan-2022.json` in-cluster and calls `/reload`, then smoke-tests `/predict` and the scaler's gRPC API. About 10 minutes on a laptop.
+What it does: creates the cluster (with ingress-nginx and metrics-server), builds the four images and loads them into kind, installs the [`helm/predictive-stack`](helm/predictive-stack/) umbrella chart (MLflow, Prometheus, Grafana, forecast-serving, predictive-scaler, KEDA, the demo workload with its `ScaledObject`, the retraining CronJob), trains the first model from `notebooks/data-jan-2022.json` in-cluster (serving picks it up on its next poll), then smoke-tests `/predict` and the scaler's gRPC API. About 10 minutes on a laptop.
 
 Then:
 

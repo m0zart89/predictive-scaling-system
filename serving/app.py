@@ -166,6 +166,10 @@ MODEL_HOLDOUT_MAE = Gauge(
     "version's tags); the drift alert compares the live MAE with it",
     ["horizon_step"],
 )
+MODEL_WARMUP_SECONDS = Gauge(
+    "forecast_model_warmup_seconds",
+    "Duration of the warm-up forecast run on the last loaded model before it was swapped in",
+)
 INPUT_FILLED = Counter(
     "forecast_input_filled_total",
     "Values filled in by interpolation in the seasonal (older) part of /predict inputs: gaps "
@@ -398,6 +402,41 @@ def _validated(bundle: Bundle) -> Bundle:
     return bundle
 
 
+def warm_up(bundle: Bundle) -> float:
+    """
+    Run one forecast through the bundle before it is swapped into service:
+    a synthetic window shaped like a real request (mid-range values of each
+    channel's training range, `input_length` samples, timestamped now).
+    The first call of a freshly unpickled model pays for lazy state the
+    estimators build on demand (threadpools, prediction buffers, the feature
+    pipeline's first allocation); paying it here keeps it off the first
+    request. The output is also checked (horizon length, finite), so a model
+    that loads but cannot forecast is rejected before it replaces a working
+    one. Blocking; called from a thread. Returns the duration in seconds.
+    """
+    meta = bundle.meta
+    length = input_length(meta)
+    rows = []
+    for sc in bundle.scalers:
+        lo = float(np.ravel(getattr(sc, "data_min_", [0.0]))[0])
+        hi = float(np.ravel(getattr(sc, "data_max_", [1.0]))[0])
+        mid = lo + 0.5 * (hi - lo) if math.isfinite(lo) and math.isfinite(hi) else 0.5
+        rows.append(np.full(length, mid, dtype=float))
+    dummy = rows[0] if len(rows) == 1 else np.stack(rows)
+    started = time.perf_counter()
+    try:
+        out = bundle.forecast(dummy, time.time())
+    except Exception as exc:
+        raise RuntimeError(f"warm-up forecast failed: {exc!r}") from exc
+    elapsed = time.perf_counter() - started
+    if len(out) != int(meta["horizon"]) or not all(math.isfinite(v) for v in out):
+        raise RuntimeError(f"warm-up forecast returned {out!r} for a horizon of {meta['horizon']}")
+    MODEL_WARMUP_SECONDS.set(elapsed)
+    log.info("warm-up of v%s done in %.1f ms (%d value(s), %d channel(s))",
+             bundle.info["model_version"], elapsed * 1000, len(out), len(bundle.scalers))
+    return elapsed
+
+
 # ── Last-known-good cache ──────────────────────────────────────────────────────
 
 def write_cache(bundle: Bundle) -> None:
@@ -469,7 +508,8 @@ class ModelStore:
     # synchronous entry points (blocking; the worker calls them in a thread)
 
     def install(self, bundle: Bundle) -> None:
-        """Hot-swap: one reference assignment under the swap lock, then metrics."""
+        """Hot-swap: one reference assignment under the swap lock, then metrics.
+        Callers warm the bundle up first (warm_up); nothing untested is swapped in."""
         info = {**bundle.info, "loaded_at": datetime.now(timezone.utc).isoformat()}
         bundle = Bundle(bundle.model, bundle.scalers, bundle.meta, info, bundle.tags)
         with self._swap:
@@ -499,6 +539,7 @@ class ModelStore:
         model, if any, keeps serving."""
         try:
             bundle = fetch_bundle()
+            warm_up(bundle)                      # before the swap: a model that cannot forecast never serves
         except Exception:
             MODEL_RELOADS.labels(result="failure").inc()
             if self._bundle is None:
@@ -515,6 +556,7 @@ class ModelStore:
 
     def load_from_cache(self) -> Bundle:
         bundle = read_cache()
+        warm_up(bundle)
         self.install(bundle)
         log.warning("serving model v%s from the cache at %s; the registry is unavailable",
                     bundle.info["model_version"], MODEL_CACHE_DIR)
