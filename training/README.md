@@ -9,7 +9,8 @@ source ─► regularise ─► train candidates ─► holdout RMSE + level tra
                                                     │
                      compare with @champion on data it has not seen
                                                     │
-               register version, tag data_end_ts, move @champion ─► POST /reload
+               register version, tag data_end_ts, move @champion
+               (every forecast-serving replica polls the alias and swaps the model)
 ```
 
 ## Run
@@ -22,10 +23,10 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 python -m forecast_training --export ../notebooks/data-jan-2022.json \
     --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z
 
-# from live Prometheus, then reload serving
+# from live Prometheus (the serving replicas pick the new champion up on their own)
 python -m forecast_training --prometheus http://prometheus:9090 \
     --query 'sum(rate(process_cpu_seconds_total{app="cpu-burner"}[5m]))' \
-    --days 14 --reload-url http://forecast-serving:8080
+    --days 14
 ```
 
 Every flag has an environment variable (`TRAIN_*`, `MODEL_NAME`, `MODEL_ALIAS`,

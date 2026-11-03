@@ -2,8 +2,8 @@
 {{- $np := .Values.security.networkPolicy }}
 {{- $ns := .Release.Namespace }}
 # Needs a CNI that enforces NetworkPolicy (kind's default kindnet does not).
-# Only the scaler, the training jobs, Prometheus and the ingress controller
-# may talk to forecast-serving; everything else in the cluster is refused.
+# Only the scaler, Prometheus and the ingress controller may talk to
+# forecast-serving; everything else in the cluster is refused.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -20,15 +20,6 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: predictive-scaler
-        - podSelector:
-            matchLabels:
-              app: forecast-retrain
-        - podSelector:
-            matchLabels:
-              app: train-bootstrap
-        - podSelector:
-            matchLabels:
-              app: retrain-trigger
         - podSelector:
             matchLabels:
               app: prometheus

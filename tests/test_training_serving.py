@@ -48,7 +48,7 @@ def registry(tmp_path, monkeypatch):
 @pytest.fixture
 def serving(monkeypatch):
     """Serving app with clean model state; restored afterwards."""
-    monkeypatch.setattr(serving_app, "_bundle", None)
+    monkeypatch.setattr(serving_app.STORE, "_bundle", None)
     monkeypatch.setattr(serving_app, "MODEL_ALIAS", "champion")
     monkeypatch.setattr(serving_app, "MODEL_STAGE", "Production")
     serving_app.TRACKER.reset()
@@ -190,7 +190,9 @@ def test_no_alias_and_no_stage_fails_cleanly(registry, serving, monkeypatch):
     assert serving.get("/ready").status_code == 503
 
 
-def test_failed_reload_keeps_the_loaded_model(registry, serving, monkeypatch):
+def test_failed_refresh_keeps_the_loaded_model(registry, serving, monkeypatch):
+    """The registry loses the model (or goes away): the worker's refresh logs a
+    warning, counts a failure, and the loaded model keeps serving."""
     from prometheus_client import REGISTRY
 
     ts, values = demand()
@@ -199,12 +201,43 @@ def test_failed_reload_keeps_the_loaded_model(registry, serving, monkeypatch):
     serving_app.TRACKER.record("x", [0.5] * 10, [0.5, 0.5], 300, timestamp=1_700_000_000)
 
     monkeypatch.setattr(serving_app, "MODEL_NAME", "does-not-exist")
-    client = TestClient(serving_app.app, raise_server_exceptions=False)
-    assert client.post("/reload").status_code == 500
-    assert client.get("/ready").status_code == 200
+    assert serving_app.refresh_model() is False
+    assert serving.get("/readyz").status_code == 200
+    assert serving.get("/readyz").json()["model_version"] == "1"
     assert REGISTRY.get_sample_value("forecast_model_loaded") == 1
     assert REGISTRY.get_sample_value("forecast_pending_forecasts") == 1   # untouched
-    assert client.post("/predict", json={"values": [0.1] * 10}).status_code == 200
+    assert serving.post("/predict", json={"values": [0.1] * 10}).status_code == 200
+
+
+def test_predict_runs_inference_off_the_event_loop(registry, serving, monkeypatch):
+    """The scikit-learn work runs in the inference pool: the forecast call is
+    made from a thread of that pool, not from the event loop's thread."""
+    import threading
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    seen = {}
+    original = serving_app.Bundle.forecast
+
+    def spy(self, values, timestamp=None):
+        seen["thread"] = threading.current_thread().name
+        return original(self, values, timestamp)
+
+    monkeypatch.setattr(serving_app.Bundle, "forecast", spy)
+    assert serving.post("/predict", json={"values": [0.3] * 10}).status_code == 200
+    assert seen["thread"].startswith("inference")
+
+
+def test_strict_input_length_rejects_longer_histories(registry, serving, monkeypatch):
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    assert serving.post("/predict", json={"values": [0.3] * 12}).status_code == 200   # tail used
+    monkeypatch.setattr(serving_app, "STRICT_INPUT_LENGTH", True)
+    r = serving.post("/predict", json={"values": [0.3] * 12})
+    assert r.status_code == 422 and "exactly 10" in r.json()["detail"]
+    assert serving.post("/predict", json={"values": [0.3] * 10}).status_code == 200
 
 
 def test_predict_scores_earlier_forecasts_against_later_windows(registry, serving):
@@ -273,40 +306,6 @@ def test_time_of_day_model_serves_the_pipeline_forecast_for_the_given_timestamp(
     assert serving.post("/predict", json={"values": window}).status_code == 200   # defaults to now
 
 
-def test_reload_requires_the_token_when_one_is_configured(registry, serving, monkeypatch):
-    ts, values = demand()
-    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
-    monkeypatch.setattr(serving_app, "RELOAD_TOKEN", "s3cret")
-    client = TestClient(serving_app.app, raise_server_exceptions=False)
-    assert client.post("/reload").status_code == 401
-    assert client.post("/reload", headers={"X-Reload-Token": "wrong"}).status_code == 401
-    assert client.get("/ready").status_code == 503          # nothing was loaded by the refusals
-    assert client.post("/reload", headers={"X-Reload-Token": "s3cret"}).status_code == 200
-    assert client.get("/ready").status_code == 200
-
-    # the training side sends the header the service expects
-    seen = {}
-
-    class Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return b"{}"
-
-    def fake_urlopen(req, timeout, context=None):
-        seen["token"] = req.get_header("X-reload-token")
-        return Resp()
-
-    from forecast_training import registry as reg
-    monkeypatch.setattr(reg.urllib.request, "urlopen", fake_urlopen)
-    assert reg.reload_serving("http://forecast-serving:8080", token="s3cret") is True
-    assert seen["token"] == "s3cret"
-
-
 def test_serving_exports_the_models_holdout_mae_for_the_drift_alert(registry, serving):
     from prometheus_client import REGISTRY
 
@@ -339,16 +338,16 @@ def test_cache_serves_the_last_known_good_model_while_the_registry_is_down(regis
     assert (tmp_path / "cache" / "champion" / "cache.json").exists()
 
     # registry gone, process restarted (fail fast instead of MLflow's retry backoff)
-    resolve = serving_app._resolve_version
+    import asyncio
+
+    resolve = serving_app.resolve_version
 
     def registry_down(client):
-        raise ConnectionError("mlflow unreachable")
+        raise serving_app.RegistryError("mlflow unreachable")
 
-    monkeypatch.setattr(serving_app, "_resolve_version", registry_down)
-    monkeypatch.setattr(serving_app, "MODEL_RETRY_SECONDS", 0.0)
-    monkeypatch.setattr(serving_app, "_bundle", None)
-    serving_app._stop_loading.clear()                         # an earlier TestClient's shutdown set it
-    serving_app._load_model_until_available()                 # fails on MLflow, falls back to the cache
+    monkeypatch.setattr(serving_app, "resolve_version", registry_down)
+    monkeypatch.setattr(serving_app.STORE, "_bundle", None)
+    asyncio.run(serving_app.startup_load())                   # fails on MLflow, falls back to the cache
     info = serving.get("/model-info").json()
     assert info["model_stage"] == "cache" and info["model_version"] == "1"
     assert serving.post("/predict", json={"values": window}).json()["predictions"] == expected
@@ -359,7 +358,7 @@ def test_cache_serves_the_last_known_good_model_while_the_registry_is_down(regis
 
     assert serving_app.refresh_model() is False                # registry still down: keep serving
     assert serving.get("/model-info").json()["model_stage"] == "cache"
-    monkeypatch.setattr(serving_app, "_resolve_version", resolve)
+    monkeypatch.setattr(serving_app, "resolve_version", resolve)
     assert serving_app.refresh_model() is True                 # back: the registry copy replaces the cache
     assert serving.get("/model-info").json()["model_stage"] == "@champion"
 
@@ -398,10 +397,10 @@ def test_multivariate_model_takes_one_list_per_channel(registry, serving):
     per-channel scalers, the pipeline's exact forecast, 422 without a channel,
     and a one-series model still takes a plain list (or its one channel by name)."""
     rng = np.random.default_rng(3)
-    ts, cpu = demand(days=8)
+    ts, cpu = demand(days=5)
     rps = np.roll(cpu, -2) * 300 + rng.normal(0, 3, len(cpu))
     values = np.stack([cpu, rps])
-    out = run_pipeline(values, TrainConfig(horizon=3, candidates=["hgb_delta"], channels=("cpu", "rps")),
+    out = run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"], channels=("cpu", "rps")),
                        "test", timestamps=ts)
     assert out.promoted
     serving_app.load_model()

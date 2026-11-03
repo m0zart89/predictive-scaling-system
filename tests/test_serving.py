@@ -101,17 +101,29 @@ def test_predict_rejects_empty_list(client):
     assert response.status_code == 422
 
 
-# ── Reload ─────────────────────────────────────────────────────────────────────
+# ── Lifecycle ──────────────────────────────────────────────────────────────────
 
-def test_reload_fails_gracefully_without_mlflow():
-    """POST /reload returns 500 when MLflow is unreachable — does not crash the process."""
-    # Use a fresh client with raise_server_exceptions=False so a 500 from the app
-    # is returned as an HTTP response rather than re-raised as a Python exception.
-    from fastapi.testclient import TestClient
-    import app as serving_app
-    c = TestClient(serving_app.app, raise_server_exceptions=False)
-    response = c.post("/reload")
-    assert response.status_code == 500
+def test_registry_outage_leaves_the_pod_alive_and_unready(client):
+    """No MLflow: startup logged the failure and the pod runs without a model;
+    the worker's refresh is a no-op; there is no reload endpoint any more."""
+    import asyncio
+
+    import pytest as _pytest
+
+    assert serving_app.refresh_model() is False
+    with _pytest.raises(serving_app.RegistryError):
+        serving_app.load_model()
+    assert asyncio.run(serving_app.STORE.refresh_async()) is False
+    assert client.get("/healthz").status_code == 200
+    r = client.get("/readyz")
+    assert r.status_code == 503 and "lifecycle worker" in r.json()["detail"]
+    assert client.post("/reload").status_code in (404, 405)
+    assert client.get("/model-info").json()["model_loaded"] is False
+
+
+def test_predict_rejects_unknown_fields(client):
+    r = client.post("/predict", json={"values": [0.1] * 10, "bogus": 1})
+    assert r.status_code == 422
 
 
 # ── Observability ──────────────────────────────────────────────────────────────
@@ -128,3 +140,4 @@ def test_metrics_endpoint_reachable(client):
     assert "forecast_model_loaded" in body
     assert "forecast_prediction_requests_total" in body
     assert "forecast_model_reloads_total" in body
+    assert 'forecast_model_reloads_total{result="failure"}' in body   # the startup attempt

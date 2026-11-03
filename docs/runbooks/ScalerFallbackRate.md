@@ -24,7 +24,7 @@ The scaler falls back to observed demand when:
    `timeSteps: 10` and `stepSeconds: 300` that takes 50 minutes after the
    workload first appears in Prometheus.
 2. `reason="not_ready"`: forecast-serving has no model loaded —
-   `kubectl get pods`, `curl /ready`, `curl /model-info`; see
+   `kubectl get pods`, `curl /readyz`, `curl /model-info`; see
    [ForecastReloadErrorRate](ForecastReloadErrorRate.md).
 3. `reason="unavailable"`: DNS, NetworkPolicy or the service is down —
    check `forecastServiceURL` in the ScaledObject trigger and
@@ -39,7 +39,8 @@ The scaler falls back to observed demand when:
 ## How to fix
 
 - Window filling after a restart: nothing to do; the alert clears on its own.
-- Load a model / fix the model: `POST /reload` once MLflow has a champion.
+- Load a model / fix the model: once MLflow has a champion the serving pods
+  pick it up within a minute on their own.
 - Mismatched `timeSteps`/`stepSeconds`: edit the ScaledObject trigger
   metadata to match the model; the scaler picks it up on the next call.
 - Persistent scrape gaps: the scaler only uses the trailing run of

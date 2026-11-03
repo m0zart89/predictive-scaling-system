@@ -4,7 +4,7 @@
 {{- $ns := .Release.Namespace }}
 # Mutual TLS on both loops, certificates from cert-manager:
 #   KEDA ──(gRPC, enableTLS + TriggerAuthentication)──▶ predictive-scaler
-#   predictive-scaler / training jobs / ingress ──(https, client cert)──▶ forecast-serving
+#   predictive-scaler / ingress ──(https, client cert)──▶ forecast-serving
 # One CA (global.tls.issuerRef) signs everything; rotation rewrites the
 # Secrets and the pods roll on the next deploy (or a reloader).
 apiVersion: cert-manager.io/v1
@@ -59,20 +59,6 @@ spec:
   renewBefore: {{ $t.renewBefore }}
   usages: [client auth]
   commonName: keda-operator
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: forecast-training-client
-  labels:
-    {{- include "predictive-stack.labels" . | nindent 4 }}
-spec:
-  secretName: forecast-training-client
-  issuerRef: {name: {{ $issuer }}, kind: {{ $t.issuerRef.kind }}}
-  duration: {{ $t.duration }}
-  renewBefore: {{ $t.renewBefore }}
-  usages: [client auth]
-  commonName: forecast-retrain
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate

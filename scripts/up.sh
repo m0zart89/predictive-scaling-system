@@ -3,7 +3,7 @@
 # Bring the whole predictive autoscaling stack up on a local kind cluster:
 #
 #   kind cluster (+ ingress-nginx, metrics-server) → images → helm install
-#   → train the first model from notebooks/data-jan-2022.json → /reload
+#   → train the first model from notebooks/data-jan-2022.json (serving picks it up)
 #   → smoke-test /predict and the scaler's gRPC GetMetrics
 #
 # Reproducible on a laptop and in CI (.github/workflows/e2e.yml). Needs
@@ -153,7 +153,7 @@ helm dependency build helm/predictive-stack >/dev/null
 # Phase 1: everything except the ScaledObject — KEDA's CRDs come from the
 # KEDA subchart's templates, so a ScaledObject in the same install would fail
 # validation before the CRDs exist. No `helm --wait`: forecast-serving stays
-# unready (503 on /ready) until a model is loaded, which happens later.
+# unready (503 on /readyz) until a model is loaded, which happens later.
 log "Installing release '$RELEASE' in namespace '$NAMESPACE'"
 # shellcheck disable=SC2086
 helm upgrade --install "$RELEASE" helm/predictive-stack \
@@ -212,7 +212,7 @@ fi
 if [ "$SMOKE" = "1" ]; then
   log "Smoke: forecast-serving"
   for i in $(seq 1 60); do
-    icurl "forecast.$DOMAIN" -f "http://forecast.$DOMAIN/ready" -o /dev/null && break
+    icurl "forecast.$DOMAIN" -f "http://forecast.$DOMAIN/readyz" -o /dev/null && break
     [ "$i" = 60 ] && die "forecast-serving did not become ready"
     sleep 5
   done

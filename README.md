@@ -35,7 +35,7 @@ This project closes that gap end to end: a forecasting service turns recent obse
 │                                       │ POST /predict {values, series, ts}    │
 │                                       ▼                                       │
 │                               forecast-serving ◄── models:/cpu-forecasting@champion
-│                                 │ ▲ POST /reload                │             │
+│                                 │ ▲ polls @champion every 60 s  │             │
 │                       /metrics  │ └── forecast-training (CronJob) ─► MLflow    │
 │                                 ▼                                             │
 │                              Grafana: Predictive scaling · Model quality      │
@@ -47,7 +47,7 @@ This project closes that gap end to end: a forecasting service turns recent obse
 
 1. **Scaling (every KEDA poll).** The scaler reads the last `timeSteps` samples of the workload's demand from Prometheus, normalises them, calls `POST /predict`, and reports `max(forecast over the horizon, observed)` to KEDA. KEDA's HPA sets `replicas = ceil(reported / targetValue)`.
 2. **Model quality (every forecast horizon).** forecast-serving keeps its recent forecasts in memory; when a later window carries the value it forecast, it records the error per horizon step. `ForecastDriftHigh` fires when the rolling MAE stays high.
-3. **Retraining (nightly).** The CronJob pulls recent history from Prometheus, trains four candidates, applies the level-tracking gate, compares the winner with the current champion on data neither has seen, moves the `@champion` alias in MLflow and calls `/reload`.
+3. **Retraining (nightly).** The CronJob pulls recent history from Prometheus, trains four candidates, applies the level-tracking gate, compares the winner with the current champion on data neither has seen, moves the `@champion` alias in MLflow. Every forecast-serving replica polls the alias and hot-swaps the model on its own; nothing is pushed to it.
 4. **Deployment.** CI publishes four images to GHCR; `scripts/up.sh` installs the chart on kind, trains the first model in-cluster and smoke-tests the REST and gRPC APIs; `e2e.yml` adds ten minutes of load with assertions.
 
 A fuller treatment, with the decisions table: [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -114,17 +114,17 @@ Takes the last `input_length` values of the series (raw units, `step_seconds` ap
 
 `prediction` is the first step; `predictions` covers the horizon (one value for notebook-registered models). `stage` and `model_version` say which registry entry served the answer, so a caller can see a model swap between requests.
 
-### `POST /reload`
-
-Re-fetches the champion from MLflow and swaps it in memory, atomically with its scaler and metadata. The retraining job calls it after moving the alias. On failure the previous model keeps serving and the call returns 500.
-
 ### `GET /model-info`
 
-Loaded version, run id, `time_steps`, `input_length`, `season_steps`, `horizon`, `step_seconds`, feature/target kinds, and the current rolling MAE per horizon step.
+Loaded version, run id, `time_steps`, `input_length`, `season_steps`, `channels`, `horizon`, `step_seconds`, feature/target kinds, the refresh interval and the current rolling MAE per horizon step.
 
-### `GET /live`, `GET /ready`
+### `GET /healthz`, `GET /readyz`
 
-Liveness (process up) and readiness (a model is loaded). Split on purpose: a pod waiting for MLflow is alive but not ready, and must not be restarted for it.
+Liveness (process and event loop up) and readiness (a model is loaded: 200 with `model_version` and `model_stage`, else 503). Split on purpose: a pod waiting for MLflow is alive but not ready, and must not be restarted for it. `/live` and `/ready` remain as aliases.
+
+### Model lifecycle
+
+There is no reload endpoint. A lifecycle worker in every replica polls the registry alias every `MODEL_REFRESH_SECONDS` (60) and hot-swaps the model under a lock when the alias moved, so all replicas converge on the same version without anyone pushing to them. Startup fetches the champion once before the port opens (`STARTUP_LOAD_TIMEOUT`); if MLflow is unreachable the pod starts alive but unready, serves the last-known-good copy from `MODEL_CACHE_DIR` when there is one, and the worker keeps retrying every `MODEL_RETRY_SECONDS`. Inference runs in a bounded thread pool (`INFERENCE_THREADS`), never on the event loop.
 
 ### `GET /metrics`
 
@@ -263,7 +263,7 @@ The notebook is the exploration record; production models come from [`training/`
 Prometheus (14 days) → regularise + fill gaps → train candidates → holdout cost
      → level-tracking check → beat persistence (plain or seasonal)
      → compare with @champion on data it has not seen
-     → register + move alias → POST /reload on forecast-serving
+     → register + move alias → every forecast-serving replica swaps on its next poll
 ```
 
 Selection is by an asymmetric cost, not RMSE: a unit of demand the forecast missed costs three idle units (`--under-weight`), because for an autoscaler the two errors are not worth the same. The `hgb_q75_*` candidates estimate the 75th percentile of the change, the forecast that minimises that cost; `coverage` (share of forecast steps at or above the actual) is logged next to RMSE so the trade-off stays visible. Two baselines are scored on every run, persistence and seasonal persistence (the same time yesterday); `--baseline` says which one the winner must beat.
@@ -403,7 +403,7 @@ helm upgrade --install predictive helm/predictive-stack -n predictive --create-n
   pip install -r training/requirements.txt
   MLFLOW_TRACKING_URI=http://mlflow.localhost PYTHONPATH=training \
     python -m forecast_training --export notebooks/data-jan-2022.json \
-      --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z --reload-url http://forecast.localhost
+      --exclude 2022-01-17T00:00:00Z/2022-01-17T08:00:00Z
   ```
   The notebook (`notebooks/project.ipynb`) remains as the exploration record; models it promotes to the `Production` stage are still served when no `@champion` alias exists.
 
@@ -418,7 +418,7 @@ predictive-scaling-system/
 │   ├── e2e.yml                  # up.sh on kind, 10 min of load, scaling assertions
 │   └── benchmark.yml            # predictive vs reactive, manual + weekly, commits docs/benchmark.md
 ├── serving/                     # FastAPI inference service
-│   ├── app.py                   # /predict, /reload, /model-info, probes, alias refresh, model cache
+│   ├── app.py                   # async /predict, /healthz, /readyz, /model-info, lifecycle worker, model cache
 │   └── quality.py               # in-process forecast error tracking (single replica)
 ├── scaler/                      # KEDA external scaler (gRPC): Prometheus → /predict → replicas
 │   ├── predictive_scaler/       # config, clients, decision engine, breaker, quality, gRPC server (mTLS), metrics

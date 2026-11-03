@@ -15,7 +15,7 @@ few milliseconds; something is contending for the pod.
    starved) or only on `/predict` (model)?
 2. `kubectl top pod` against the pod's CPU limit — a throttled pod shows
    latency on everything.
-3. Did it start at a reload (`forecast_model_reloads_total`)? A much larger
+3. Did it start at a model swap (`forecast_model_reloads_total`)? A much larger
    model (more trees, a longer horizon) is slower.
 4. Request rate: many ScaledObjects polling with `cacheSeconds: "0"` can
    overload a single replica.
@@ -25,4 +25,4 @@ few milliseconds; something is contending for the pod.
 - Raise the CPU limit or add replicas (`replicaCount` in
   `helm/forecast-serving/values.yaml`); the service is stateless.
 - Restore the scaler's `cacheSeconds` (default 15) if it was lowered.
-- Roll back the model if the regression coincides with a reload.
+- Roll back the model (move the alias) if the regression coincides with a swap.

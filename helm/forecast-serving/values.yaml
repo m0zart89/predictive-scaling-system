@@ -100,15 +100,6 @@ autoscaling:
 mlflow:
   trackingUri: "http://mlflow:5000"
 
-# POST /reload requires this value in the X-Reload-Token header. Either set
-# reloadToken (stored in this chart's Secret) or point reloadTokenSecret at an
-# existing Secret (the predictive-stack umbrella generates one and shares it
-# with the training jobs). Both empty: /reload is open — local runs only.
-reloadToken: ""
-reloadTokenSecret:
-  name: ""
-  key: RELOAD_TOKEN
-
 model:
   name: "cpu-forecasting"
   # Registry alias moved by the retraining job (training/).
@@ -117,8 +108,16 @@ model:
   stage: "Production"
   # Window size for legacy models only; newer models carry it in forecast_meta.json
   timeSteps: "10"
-  # Check the alias this often and reload when it moved ("0" = only on /reload).
+  # The lifecycle worker checks the registry alias this often and hot-swaps the
+  # model when it moved; every replica does it, nothing is pushed ("0" = never).
   refreshSeconds: "60"
+  # While no model is loaded, retry the registry this often.
+  retrySeconds: "30"
+  # The synchronous first fetch at startup gives up after this and the pod
+  # starts without a model (alive, not ready) for the worker to fill.
+  startupTimeoutSeconds: "20"
+  # Threads for the CPU-bound inference, off the event loop.
+  inferenceThreads: "4"
 
 # Last-known-good model cache (emptyDir at /cache): a pod that restarts while
 # MLflow is down serves the cached champion (model_stage "cache").
@@ -135,18 +134,18 @@ quality:
 # probe keeps liveness from killing the pod meanwhile.
 startupProbe:
   httpGet:
-    path: /live
+    path: /healthz
     port: 8080
   periodSeconds: 5
   failureThreshold: 60
 
-# /live — process is running (does not require model to be loaded)
-# /ready — model is loaded and inference is possible
+# /healthz — process is running (does not require model to be loaded)
+# /readyz — model is loaded and inference is possible (200 with the version)
 # This split prevents Kubernetes from restarting a healthy pod
 # that is simply waiting for MLflow to become available.
 livenessProbe:
   httpGet:
-    path: /live
+    path: /healthz
     port: 8080
   initialDelaySeconds: 15
   periodSeconds: 10
@@ -154,7 +153,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /ready
+    path: /readyz
     port: 8080
   initialDelaySeconds: 10
   periodSeconds: 5

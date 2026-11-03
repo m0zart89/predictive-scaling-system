@@ -73,11 +73,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "forecast-serving.fullname" . }}
                   key: MLFLOW_TRACKING_URI
-            - name: RELOAD_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.reloadTokenSecret.name | default (include "forecast-serving.fullname" .) }}
-                  key: {{ if .Values.reloadTokenSecret.name }}{{ .Values.reloadTokenSecret.key }}{{ else }}RELOAD_TOKEN{{ end }}
             - name: MODEL_NAME
               value: {{ .Values.model.name | quote }}
             - name: MODEL_ALIAS
@@ -86,9 +81,15 @@ spec:
               value: {{ .Values.model.stage | quote }}
             - name: TIME_STEPS
               value: {{ .Values.model.timeSteps | quote }}
-            # pull-based refresh: every replica follows the alias on its own
+            # pull-based lifecycle: every replica follows the registry alias on its own
             - name: MODEL_REFRESH_SECONDS
               value: {{ .Values.model.refreshSeconds | quote }}
+            - name: MODEL_RETRY_SECONDS
+              value: {{ .Values.model.retrySeconds | quote }}
+            - name: STARTUP_LOAD_TIMEOUT
+              value: {{ .Values.model.startupTimeoutSeconds | quote }}
+            - name: INFERENCE_THREADS
+              value: {{ .Values.model.inferenceThreads | quote }}
             - name: MODEL_CACHE_DIR
               value: /cache
             - name: TMPDIR
@@ -107,17 +108,17 @@ spec:
           {{- /* the kubelet has no client certificate: probe from inside with the pod's own */}}
           startupProbe:
             exec:
-              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/live',context=c,timeout=4)"]
+              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/healthz',context=c,timeout=4)"]
             periodSeconds: {{ .Values.startupProbe.periodSeconds | default 5 }}
             failureThreshold: {{ .Values.startupProbe.failureThreshold | default 60 }}
           livenessProbe:
             exec:
-              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/live',context=c,timeout=4)"]
+              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/healthz',context=c,timeout=4)"]
             periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 10 }}
             failureThreshold: {{ .Values.livenessProbe.failureThreshold | default 3 }}
           readinessProbe:
             exec:
-              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/ready',context=c,timeout=4)"]
+              command: ["python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/etc/tls/ca.crt');c.load_cert_chain('/etc/tls/tls.crt','/etc/tls/tls.key');u.urlopen('https://localhost:8443/readyz',context=c,timeout=4)"]
             periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 5 }}
             failureThreshold: {{ .Values.readinessProbe.failureThreshold | default 6 }}
           {{- else }}

@@ -14,7 +14,7 @@ The system turns a stream of workload metrics into **scaling decisions made ahea
 |---|---|---|
 | Scaling | seconds (KEDA polling) | predictive-scaler → forecast-serving → KEDA → HPA |
 | Model quality | minutes (one forecast horizon) | forecast-serving scores its own past forecasts; Prometheus alerts |
-| Retraining | daily (CronJob) | forecast-training → MLflow registry → `/reload` |
+| Retraining | daily (CronJob) | forecast-training → MLflow registry → every serving replica polls the alias |
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
@@ -30,7 +30,7 @@ The system turns a stream of workload metrics into **scaling decisions made ahea
 │      by KEDA)                      │ POST /predict {values, series, timestamp}      │
 │                                    ▼                                                │
 │                            forecast-serving ◄──── models:/cpu-forecasting@champion  │
-│                              │  ▲ POST /reload              │                       │
+│                              │  ▲ polls @champion (60 s)    │                       │
 │                              │  │                           ▼                       │
 │                              │  └──────── forecast-training (CronJob, nightly)      │
 │                              │                  │  candidates → gates → compare     │
@@ -73,7 +73,7 @@ Prometheus (TRAIN_DAYS of `query`) ─► regularise onto the step grid, fill ga
    ─► eligible = tracking ≥ 0.5 and beats persistence
    ─► compare the best with @champion on windows after both the split and the champion's data_end_ts
    ─► register version (model/, scaler/, forecast_meta.json), tag data_end_ts, move @champion
-   ─► POST /reload on forecast-serving
+   ─► every forecast-serving replica sees the alias move on its next poll and swaps
 ```
 
 ### Deployment path
@@ -87,7 +87,7 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 | Component | Owns | Contract |
 |---|---|---|
 | `training/forecast_training` | candidates, gates, registry promotion | registered version = `model/` (sklearn, pickled with the pinned scikit-learn) + `scaler/scaler.pkl` (MinMaxScaler) + `forecast_meta.json` (`time_steps`, `horizon`, `step_seconds`, `features`, `target`, `period_seconds`, `season_steps`); tags `data_end_ts`, `holdout_cost`, `holdout_coverage`, `under_weight`, `holdout_mae_step_k` |
-| `serving/app.py` | inference, hot reload, quality tracking | `POST /predict {values[≥ input_length, nulls allowed before the last time_steps], series?, timestamp?, step_seconds?}` → `{prediction, predictions[horizon], step_seconds, model, stage, model_version}`; `/ready` 503 until a model is loaded; legacy notebook models (no meta, `Production` stage) still load |
+| `serving/app.py` | async inference in a bounded thread pool, pull-based model lifecycle, quality tracking | `POST /predict {values[≥ input_length, nulls allowed before the last time_steps], series?, timestamp?, step_seconds?}` → `{prediction, predictions[horizon], step_seconds, model, stage, model_version}`; `/ready` 503 until a model is loaded; legacy notebook models (no meta, `Production` stage) still load |
 | `scaler/predictive_scaler` | KEDA ExternalScaler gRPC, decision policy, forecast scoring, circuit breaker | trigger metadata validated per call (`INVALID_ARGUMENT` on errors); fetches `historySteps` grid instants per channel, decides on the trailing contiguous window, scores past forecasts from the history (`forecast_abs_error{step}`), opens the breaker on residual/level/jump signals; failure policy: forecast errors or breaker open → observed demand, Prometheus errors → `UNAVAILABLE` → KEDA `fallback`; mTLS with `TLS_DIR` |
 | `training/forecast_training/trigger.py` | alert-driven retraining | Alertmanager webhook (bearer token) → Job cloned from the CronJob with `--exclude` for the breaker's open intervals, `TRAIN_REASON`; one at a time, `MIN_GAP_HOURS` apart |
 | `monitoring/` | rules, dashboards, runbooks | `render.py` validates dashboards against the metric names the code exports, checks every alert links a runbook, and syncs copies into the umbrella chart |
@@ -104,7 +104,7 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 | `predictive_scaler_decisions_total{source}` | scaler | forecast vs reactive fallback |
 | `predictive_scaler_forecast_failures_total{reason}`, `_prometheus_failures_total` | scaler | why a fallback happened |
 | `forecast_rolling_mae{horizon_step}`, `forecast_abs_error{horizon_step}` | serving | forecast quality |
-| `forecast_model_info{model_version,...}`, `forecast_model_loaded`, `forecast_model_reloads_total` | serving | which model, and whether reloads work |
+| `forecast_model_info{model_version,...}`, `forecast_model_loaded`, `forecast_model_reloads_total{result}` | serving | which model, and whether loads from the registry work |
 | `bench_latency_seconds`, `bench_requests_total`, `bench_clients`, `bench_sim_hour` | load generator | what clients experienced during a benchmark |
 
 ---
@@ -120,7 +120,7 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 | **Asymmetric selection cost** (`under_weight` × shortfall + excess, default weight 3) and a quantile candidate | holdout RMSE; a fixed safety margin in the scaler | RMSE treats a forecast 10% low and 10% high the same; the autoscaler does not — the first costs latency, the second idle replicas. The cost says so in one number, the `_q75` candidates estimate the quantile that minimises it, and `coverage` is reported so nobody has to infer the headroom from the RMSE. A margin bolted on in the scaler would hide the same choice in a second place. |
 | **Seasonal persistence as a logged baseline** (`--baseline`) | persistence alone | "Same time yesterday" is the baseline daily traffic actually has to beat; plain persistence flatters any model. Both are scored on every run and the operator chooses which one gates promotion. |
 | **The scaler scores its own forecasts** from the history it fetches | serving's in-process tracker; recording rules with `offset` | The history a decision fetches holds the actuals earlier forecasts aimed at, so every replica scores exactly the forecasts it made, whichever replica KEDA polled in between; no shared state, no offset arithmetic that breaks when the step changes. |
-| **Pull-based model refresh in serving** (poll the alias) | `POST /reload` from the training job | A push reaches one pod behind a Service; every pod polling the alias reaches all of them and removes the reload token from the training path. `/reload` stays for operators. |
+| **Pull-based model lifecycle in serving** (a worker polls the alias; no reload endpoint) | `POST /reload` from the training job | A push reaches one pod behind a Service and the others keep the old version: split brain, replicas flapping. Every pod polling the alias converges on one version, the training job needs no credential for serving, and startup, retry and swap are one code path under one lock. |
 | **Circuit breaker in the scaler**, three signals in model units | trust `mode=max` alone; a fixed surge cap | `mode=max` already prevents scaling below demand; what a spike does is poison the next hour of forecasts. The breaker takes the model out of the loop while the present does not resemble the history, records the interval so retraining excludes it, and closes only after calm polls. The surge cap is a second, cruder guard. |
 | **Mutual TLS from cert-manager, native in both hops** | a service mesh | No dependency the chart cannot ship: the gRPC server and the HTTP client take a mounted Secret, KEDA's own `enableTLS` + `TriggerAuthentication` cover its side, uvicorn verifies client certificates. A mesh does the same with zero code if one is already there. |
 | **Alert-driven retraining as a 300-line stdlib receiver** that clones the CronJob | Argo Events / Tekton; the alert runs `kubectl` | The CronJob template stays the one definition of how training runs; the receiver adds what the alert cannot do (dedup, rate limit, excluding the anomaly) and nothing else. |
@@ -152,8 +152,8 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 | forecast-serving down / not ready / bad answer | scaler reports observed demand (reactive scaling continues) | `predictive_scaler_forecast_failures_total{reason}`, `ScalerFallbackRate` | `docs/runbooks/ScalerFallbackRate.md` |
 | Prometheus down, query empty or multi-series | scaler returns `UNAVAILABLE`; KEDA applies `fallback.replicas` | `predictive_scaler_prometheus_failures_total`, `ScalerPrometheusErrors` | `ScalerPrometheusErrors.md` |
 | Model stopped tracking the workload (drift) | forecasts still served; `mode=max` protects availability | `forecast_rolling_mae`, `ForecastDriftHigh` | `ForecastDriftHigh.md` |
-| MLflow down | serving keeps the model in memory; `/reload` fails; retraining job fails | `ForecastReloadErrorRate`, Job status | `ForecastReloadErrorRate.md` |
-| No champion yet (fresh cluster) | `/ready` 503; scaler falls back to observed demand | `forecast_model_loaded == 0` | `ForecastReloadErrorRate.md` |
+| MLflow down | serving keeps the model in memory, the worker's loads fail and are counted; retraining job fails | `ForecastReloadErrorRate`, Job status | `ForecastReloadErrorRate.md` |
+| No champion yet (fresh cluster) | `/readyz` 503; scaler falls back to observed demand | `forecast_model_loaded == 0` | `ForecastReloadErrorRate.md` |
 | Retraining finds a worse model | champion kept; decision and reason logged to MLflow and stdout | run tags `decision`, `decision_reason` | — |
 | Scrape gap on the workload | short window → observed demand until it refills | `decisions_total{source="observed"}` | `ScalerFallbackRate.md` |
 | Traffic unlike the history (flash sale, DDoS, failover): a jump, a level far from a season ago, forecasts wrong by more than the noise | circuit breaker opens: observed demand only (plus the CPU floor trigger), forecast still made and scored; retraining excludes the interval | `predictive_scaler_breaker_open`, `_trips_total{reason}`, `ForecastBreakerOpenLong` | `ForecastBreakerOpenLong.md` |
