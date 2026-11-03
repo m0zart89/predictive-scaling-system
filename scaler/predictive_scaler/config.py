@@ -70,6 +70,21 @@ class ScalerConfig:
     breaker_jump_min_samples: int = 48
     breaker_min_open_seconds: float = 600.0
     breaker_calm_polls: int = 6
+    # Metric conditioning (see smoothing.py). EWMA on the forecast demand:
+    # S_t = alpha*Y_t + (1-alpha)*S_{t-1}; 1 = raw forecast. A state older
+    # than smoothing_max_age_seconds is seeded again (0 = never expires).
+    smoothing_alpha: float = 0.3
+    smoothing_max_age_seconds: float = 600.0
+    # Hysteresis gate: a forecast needing more replicas than observed demand
+    # must do so for this many consecutive horizon steps, else it is noise
+    # and the decision rests on observed demand (0/1 = off).
+    spike_min_steps: int = 3
+    # Forecast-service call: its own timeout (Prometheus keeps
+    # timeout_seconds) and the failure budget that opens the service
+    # breaker, after which the scaler is reactive for the hold time.
+    forecast_timeout_seconds: float = 0.2
+    forecast_breaker_failures: int = 3
+    forecast_breaker_open_seconds: float = 30.0
 
     @property
     def cache_key(self) -> str:
@@ -103,7 +118,7 @@ def _positive_float(meta: Mapping[str, str], key: str, default: float | None = N
     return value
 
 
-def _positive_int(meta: Mapping[str, str], key: str, default: int) -> int:
+def _positive_int(meta: Mapping[str, str], key: str, default: int, allow_zero: bool = False) -> int:
     raw = meta.get(key)
     if raw is None or str(raw).strip() == "":
         return default
@@ -111,8 +126,9 @@ def _positive_int(meta: Mapping[str, str], key: str, default: int) -> int:
         value = int(raw)
     except ValueError as exc:
         raise ConfigError(f"metadata.{key} must be an integer, got {raw!r}") from exc
-    if value <= 0:
-        raise ConfigError(f"metadata.{key} must be > 0, got {raw!r}")
+    if value < 0 or (value == 0 and not allow_zero):
+        bound = ">= 0" if allow_zero else "> 0"
+        raise ConfigError(f"metadata.{key} must be {bound}, got {raw!r}")
     return value
 
 
@@ -159,6 +175,9 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     level_shift = _positive_float(meta, "breakerLevelShift", default=2.5)
     if level_shift <= 1:
         raise ConfigError(f"metadata.breakerLevelShift must be > 1, got {level_shift!r}")
+    alpha = _positive_float(meta, "smoothingAlpha", default=0.3)
+    if alpha > 1:
+        raise ConfigError(f"metadata.smoothingAlpha must be in (0, 1], got {alpha!r}")
 
     return ScalerConfig(
         prometheus_address=_required(meta, "prometheusServerAddress").rstrip("/"),
@@ -186,4 +205,11 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
         breaker_jump_min_samples=_positive_int(meta, "breakerJumpMinSamples", default=48),
         breaker_min_open_seconds=_positive_float(meta, "breakerMinOpenSeconds", default=600.0),
         breaker_calm_polls=_positive_int(meta, "breakerCalmPolls", default=6),
+        smoothing_alpha=alpha,
+        smoothing_max_age_seconds=_positive_float(meta, "smoothingMaxAgeSeconds", default=600.0,
+                                                  allow_zero=True),
+        spike_min_steps=_positive_int(meta, "spikeMinSteps", default=3, allow_zero=True),
+        forecast_timeout_seconds=_positive_float(meta, "forecastTimeoutSeconds", default=0.2),
+        forecast_breaker_failures=_positive_int(meta, "forecastBreakerFailures", default=3, allow_zero=True),
+        forecast_breaker_open_seconds=_positive_float(meta, "forecastBreakerOpenSeconds", default=30.0),
     )

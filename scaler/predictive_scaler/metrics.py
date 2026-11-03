@@ -92,6 +92,35 @@ class ScalerMetrics:
             "breaker was open",
             _LABELS, registry=registry,
         )
+        # Metric conditioning (smoothing.py): what KEDA got vs what the model said.
+        self.smoothed_demand = Gauge(
+            "predictive_scaler_smoothed_demand",
+            "Forecast demand after the EWMA (smoothingAlpha), the value that meets observed "
+            "demand in the decision (absent while in fallback)",
+            _LABELS, registry=registry,
+        )
+        self.spikes_suppressed = Counter(
+            "predictive_scaler_spikes_suppressed_total",
+            "Forecasts the hysteresis gate classified as noise (a rise shorter than spikeMinSteps "
+            "consecutive horizon steps); the decision used observed demand",
+            _LABELS, registry=registry,
+        )
+        self.forecast_service_breaker_open = Gauge(
+            "predictive_scaler_forecast_service_breaker_open",
+            "1 while the forecast-service breaker is open or half-open: the service failed "
+            "forecastBreakerFailures times in a row and the scaler is reactive",
+            _LABELS, registry=registry,
+        )
+        self.forecast_service_breaker_trips = Counter(
+            "predictive_scaler_forecast_service_breaker_trips_total",
+            "Times the forecast-service breaker opened",
+            _LABELS, registry=registry,
+        )
+        self.forecast_skipped = Counter(
+            "predictive_scaler_forecast_skipped_total",
+            "Decisions that did not call the forecast service because its breaker was open",
+            _LABELS, registry=registry,
+        )
         self.forecast_latency = Histogram(
             "predictive_scaler_forecast_latency_seconds",
             "Latency of calls to the forecast service",

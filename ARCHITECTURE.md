@@ -53,8 +53,10 @@ KEDA ──GetMetrics(ScaledObjectRef + trigger metadata)──► predictive-sc
   2. model input = demand / capacity          (workload units → model units)
   3. POST /predict {values, series: ns/name, timestamp, step_seconds}
   4. predicted = (max over horizon | next step) × capacity
-  5. reported  = max(predicted, observed)     (mode=max) | predicted (mode=forecast)
-  6. cache for cacheSeconds
+  5. condition it: surge cap, hysteresis gate (spikeMinSteps), EWMA (smoothingAlpha);
+     a failing service (forecastTimeoutSeconds, forecastBreakerFailures) means predicted = none
+  6. reported  = max(smoothed, observed)      (mode=max) | smoothed (mode=forecast)
+  7. cache for cacheSeconds
 KEDA ◄── metricValue = reported ──► HPA: replicas = ceil(reported / targetValue)
 ```
 

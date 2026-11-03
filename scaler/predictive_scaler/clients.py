@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import socket
 import ssl
 import time
 import urllib.error
@@ -27,7 +28,7 @@ class ForecastError(RuntimeError):
 
     def __init__(self, message: str, reason: str = "unavailable"):
         super().__init__(message)
-        # Short label for metrics: unavailable | not_ready | bad_response
+        # Short label for metrics: unavailable | timeout | not_ready | server_error | bad_response
         self.reason = reason
 
 
@@ -52,6 +53,15 @@ _SSL = ssl_context(os.getenv("TLS_DIR", ""))
 def _read_json(req: urllib.request.Request, timeout: float) -> dict:
     with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as resp:  # noqa: S310 (operator config)
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """urllib wraps socket timeouts in URLError(reason=timeout) on connect and
+    raises TimeoutError (socket.timeout) on read; both are the same event."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, (TimeoutError, socket.timeout))
 
 
 class PrometheusClient:
@@ -179,9 +189,16 @@ class ForecastClient:
         try:
             body = _read_json(req, timeout)
         except urllib.error.HTTPError as exc:
-            reason = "not_ready" if exc.code == 503 else "bad_response"
+            if exc.code == 503:
+                reason = "not_ready"
+            elif exc.code >= 500:
+                reason = "server_error"
+            else:
+                reason = "bad_response"
             raise ForecastError(f"forecast service returned HTTP {exc.code}", reason) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if _is_timeout(exc):
+                raise ForecastError(f"forecast service did not answer within {timeout:g}s", "timeout") from exc
             raise ForecastError(f"forecast service unreachable at {base_url}: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise ForecastError("forecast service returned invalid JSON", "bad_response") from exc
