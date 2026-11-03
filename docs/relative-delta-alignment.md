@@ -1,5 +1,12 @@
 # Relative delta alignment: models forecast fractions of capacity, not cores
 
+> **Applied in PR #16.** Training (`CapacityFractionScaler`, `units` /
+> `capacity_reference`, `TRAIN_UNITS` / `TRAIN_CAPACITY_REFERENCE`), serving
+> (`units` in `/predict` and `/model-info`, load-time check), scaler
+> (`capacity.py` resolver, `capacityQuery`, `ForecastAnswer`, drift metric)
+> and the chart follow the sections below; the bootstrap Job keeps `scaled`
+> because it trains on a saved export in raw cores.
+
 Blueprint for Task 4 of the production refactor. It states what the pipeline
 does today (with file references), where the scale mismatch actually is, the
 target contract that removes it, and the code changes in training, serving

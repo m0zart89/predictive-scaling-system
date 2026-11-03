@@ -276,6 +276,16 @@ scalerDefaults:
   forecastTimeoutSeconds: "0.2"
   forecastBreakerFailures: "3"
   forecastBreakerOpenSeconds: "30"
+  # Reference capacity at runtime (docs/relative-delta-alignment.md): a PromQL
+  # instant query for the workload's envelope in cores, read every
+  # capacityRefreshSeconds; "" = the static capacity above. Keep it the fixed
+  # envelope (limit per pod x maxReplicas, needs kube-state-metrics), never the
+  # live replica total. A value more than capacityDriftFactor away from the
+  # capacity_reference the served model was trained with is flagged
+  # (predictive_scaler_capacity_drift; "0" = no check).
+  capacityQuery: ""
+  capacityRefreshSeconds: "300"
+  capacityDriftFactor: "2"
   # Name of the demand series when a workload lists extra channels (see
   # workloads[].channels); the model's target channel.
   targetChannel: cpu
@@ -307,6 +317,8 @@ scalerDefaults:
 #     channels:
 #       rps: sum(rate(http_requests_total{namespace="predictive", container="api"}[2m]))
 #     capacity: "4"
+#     # the envelope from the cluster instead of the number above:
+#     capacityQuery: max(kube_pod_container_resource_limits{namespace="predictive", container="api", resource="cpu"}) * 20
 workloads: []
 
 # ── demo workload ──────────────────────────────────────────────────────────────
@@ -372,6 +384,11 @@ training:
     limits: {cpu: "2", memory: 1Gi}
   # Nightly: last N days of the demand query from Prometheus.
   cronjob:
+    # Units of the model's target channel (training/README.md "Model contract"):
+    # capacity_fraction = the series is demand / capacity and is not re-scaled,
+    # so forecasts are fractions of the workload's capacity whatever its size
+    # (format 5); scaled = MinMax of the training series (formats <= 4).
+    units: capacity_fraction
     enabled: true
     schedule: "17 3 * * *"
     # "" = (query of training.workload) / its capacity, i.e. exactly the

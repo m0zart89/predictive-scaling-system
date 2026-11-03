@@ -17,7 +17,10 @@ query (at least the `timeSteps` window), sends them to `forecast-serving`'s
 | `query` | yes | — | PromQL returning **one** series of total demand (aggregate with `sum`) |
 | `forecastServiceURL` | yes | — | forecast-serving base URL |
 | `targetValue` | yes | — | demand one replica should carry, in the query's unit |
-| `capacity` | no | `1` | model input = demand / capacity. The model must be trained on the same series divided by the same capacity (the chart's CronJob does this); for a model trained on another workload, pick it so this workload's range fits the training range |
+| `capacity` | no | `1` | reference capacity in cores: model input = demand / capacity, forecast demand = coefficient × capacity. The chart's CronJob trains on the same series divided by the same number and records it in the model (`capacity_reference`) |
+| `capacityQuery` | no | — | read the reference from Prometheus instead (an instant query for the workload's envelope in cores, e.g. `max(kube_pod_container_resource_limits{container="api", resource="cpu"}) * 20`); on any failure the last good value, then `capacity`, is used and logged once (`event=capacity_fallback`). Keep it the fixed envelope, never the live replica total |
+| `capacityRefreshSeconds` | no | `300` | how long a value from `capacityQuery` is reused |
+| `capacityDriftFactor` | no | `2` | a reference more than this factor away from the `capacity_reference` the served model was trained with is logged (`event=capacity_drift`) and exported as `predictive_scaler_capacity_drift` (`0` = no check) |
 | `timeSteps` | no | `10` | the window: consecutive samples a forecast needs; must match `time_steps` in forecast-serving's `GET /model-info` |
 | `historySteps` | no | `timeSteps` | samples fetched and sent with each forecast, ≥ `timeSteps`. Models with seasonal features need a cycle more (`input_length` in `/model-info`, e.g. 10 + 288 for a day of 5-minute samples); the umbrella chart sets it from the training period. Samples older than the window may be missing (sent as `null`; serving interpolates) |
 | `stepSeconds` | no | `300` | spacing of samples; must match the model's `step_seconds` (`/model-info`), 300 for models trained on 5-minute data |
@@ -77,6 +80,18 @@ closed → open (`breakerMinOpenSeconds`, doubled on a re-trip) → half-open
 (`forecast_training.trigger` does). Add a plain `cpu` trigger to the
 ScaledObject (`scalerDefaults.reactiveFloor` in the chart) so KEDA keeps
 scaling on CPU whatever the scaler reports.
+
+## Units: what the forecast numbers are
+
+`/predict` says what its numbers are (`units`, `capacity_reference`;
+`docs/relative-delta-alignment.md`). A model trained by the chart's CronJob
+answers in `capacity_fraction`: the horizon is a fraction of the capacity its
+series was divided by, so the scaler multiplies by its own reference
+(`capacity` or `capacityQuery`) to get cores and checks that the two agree
+(`predictive_scaler_capacity_drift`). Older models (`scaled`) are multiplied
+by the same reference as before. Pod size never reaches the model: a 1-core
+and an 8-core variant of a workload differ in `targetValue`, not in the
+coefficient.
 
 ## Metric conditioning
 
