@@ -27,16 +27,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import MinMaxScaler
 
 from .features import (SEASONAL_FEATURE_KINDS, TIMED_FEATURE_KINDS, ForecastMeta, build_features_mv,
+                       fit_scalers,
                        from_target, make_windows_mv, seasonal_lags, target_channel, to_target)
 
 log = logging.getLogger("forecast-training")
@@ -118,9 +118,9 @@ class ForecastBundle:
     `scaler` scales the target channel; `scalers` has one per channel (the
     first is `scaler`), so a one-channel bundle looks as it always did."""
     model: BaseEstimator
-    scaler: MinMaxScaler
+    scaler: Any                       # the target channel's: MinMaxScaler, or CapacityFractionScaler
     meta: ForecastMeta
-    scalers: List[MinMaxScaler] = field(default_factory=list)
+    scalers: List[Any] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.scalers:
@@ -173,9 +173,11 @@ def _last_ts(timestamps, first_target: np.ndarray):
 
 def fit_bundle(values: np.ndarray, candidate: Candidate, time_steps: int, horizon: int,
                step_seconds: int, timestamps=None, period_seconds: int = 86400,
-               channels=()) -> ForecastBundle:
+               channels=(), units: str = "scaled", capacity_reference=None) -> ForecastBundle:
     """`values`: (n,) one series, or (channels, n) with the target first and
-    `channels` naming them."""
+    `channels` naming them. `units` says what the target channel is (see
+    features.UNITS); capacity_fraction keeps it unscaled and records
+    `capacity_reference` in the contract."""
     if candidate.needs_time and timestamps is None:
         raise ValueError(f"candidate {candidate.name} needs timestamps")
     season = season_steps_for(candidate, period_seconds, step_seconds)
@@ -183,7 +185,7 @@ def fit_bundle(values: np.ndarray, candidate: Candidate, time_steps: int, horizo
     channels = tuple(channels) if chans.shape[0] > 1 else tuple(channels[:1]) if channels else ()
     if chans.shape[0] > 1 and len(channels) != chans.shape[0]:
         raise ValueError(f"{chans.shape[0]} channels need {chans.shape[0]} names, got {channels}")
-    scalers = [MinMaxScaler().fit(ch.reshape(-1, 1)) for ch in chans]
+    scalers = fit_scalers(chans, units)
     scaled = np.stack([sc.transform(ch.reshape(-1, 1)).ravel() for sc, ch in zip(scalers, chans)])
     X, Y, first_target = make_windows_mv(scaled, time_steps, horizon, season)
     if X.shape[1] == 1:
@@ -195,7 +197,8 @@ def fit_bundle(values: np.ndarray, candidate: Candidate, time_steps: int, horizo
     model.fit(feats, target if horizon > 1 else target.ravel())
     meta = ForecastMeta(time_steps=time_steps, horizon=horizon, step_seconds=step_seconds,
                         features=candidate.features, target=candidate.target,
-                        period_seconds=period_seconds, season_steps=season, channels=channels)
+                        period_seconds=period_seconds, season_steps=season, channels=channels,
+                        units=units, capacity_reference=capacity_reference)
     return ForecastBundle(model=model, scaler=scalers[0], meta=meta, scalers=scalers)
 
 
@@ -333,7 +336,7 @@ def train_and_select(values: np.ndarray, time_steps: int, horizon: int, step_sec
                      test_fraction: float, min_tracking: float = 0.5,
                      candidates: List[Candidate] | None = None, timestamps=None,
                      period_seconds: int = 86400, under_weight: float = DEFAULT_UNDER_WEIGHT,
-                     channels=()):
+                     channels=(), units: str = "scaled", capacity_reference=None):
     """
     Fit every candidate on the training part and score it on the holdout.
     `values`: one series (n,) or channels (c, n) with the target first.
@@ -365,7 +368,7 @@ def train_and_select(values: np.ndarray, time_steps: int, horizon: int, step_sec
             continue
         train_ts = timestamps[:split] if timestamps is not None else None
         bundle = fit_bundle(values[:, :split], cand, time_steps, horizon, step_seconds, train_ts,
-                            period_seconds, channels)
+                            period_seconds, channels, units, capacity_reference)
         s = evaluate_bundle(bundle, values, split, timestamps=timestamps, under_weight=under_weight)
         tr = level_tracking(bundle, values, split, timestamps)
         ok = tr >= min_tracking

@@ -50,3 +50,48 @@ def test_seasonal_features_hold_yesterdays_level_and_change():
     with pytest.raises(ValueError, match="season_steps"):
         ForecastMeta(features="anchored", season_steps=4)
     assert ForecastMeta.from_dict({"time_steps": 10}).season_steps == 0   # older metas
+
+
+# ── capacity-fraction units (docs/relative-delta-alignment.md) ─────────────────
+
+def test_capacity_fraction_delta_is_change_over_capacity():
+    """With the identity scaler on the target channel, the delta target is
+    exactly (CPU_{t+k} - CPU_t) / capacity_reference, to machine precision."""
+    import numpy as np
+    from forecast_training.features import (CapacityFractionScaler, ForecastMeta, fit_scalers,
+                                            from_target, is_identity_scaler, to_target)
+
+    capacity = 8.0
+    cores = np.array([1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 7.2, 7.4])
+    series = cores / capacity
+    scalers = fit_scalers(series[None, :], "capacity_fraction")
+    assert isinstance(scalers[0], CapacityFractionScaler) and is_identity_scaler(scalers[0])
+    assert scalers[0].data_min_[0] == series.min() and scalers[0].data_max_[0] == series.max()
+    X = series[None, :10]
+    Y = series[None, 10:12]
+    target = to_target(X, Y, "delta")
+    assert np.allclose(target, (cores[10:12] - cores[9]) / capacity)
+    assert np.allclose(from_target(X, target, "delta"), Y)
+    meta = ForecastMeta(horizon=2, target="delta", units="capacity_fraction", capacity_reference=capacity)
+    assert meta.format_version == 5 and meta.capacity_reference == 8.0
+
+
+def test_capacity_fraction_contract_is_validated():
+    import numpy as np
+    import pytest
+    from forecast_training.features import ForecastMeta, fit_scalers
+    from sklearn.preprocessing import MinMaxScaler
+
+    with pytest.raises(ValueError, match="capacity_reference"):
+        ForecastMeta(units="capacity_fraction")
+    with pytest.raises(ValueError, match="units"):
+        ForecastMeta(units="cores")
+    # a series above 1.5 x the reference is a wrong reference, refused up front
+    with pytest.raises(ValueError, match="capacity reference"):
+        fit_scalers(np.array([[0.2, 0.5, 1.6, 0.3]]), "capacity_fraction")
+    # exogenous channels keep MinMax; scaled keeps MinMax everywhere
+    scalers = fit_scalers(np.array([[0.2, 0.5], [10.0, 40.0]]), "capacity_fraction")
+    assert isinstance(scalers[1], MinMaxScaler)
+    assert all(isinstance(s, MinMaxScaler) for s in fit_scalers(np.array([[0.2, 0.5]]), "scaled"))
+    # older metadata without the fields still loads as scaled
+    assert ForecastMeta.from_dict({"time_steps": 10, "horizon": 2}).units == "scaled"

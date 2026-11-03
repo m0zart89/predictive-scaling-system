@@ -45,7 +45,7 @@ import numpy as np
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
-from .features import LEGACY_META, ForecastMeta
+from .features import LEGACY_META, UNITS, ForecastMeta
 from .model import (CANDIDATES, DEFAULT_UNDER_WEIGHT, Candidate, CandidateResult, ForecastBundle,
                     evaluate_bundle, fit_bundle, level_tracking, naive_score, seasonal_naive_score,
                     train_and_select)
@@ -74,6 +74,8 @@ class TrainConfig:
     baseline: str = "persistence"    # the winner must beat: persistence | seasonal | best
     reason: str = "scheduled"        # why this run exists: scheduled | the alert that triggered it
     channels: Tuple[str, ...] = ()   # names of the series in `values` when there are several; [0] the target
+    units: str = "scaled"            # target channel units: scaled | capacity_fraction (features.UNITS)
+    capacity_reference: Optional[float] = None   # cores `values` was divided by (capacity_fraction)
     refit: bool = True
     dry_run: bool = False
     candidates: List[str] = field(default_factory=lambda: [c.name for c in CANDIDATES])
@@ -83,6 +85,11 @@ class TrainConfig:
             raise ValueError(f"baseline must be one of {BASELINES}, got {self.baseline!r}")
         if self.under_weight <= 0:
             raise ValueError("under_weight must be > 0")
+        if self.units not in UNITS:
+            raise ValueError(f"units must be one of {UNITS}, got {self.units!r}")
+        if self.units == "capacity_fraction" and not (self.capacity_reference and self.capacity_reference > 0):
+            raise ValueError("units=capacity_fraction needs capacity_reference > 0 (the cores the series "
+                             "was divided by: the ScaledObject's capacity)")
 
 
 @dataclass
@@ -183,7 +190,8 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
         results, split = train_and_select(values, cfg.time_steps, cfg.horizon, cfg.step_seconds,
                                           cfg.test_fraction, cfg.min_tracking, candidates,
                                           timestamps, cfg.period_seconds, cfg.under_weight,
-                                          cfg.channels if values.ndim == 2 else ())
+                                          cfg.channels if values.ndim == 2 else (),
+                                          cfg.units, cfg.capacity_reference)
         for r in results:
             with mlflow.start_run(run_name=r.candidate.name, nested=True):
                 mlflow.log_params({**r.candidate.params, "features": r.candidate.features,
@@ -222,7 +230,8 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
         if outcome.promoted and not cfg.dry_run:
             final = (fit_bundle(values, best.candidate, cfg.time_steps, cfg.horizon,
                                 cfg.step_seconds, timestamps, cfg.period_seconds,
-                                cfg.channels if values.ndim == 2 else ())
+                                cfg.channels if values.ndim == 2 else (),
+                                cfg.units, cfg.capacity_reference)
                      if cfg.refit else best.bundle)
             fitted_until = n_points if cfg.refit else split
             _log_bundle(final)
@@ -230,6 +239,9 @@ def run_pipeline(values: np.ndarray, cfg: TrainConfig, source: str,
             client.set_registered_model_alias(cfg.model_name, cfg.alias, mv.version)
             tags = {"candidate": best.candidate.name, "horizon": cfg.horizon, "reason": cfg.reason,
                     "channels": ",".join(best.bundle.meta.channels),
+                    # what the forecast numbers are: the scaler checks its runtime capacity against it
+                    "units": cfg.units,
+                    "capacity_reference": f"{cfg.capacity_reference:g}" if cfg.capacity_reference else "",
                     "holdout_rmse": f"{best.score.rmse:.6f}",
                     "holdout_cost": f"{best.score.cost:.6f}",
                     "holdout_coverage": f"{best.score.coverage:.4f}",

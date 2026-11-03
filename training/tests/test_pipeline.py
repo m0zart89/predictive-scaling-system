@@ -170,3 +170,26 @@ def test_cli_accepts_under_weight_and_baseline(mlflow_tmp, tmp_path, capsys):
     run = mlflow.search_runs(experiment_names=["cpu-forecasting"], output_format="list",
                              filter_string="tags.decision = 'dry_run'")[0]
     assert run.data.params["under_weight"] == "1.0" and run.data.params["baseline"] == "best"
+
+
+def test_capacity_fraction_models_carry_the_reference_in_contract_and_tags(mlflow_tmp, series):
+    ts, values = series
+    out = run_pipeline(values / 4.0, cfg(units="capacity_fraction", capacity_reference=4.0), "test",
+                       timestamps=ts)
+    assert out.decision == "promoted"
+    client = MlflowClient()
+    mv = client.get_model_version_by_alias("cpu-forecasting", "champion")
+    assert mv.tags["units"] == "capacity_fraction" and mv.tags["capacity_reference"] == "4"
+    bundle, _, _ = load_champion(client, "cpu-forecasting", "champion")
+    assert bundle.meta.units == "capacity_fraction" and bundle.meta.capacity_reference == 4.0
+    assert bundle.meta.format_version == 5
+    from forecast_training.features import is_identity_scaler
+    assert is_identity_scaler(bundle.scaler)
+    # the forecast is a fraction of capacity: x 4 gives cores, and the window is unscaled on the way in
+    out_fraction = bundle.predict((values / 4.0)[-10:])
+    assert out_fraction.shape == (1, 3) and float(out_fraction.max()) < 1.5
+
+
+def test_capacity_fraction_needs_a_reference(mlflow_tmp):
+    with pytest.raises(ValueError, match="capacity_reference"):
+        cfg(units="capacity_fraction")
