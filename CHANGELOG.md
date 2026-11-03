@@ -3,7 +3,7 @@
 Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 `main`; `v1.0.0` is the first release where every stage is in.
 
-## Unreleased
+## v1.2.0 — production hardening (PRs #8–#16)
 
 ### Relative delta alignment (PR #16) — docs/relative-delta-alignment.md applied
 
