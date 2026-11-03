@@ -36,7 +36,12 @@ Forecast-service breaker (`ServiceBreaker`)
     service does.
 
 All three are in-process and thread-safe: the gRPC server answers KEDA from
-a thread pool and two calls for the same ScaledObject can overlap.
+a thread pool and two calls for the same ScaledObject can overlap. Each
+state dictionary sits behind a reentrant lock (`threading.RLock`), so a
+helper that reads state while another method of the same object holds the
+lock on the same thread cannot deadlock. State is keyed by the ScaledObject's
+`namespace/name`, the identity KEDA sends in `ScaledObjectRef` (the gRPC
+contract carries no UID).
 """
 
 from __future__ import annotations
@@ -74,7 +79,7 @@ class EwmaSmoother:
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self._clock = clock
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._states: Dict[str, _EwmaState] = {}
 
     def update(self, key: str, raw: float, alpha: float, max_age: float) -> Smoothed:
@@ -187,7 +192,7 @@ class ServiceBreaker:
                  clock: Callable[[], float] = time.monotonic):
         self.cfg = cfg
         self._clock = clock
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._states: Dict[str, _ServiceState] = {}
 
     def admit(self, key: str) -> Admission:
