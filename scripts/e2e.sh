@@ -16,6 +16,8 @@
 #   LOAD_SECONDS    how long to load the workload        (default: 600)
 #   RAMP_AT         seconds after which the load steps up (default: 180)
 #   OUT_DIR         where to write artifacts             (default: e2e-artifacts)
+#   REDIS           1 = also require forecast-serving's Redis quality backend
+#                   to have answered (forecast_quality_backend_up) (default: 0)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -25,6 +27,7 @@ DOMAIN=${DOMAIN:-localhost}
 LOAD_SECONDS=${LOAD_SECONDS:-600}
 RAMP_AT=${RAMP_AT:-180}
 OUT_DIR=${OUT_DIR:-e2e-artifacts}
+REDIS=${REDIS:-0}
 PROM="http://prometheus.$DOMAIN"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -81,7 +84,7 @@ k get all -o wide > "$OUT_DIR/resources.txt" 2>&1 || true
 k get hpa -o yaml > "$OUT_DIR/hpa.yaml" 2>&1 || true
 k get scaledobject -o yaml > "$OUT_DIR/scaledobject.yaml" 2>&1 || true
 k get events --sort-by=.lastTimestamp > "$OUT_DIR/events.txt" 2>&1 || true
-for d in predictive-scaler forecast-serving cpu-burner mlflow prometheus grafana; do
+for d in predictive-scaler forecast-serving cpu-burner mlflow prometheus grafana redis; do
   k logs "deploy/$d" --all-containers=true --tail=2000 > "$OUT_DIR/$d.log" 2>&1 || true
 done
 k logs deploy/keda-operator --tail=500 > "$OUT_DIR/keda-operator.log" 2>&1 || true
@@ -89,7 +92,7 @@ for q in \
   'predictive_scaler_observed_demand' 'predictive_scaler_predicted_demand' \
   'predictive_scaler_reported_demand' 'predictive_scaler_desired_replicas' \
   'sum by (source) (predictive_scaler_decisions_total)' \
-  'count(up{app="cpu-burner"} == 1)' 'forecast_rolling_mae' \
+  'count(up{app="cpu-burner"} == 1)' 'forecast_rolling_mae' 'forecast_quality_backend_up' \
   'histogram_quantile(0.95, sum by (le) (rate(cpu_burner_request_duration_seconds_bucket[1m])))'; do
   name=$(echo "$q" | tr -c 'a-zA-Z0-9' '_' | sed 's/_*$//')
   icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query_range" --data-urlencode "query=$q" \
@@ -105,6 +108,8 @@ max_pods=$(promq "max_over_time((count(up{app=\"cpu-burner\"} == 1))[$((LOAD_SEC
 replicas_after=$(k get deploy cpu-burner -o jsonpath='{.status.replicas}')
 rescales=$(k get events --field-selector reason=SuccessfulRescale -o name 2>/dev/null | wc -l)
 mae=$(promq 'max(forecast_rolling_mae)')
+quality_up=$(promq 'min(forecast_quality_backend_up)')
+quality_errors=$(promq 'sum(forecast_quality_backend_errors_total) or vector(0)')
 failures=$(icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query" --data-urlencode 'query=sum by (reason) (predictive_scaler_forecast_failures_total)' \
   | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(", ".join(f"{x[\"metric\"].get(\"reason\",\"?\")}={x[\"value\"][1]}" for x in r) or "none")' 2>/dev/null || echo "n/a")
 trips=$(icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query" --data-urlencode 'query=sum by (reason) (predictive_scaler_breaker_trips_total)' \
@@ -119,6 +124,7 @@ scaler_mae=$(promq 'max(rate(predictive_scaler_forecast_abs_error_sum[10m]) / ra
   echo "desired replicas (max): ${max_desired:-n/a}; scraped cpu-burner pods (max): ${max_pods:-n/a}"
   echo "cpu-burner replicas: $replicas_before -> $replicas_after; SuccessfulRescale events: $rescales"
   echo "forecast rolling MAE (max over steps): ${mae:-n/a}"
+  echo "quality backend (redis) up: ${quality_up:-n/a}; backend errors: ${quality_errors:-n/a}"
 } | tee "$OUT_DIR/summary.txt"
 
 fail=0
@@ -127,5 +133,15 @@ if ! python3 -c "import sys; sys.exit(0 if float('${after_forecast:-0}') > float
 fi
 if [ "$rescales" -lt 1 ] && ! python3 -c "import sys; sys.exit(0 if float('${max_pods:-0}') > 1 else 1)"; then
   echo "FAIL: the HPA never changed the replica count"; fail=1
+fi
+if [ "$REDIS" = "1" ]; then
+  # the serving replicas scored their forecasts in Redis: the backend answered
+  # and the shared rolling MAE exists
+  if [ "${quality_up:-}" != "1" ]; then
+    echo "FAIL: forecast_quality_backend_up is '${quality_up:-n/a}', expected 1"; fail=1
+  fi
+  if [ -z "${mae:-}" ]; then
+    echo "FAIL: forecast_rolling_mae never appeared with the redis backend"; fail=1
+  fi
 fi
 [ "$fail" = 0 ] && log "e2e OK" || { log "e2e FAILED"; exit 1; }

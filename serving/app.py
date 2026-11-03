@@ -49,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Optional, Union
 
 import mlflow
@@ -63,7 +64,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from forecast_training.features import (FEATURE_KINDS, TARGET_KINDS, build_features_mv, from_target,
                                         target_channel)
-from quality import ForecastTracker
+from quality import ForecastTracker, QualityBackend, RedisMetricsEngine
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
@@ -76,13 +77,27 @@ MODEL_STAGE = os.getenv("MODEL_STAGE", "Production")
 TIME_STEPS = int(os.getenv("TIME_STEPS", "10"))
 META_ARTIFACT = "forecast_meta.json"
 CHANNELS_ARTIFACT = "channels.pkl"
-# Forecast quality tracking (see quality.py): rolling-MAE window per horizon
-# step, and memory bounds for the forecasts waiting to be scored. Exact with
-# one replica; with several, set FORECAST_MAX_SERIES=0 and read the scaler's
-# own scoring (predictive_scaler_forecast_abs_error) instead.
+# Forecast quality tracking (see quality.py): past forecasts are scored
+# against the actual values later windows carry, per horizon step, over a
+# rolling window of FORECAST_MAE_WINDOW errors.
+#   QUALITY_BACKEND=memory  per-pod state, bounded by FORECAST_MAX_SERIES
+#                           series and FORECAST_MAX_PENDING forecasts each;
+#                           exact with one replica (0 series = off)
+#   QUALITY_BACKEND=redis   state in Redis (REDIS_URL), shared by every
+#                           replica, every forecast with a FORECAST_TTL_SECONDS
+#                           TTL; the default when REDIS_URL is set
+REDIS_URL = os.getenv("REDIS_URL", "")
+QUALITY_BACKEND = os.getenv("QUALITY_BACKEND", "redis" if REDIS_URL else "memory").lower()
 FORECAST_MAE_WINDOW = int(os.getenv("FORECAST_MAE_WINDOW", "100"))
 FORECAST_MAX_SERIES = int(os.getenv("FORECAST_MAX_SERIES", "64"))
 FORECAST_MAX_PENDING = int(os.getenv("FORECAST_MAX_PENDING", "512"))
+FORECAST_TTL_SECONDS = int(os.getenv("FORECAST_TTL_SECONDS", str(24 * 3600)))
+# Redis client limits: connections in the pool and the socket timeouts, which
+# bound how long a /predict call can wait on a slow Redis.
+QUALITY_REDIS_MAX_CONNECTIONS = int(os.getenv("QUALITY_REDIS_MAX_CONNECTIONS", "16"))
+QUALITY_REDIS_TIMEOUT = float(os.getenv("QUALITY_REDIS_TIMEOUT", "0.25"))
+# Threads for the quality bookkeeping (Redis round trips), off the event loop.
+QUALITY_THREADS = int(os.getenv("QUALITY_THREADS", "2"))
 # Startup: how long the synchronous first fetch may take before the pod starts
 # without a model and the worker takes over.
 STARTUP_LOAD_TIMEOUT = float(os.getenv("STARTUP_LOAD_TIMEOUT", "20"))
@@ -156,10 +171,31 @@ INPUT_FILLED = Counter(
     "Values filled in by interpolation in the seasonal (older) part of /predict inputs: gaps "
     "in the caller's history, or less than a season of it",
 )
+
+
+def build_tracker() -> QualityBackend:
+    """The quality backend QUALITY_BACKEND names (see the configuration block).
+    Building the Redis engine opens no connection: a Redis that is down at
+    startup is an outage the engine rides out, not a failed start."""
+    if QUALITY_BACKEND == "redis":
+        if not REDIS_URL:
+            raise RuntimeError("QUALITY_BACKEND=redis needs REDIS_URL")
+        log.info("Forecast quality state in Redis (window %d, forecast TTL %ds, %d connections, %.2fs timeouts)",
+                 FORECAST_MAE_WINDOW, FORECAST_TTL_SECONDS, QUALITY_REDIS_MAX_CONNECTIONS, QUALITY_REDIS_TIMEOUT)
+        return RedisMetricsEngine(REDIS_URL, rolling_window_size=FORECAST_MAE_WINDOW,
+                                  forecast_ttl_seconds=FORECAST_TTL_SECONDS,
+                                  max_connections=QUALITY_REDIS_MAX_CONNECTIONS,
+                                  socket_timeout=QUALITY_REDIS_TIMEOUT,
+                                  socket_connect_timeout=QUALITY_REDIS_TIMEOUT)
+    if QUALITY_BACKEND != "memory":
+        raise RuntimeError(f"QUALITY_BACKEND must be memory or redis, got {QUALITY_BACKEND!r}")
+    return ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_MAX_PENDING,
+                           mae_window=FORECAST_MAE_WINDOW)
+
+
 # Scores past forecasts against the actual values that later windows carry:
 # forecast_abs_error / forecast_rolling_mae, both by horizon step.
-TRACKER = ForecastTracker(max_series=FORECAST_MAX_SERIES, max_pending=FORECAST_MAX_PENDING,
-                          mae_window=FORECAST_MAE_WINDOW)
+TRACKER: QualityBackend = build_tracker()
 
 # ── Model contract ─────────────────────────────────────────────────────────────
 # Models without a forecast_meta.json artifact were registered by the notebook:
@@ -606,6 +642,20 @@ def inference_pool() -> ThreadPoolExecutor:
     return pool
 
 
+_QUALITY_POOL: Optional[ThreadPoolExecutor] = None
+
+
+def quality_pool() -> ThreadPoolExecutor:
+    """A small pool for the quality bookkeeping (Redis round trips in the redis
+    backend), so a slow or dead backend never blocks the event loop; same
+    on-demand lifecycle as the inference pool."""
+    global _QUALITY_POOL
+    pool = _QUALITY_POOL
+    if pool is None or pool._shutdown:
+        pool = _QUALITY_POOL = ThreadPoolExecutor(max_workers=QUALITY_THREADS, thread_name_prefix="quality")
+    return pool
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     log.info("Workload Forecast Service starting — MODEL=%s ALIAS=%s STAGE=%s MLFLOW=%s "
@@ -617,6 +667,7 @@ async def lifespan(application: FastAPI):
         start_http_server(METRICS_PORT)
         log.info("Plain-HTTP /metrics on :%d (the API port may require client certificates)", METRICS_PORT)
     inference_pool()
+    quality_pool()
     await startup_load()                      # before the port opens
     worker = asyncio.create_task(lifecycle_worker(), name="model-lifecycle")
     if STORE.loaded:
@@ -632,6 +683,7 @@ async def lifespan(application: FastAPI):
         except (asyncio.CancelledError, Exception):
             pass
         inference_pool().shutdown(wait=False, cancel_futures=True)
+        quality_pool().shutdown(wait=False, cancel_futures=True)
         log.info("Workload Forecast Service shutting down")
 
 
@@ -759,6 +811,10 @@ async def model_info() -> dict[str, Any]:
     contract (input_length, channels, step) and the live rolling MAE."""
     b = STORE.get()
     meta = b.meta if b is not None else LEGACY_FORECAST_META
+    loop = asyncio.get_running_loop()
+    rolling = await loop.run_in_executor(
+        quality_pool(), partial(TRACKER.snapshot, model_version=b.info["model_version"] if b else None,
+                                horizon=int(meta["horizon"])))
     return {
         "model_loaded": b is not None,
         "time_steps": meta["time_steps"],
@@ -772,7 +828,7 @@ async def model_info() -> dict[str, Any]:
         "target": meta["target"],
         "period_seconds": meta.get("period_seconds", 86400),
         "refresh_seconds": MODEL_REFRESH_SECONDS,
-        "rolling_mae": {str(k): round(v, 6) for k, v in sorted(TRACKER.snapshot().items())},
+        "rolling_mae": {str(k): round(v, 6) for k, v in sorted(rolling.items())},
         **(b.info if b is not None else {}),
     }
 
@@ -822,9 +878,14 @@ async def predict(req: PredictRequest) -> PredictResponse:
         raise HTTPException(status_code=500, detail="Model produced a non-finite prediction.")
 
     try:
-        # the window only: filled-in history is not an actual value to score against
-        TRACKER.record(req.series, window, predictions,
-                       req.step_seconds or int(b.meta["step_seconds"]), req.timestamp)
+        # Quality bookkeeping, off the event loop (the redis backend makes
+        # network round trips): the window only, since filled-in history is
+        # not an actual value to score against. Its errors are logged and
+        # swallowed; a prediction never fails because of tracking.
+        await loop.run_in_executor(
+            quality_pool(), partial(TRACKER.record, req.series, window, predictions,
+                                    req.step_seconds or int(b.meta["step_seconds"]), req.timestamp,
+                                    model_version=b.info["model_version"]))
     except Exception:   # quality tracking must never fail a prediction
         log.exception("forecast quality tracking failed")
 

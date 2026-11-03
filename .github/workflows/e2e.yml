@@ -46,6 +46,7 @@ jobs:
           STEP_SECONDS: "30"
           MAX_REPLICAS: "5"
           TLS: "1"                  # cert-manager + mutual TLS on both internal loops
+          REDIS: "1"                # forecast scoring state in the bundled Redis
         run: ./scripts/up.sh
 
       - name: Load for 10 minutes and verify scaling
@@ -53,6 +54,7 @@ jobs:
           LOAD_SECONDS: "600"
           RAMP_AT: "180"
           OUT_DIR: e2e-artifacts
+          REDIS: "1"
         run: ./scripts/e2e.sh
 
       - name: Describe cluster state on failure
@@ -65,7 +67,7 @@ jobs:
           kubectl get certificates,clusterissuers -A > e2e-artifacts/certificates.txt 2>&1 || true
           kubectl -n cert-manager logs deploy/cert-manager --tail=200 > e2e-artifacts/cert-manager.log 2>&1 || true
           kubectl -n predictive logs pod/scaler-smoke > e2e-artifacts/scaler-smoke.log 2>&1 || true
-          for d in predictive-scaler forecast-serving cpu-burner mlflow prometheus grafana keda-operator; do
+          for d in predictive-scaler forecast-serving cpu-burner mlflow prometheus grafana keda-operator redis; do
             kubectl -n predictive logs "deploy/$d" --all-containers=true --tail=500 > "e2e-artifacts/$d.log" 2>&1 || true
           done
           kubectl -n predictive logs -l app=train-bootstrap --all-containers=true --tail=500 > e2e-artifacts/train-bootstrap.log 2>&1 || true

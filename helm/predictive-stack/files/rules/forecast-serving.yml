@@ -96,6 +96,23 @@ groups:
             unready. MLflow may be unavailable, the @champion alias missing,
             or the version's artifacts unreadable.
 
+      - alert: ForecastQualityBackendDown
+        expr: |
+          min by (pod) (forecast_quality_backend_up) == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: forecast-serving
+        annotations:
+          runbook_url: https://github.com/m0zart89/predictive-scaling-system/blob/main/docs/runbooks/ForecastQualityBackendDown.md
+          summary: "forecast-serving cannot reach its Redis quality backend ({{ $labels.pod }})"
+          description: >
+            The redis quality backend (serving/quality.py) has been failing
+            for 10 minutes (forecast_quality_backend_up == 0). Predictions
+            are unaffected; forecasts are not being stored or scored, so
+            forecast_rolling_mae goes stale and ForecastDriftHigh is blind
+            until Redis answers again.
+
   # ── Forecast quality / drift ─────────────────────────────────────────────
   # forecast_rolling_mae is the mean |actual - forecast| over the last
   # FORECAST_MAE_WINDOW resolved forecasts, in model units (demand divided by

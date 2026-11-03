@@ -25,6 +25,8 @@
 #   TLS            1 = install cert-manager, create a self-signed CA issuer
 #                  (predictive-ca) and enable mutual TLS on both internal loops
 #                  (global.tls.enabled)                   (default: 0)
+#   REDIS          1 = keep forecast-serving's forecast-scoring state in the
+#                  bundled Redis (global.quality.backend=redis) (default: 0)
 #   HELM_EXTRA     extra arguments for helm upgrade (e.g. "--set grafana.anonymous=false")
 #   DOMAIN         ingress domain                         (default: localhost)
 set -euo pipefail
@@ -43,6 +45,7 @@ DEMO_SCALING=${DEMO_SCALING:-predictive}
 MAX_REPLICAS=${MAX_REPLICAS:-10}
 TRAIN=${TRAIN:-1}
 TLS=${TLS:-0}
+REDIS=${REDIS:-0}
 CERT_MANAGER_VERSION=${CERT_MANAGER_VERSION:-v1.16.3}
 SMOKE=${SMOKE:-1}
 HELM_EXTRA=${HELM_EXTRA:-}
@@ -144,6 +147,11 @@ EOF
   TLS_SET="--set global.tls.enabled=true --set global.tls.issuerRef.name=predictive-ca"
 fi
 
+REDIS_SET=""
+if [ "$REDIS" = "1" ]; then
+  REDIS_SET="--set global.quality.backend=redis"
+fi
+
 # ── 4. helm ────────────────────────────────────────────────────────────────────
 log "Resolving chart dependencies (KEDA)"
 helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1 || true
@@ -163,7 +171,7 @@ helm upgrade --install "$RELEASE" helm/predictive-stack \
   --set demo.scaling=none \
   --set demo.maxReplicas="$MAX_REPLICAS" \
   --set demo.predictive.stepSeconds="$STEP_SECONDS" \
-  $TLS_SET $HELM_EXTRA \
+  $TLS_SET $REDIS_SET $HELM_EXTRA \
   --timeout 10m >/dev/null
 if [ "$TLS" = "1" ]; then
   log "Waiting for the certificates"
@@ -172,7 +180,8 @@ fi
 
 log "Waiting for the platform components"
 for d in mlflow prometheus grafana predictive-scaler cpu-burner \
-         keda-operator keda-operator-metrics-apiserver keda-admission-webhooks; do
+         keda-operator keda-operator-metrics-apiserver keda-admission-webhooks \
+         $([ "$REDIS" = "1" ] && echo redis); do
   kubectl -n "$NAMESPACE" rollout status "deployment/$d" --timeout=600s >/dev/null \
     || { kubectl -n "$NAMESPACE" get pods; kubectl -n "$NAMESPACE" describe "deployment/$d" | tail -20; die "$d did not become ready"; }
 done
@@ -192,7 +201,7 @@ fi
 helm upgrade "$RELEASE" helm/predictive-stack -n "$NAMESPACE" --reuse-values \
   --set demo.scaling="$DEMO_SCALING" \
   --set training.bootstrap.enabled="$([ "$TRAIN" = "1" ] && echo true || echo false)" \
-  $TLS_SET $HELM_EXTRA \
+  $TLS_SET $REDIS_SET $HELM_EXTRA \
   --timeout 10m >/dev/null
 
 if [ "$TRAIN" = "1" ]; then
