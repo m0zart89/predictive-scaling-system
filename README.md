@@ -46,7 +46,7 @@ This project closes that gap end to end: a forecasting service turns recent obse
 ### Data flow
 
 1. **Scaling (every KEDA poll).** The scaler reads the last `timeSteps` samples of the workload's demand from Prometheus, normalises them, calls `POST /predict`, and reports `max(forecast over the horizon, observed)` to KEDA. KEDA's HPA sets `replicas = ceil(reported / targetValue)`.
-2. **Model quality (every forecast horizon).** forecast-serving keeps its recent forecasts in memory; when a later window carries the value it forecast, it records the error per horizon step. `ForecastDriftHigh` fires when the rolling MAE stays high.
+2. **Model quality (every forecast horizon).** forecast-serving keeps its recent forecasts (in the pod, or in Redis shared by every replica); when a later window carries the value it forecast, it records the error per horizon step. `ForecastDriftHigh` fires when the rolling MAE stays high.
 3. **Retraining (nightly).** The CronJob pulls recent history from Prometheus, trains four candidates, applies the level-tracking gate, compares the winner with the current champion on data neither has seen, moves the `@champion` alias in MLflow. Every forecast-serving replica polls the alias and hot-swaps the model on its own; nothing is pushed to it.
 4. **Deployment.** CI publishes four images to GHCR; `scripts/up.sh` installs the chart on kind, trains the first model in-cluster and smoke-tests the REST and gRPC APIs; `e2e.yml` adds ten minutes of load with assertions.
 
@@ -66,7 +66,7 @@ Versioned models with a `@champion` alias the pipeline moves atomically; artifac
 
 ### Inference service (`serving/`)
 
-A stateless FastAPI service: validates the input, applies the stored scaler(s) and the model's feature/target transform, returns the whole horizon, follows the registry alias on its own (every replica polls it, `/reload` is for operators), keeps a last-known-good copy of the model to serve from when MLflow is down at startup, and scores its own past forecasts (`serving/quality.py`; with several replicas the scaler's own scoring is the source instead). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve. Under `global.tls.enabled` it requires client certificates.
+A stateless FastAPI service: validates the input, applies the stored scaler(s) and the model's feature/target transform, returns the whole horizon, follows the registry alias on its own (every replica polls it, `/reload` is for operators), keeps a last-known-good copy of the model to serve from when MLflow is down at startup, and scores its own past forecasts (`serving/quality.py`: in the pod with one replica, in Redis with several — forecasts stored with a 24 h TTL, error windows as bounded Redis lists). `/ready` answers 503 until a model is loaded, which is how Kubernetes keeps traffic away from a pod that has nothing to serve. Under `global.tls.enabled` it requires client certificates.
 
 ### Predictive scaler (`scaler/`)
 
@@ -139,13 +139,13 @@ The serving layer is instrumented with `prometheus-fastapi-instrumentator`, whic
 - `http_requests_total` — request count by endpoint and status code
 - `http_request_duration_seconds` — latency histogram
 
-On top of that the service measures its own **forecast quality** without any external store (`serving/quality.py`): every forecast is kept in memory, and when a later `/predict` window carries the value that was forecast, the error is recorded per horizon step:
+On top of that the service measures its own **forecast quality** (`serving/quality.py`): every forecast is kept, and when a later `/predict` window carries the value that was forecast, the error is recorded per horizon step:
 
 - `forecast_abs_error{horizon_step}` — histogram of |actual − forecast|
 - `forecast_rolling_mae{horizon_step}` — mean absolute error over the last 100 resolved forecasts (also in `GET /model-info`)
 - `forecast_model_info{model_version,...}` — which version is serving
 
-Memory is bounded (series × pending forecasts × rolling window, all configurable). The scaler's own metrics (`predictive_scaler_*`, see [`scaler/README.md`](scaler/README.md)) show observed vs predicted vs reported demand per `ScaledObject`.
+Two backends: `QUALITY_BACKEND=memory` keeps the state in the pod, bounded (series × pending forecasts × rolling window) and exact with one replica; `QUALITY_BACKEND=redis` (`REDIS_URL`; `global.quality.backend: redis` in the chart, which also deploys a small Redis) keeps it in Redis shared by every replica — each forecast under `forecast:{series}:{timestamp}` with a 24 h TTL, each error pushed once into `metrics:mae:{model_version}:{horizon_idx}`, a list trimmed on the server to the rolling window — so the pod holds nothing per series and a Redis outage costs the quality figures, never a prediction (`forecast_quality_backend_up`, `ForecastQualityBackendDown`). The scaler's own metrics (`predictive_scaler_*`, see [`scaler/README.md`](scaler/README.md)) show observed vs predicted vs reported demand per `ScaledObject`.
 
 **Dashboards and rules as code.** `monitoring/dashboards/*.json` and `monitoring/prometheus-rules.yaml` are the sources; `python monitoring/render.py` validates them (panel grid, unique ids, every PromQL metric and label name checked against what the code exports, a runbook for every alert) and syncs them into the Helm chart's ConfigMaps. CI runs it with `--check`.
 
@@ -419,7 +419,7 @@ predictive-scaling-system/
 │   └── benchmark.yml            # predictive vs reactive, manual + weekly, commits docs/benchmark.md
 ├── serving/                     # FastAPI inference service
 │   ├── app.py                   # async /predict, /healthz, /readyz, /model-info, lifecycle worker, model cache
-│   └── quality.py               # in-process forecast error tracking (single replica)
+│   └── quality.py               # forecast error tracking: in-pod tracker, Redis engine (shared, TTL)
 ├── scaler/                      # KEDA external scaler (gRPC): Prometheus → /predict → replicas
 │   ├── predictive_scaler/       # config, clients, decision engine, breaker, quality, gRPC server (mTLS), metrics
 │   └── tests/

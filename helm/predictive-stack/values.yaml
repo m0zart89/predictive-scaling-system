@@ -23,6 +23,13 @@ global:
       kind: ClusterIssuer
     duration: 720h
     renewBefore: 240h
+  # Where forecast-serving keeps the state of its forecast scoring
+  # (serving/quality.py): memory = in each pod, exact with one replica;
+  # redis = shared by every replica in the Redis at redisUrl, which is the
+  # bundled one (redis.enabled) or your own (redis://:password@host:6379/0).
+  quality:
+    backend: memory
+    redisUrl: redis://redis:6379/0
 
 # ── subcharts ──────────────────────────────────────────────────────────────────
 
@@ -165,6 +172,21 @@ alertmanager:
   extraReceivers: []
   #  - name: oncall
   #    slack_configs: [...]
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
+
+# The bundled Redis for forecast-serving's quality state, rendered when
+# global.quality.backend is redis: forecasts waiting to be scored and the
+# rolling error windows, shared by every serving replica. Everything in it
+# has a TTL, so it runs without persistence (a restart costs a day of
+# forecasts, nothing else); maxmemory evicts the soonest-expiring keys first
+# if it ever fills. Set enabled: false to use your own Redis at
+# global.quality.redisUrl instead.
+redis:
+  enabled: true
+  image: redis:7.2-alpine
+  maxmemory: 64mb
   resources:
     requests: {cpu: 20m, memory: 64Mi}
     limits: {cpu: 200m, memory: 128Mi}

@@ -10,3 +10,4 @@ prometheus-fastapi-instrumentator==7.0.2
 # at import time with no change in this repo.
 setuptools<81
 sqlalchemy<2.1
+redis==5.0.8

@@ -166,6 +166,26 @@ spec:
       ports:
         - port: 5000
 ---
+# Redis (quality state): forecast-serving only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis
+  labels:
+    {{- include "predictive-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: forecast-serving
+      ports:
+        - port: 6379
+---
 # Grafana: the ingress controller only.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

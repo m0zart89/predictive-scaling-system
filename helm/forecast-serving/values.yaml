@@ -33,6 +33,12 @@ global:
   imageTag: ""
   tls:
     enabled: false
+  # Set by the umbrella chart when it deploys Redis (redis.enabled): the
+  # quality backend and its URL, unless quality.backend / quality.redisUrl
+  # below say otherwise.
+  quality:
+    backend: ""
+    redisUrl: ""
 
 # Mutual TLS on the API: uvicorn serves https on 8443 with the certificate in
 # tls.secretName (cert-manager layout: tls.crt, tls.key, ca.crt) and requires a
@@ -124,11 +130,21 @@ model:
 cache:
   sizeLimit: 256Mi
 
-# forecast-serving's in-process scoring of its forecasts (forecast_rolling_mae).
-# Exact with one replica only; with several, the scaler's own scoring
-# (predictive_scaler_forecast_abs_error) is the source and this is set to "0".
+# Scoring of the service's own forecasts against the actual values later
+# windows carry (forecast_abs_error, forecast_rolling_mae; serving/quality.py).
+#   memory  state in the pod, bounded by maxSeries series (exact with one
+#           replica; "0" turns it off: the scaler's own scoring is the source)
+#   redis   state in Redis at redisUrl, shared by every replica, each forecast
+#           kept ttlSeconds; the pod holds nothing per series. The umbrella
+#           chart's redis.enabled selects this through global.quality.
 quality:
-  maxSeries: "64"
+  backend: ""                 # memory | redis; "" = global.quality.backend, else memory
+  redisUrl: ""                # "" = global.quality.redisUrl (rendered into the Secret)
+  maxSeries: "64"             # memory backend
+  rollingWindow: "100"        # errors per horizon step in the rolling MAE
+  ttlSeconds: "86400"         # redis backend: TTL of a stored forecast
+  redisMaxConnections: "16"   # redis backend: connection pool size
+  redisTimeoutSeconds: "0.25" # redis backend: socket connect/read timeout
 
 # Model download + unpickle can take a while on a cold registry; the startup
 # probe keeps liveness from killing the pod meanwhile.

@@ -36,7 +36,7 @@ jobs:
 
       - name: Install dependencies
         # tests/test_training_serving.py also imports training/ (same pins)
-        run: pip install -r serving/requirements.txt -r training/requirements.txt pytest httpx pytest-timeout pyyaml
+        run: pip install -r serving/requirements.txt -r training/requirements.txt pytest httpx pytest-timeout pyyaml "fakeredis[lua]==2.23.5"
 
       - name: Run tests
         run: pytest tests/ -v --timeout=30
@@ -258,6 +258,22 @@ jobs:
           fi
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/values-pilot.yaml | grep -q 'kind: NetworkPolicy'
+          # quality backend: memory by default (no Redis, no REDIS_URL); redis on request
+          if grep -q 'name: REDIS_URL\|^  name: redis$' /tmp/stack.yaml; then
+            echo "::error::Redis rendered without global.quality.backend=redis"; exit 1
+          fi
+          grep -q 'value: "memory"' /tmp/stack.yaml
+          helm template predictive helm/predictive-stack/ -n predictive --set demo.scaling=predictive \
+            --set global.quality.backend=redis > /tmp/redis.yaml
+          grep -q '^  name: redis$' /tmp/redis.yaml
+          grep -q 'value: "redis"' /tmp/redis.yaml
+          grep -q 'REDIS_URL: "redis://redis:6379/0"' /tmp/redis.yaml
+          grep -q 'name: FORECAST_TTL_SECONDS' /tmp/redis.yaml
+          # bring-your-own Redis: the URL is required
+          if helm template predictive helm/predictive-stack/ -n predictive --set global.quality.backend=redis \
+               --set redis.enabled=false --set global.quality.redisUrl= > /dev/null 2>&1; then
+            echo "::error::redis backend rendered without a URL"; exit 1
+          fi
           # production profile: PDBs, anti-affinity, HA KEDA, read-only images
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/values-pilot.yaml -f helm/predictive-stack/values-prod.yaml > /tmp/prod.yaml

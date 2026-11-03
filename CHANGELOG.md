@@ -25,6 +25,25 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 - Decisions are logged as `event=… key=value` lines. The benchmark numbers in
   `docs/benchmark.md` predate the smoothing; the next `benchmark` run shows
   what α = 0.3 costs in lead time.
+### Quality state in Redis (PR #11)
+
+- **`serving/quality.py` has a Redis backend.** `RedisMetricsEngine` keeps
+  the forecasts waiting to be scored and the rolling error windows in Redis
+  instead of the pod: every forecast is written with a 24 h TTL
+  (`forecast:{series}:{timestamp}`, `SET … EX NX`), each (forecast, step) is
+  claimed once across replicas and its error pushed into
+  `metrics:mae:{model_version}:{horizon_idx}` with `LPUSH` + `LTRIM` on the
+  server, bounded by `FORECAST_MAE_WINDOW`; two pipelined round trips per
+  `/predict`, off the event loop. A Redis outage is logged once, counted
+  (`forecast_quality_backend_up`, `forecast_quality_backend_errors_total`,
+  `ForecastQualityBackendDown`) and skipped for a cooldown; `/predict` never
+  fails because of it. `QUALITY_BACKEND=memory` (the bounded in-pod tracker)
+  stays the default without `REDIS_URL`.
+- **Chart:** `global.quality.backend: redis` renders a bundled Redis
+  (`redis.enabled`, no persistence, `volatile-ttl`) with a NetworkPolicy, or
+  points every replica at `global.quality.redisUrl`; `values-prod.yaml` uses
+  it instead of switching the tracker off. `scripts/up.sh REDIS=1`; the kind
+  e2e runs with it and checks the backend answered.
 
 ### Serving lifecycle (PR #10)
 

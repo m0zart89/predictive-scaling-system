@@ -60,3 +60,11 @@ ServiceAccount name.
 {{- define "forecast-serving.tls" -}}
 {{- if or .Values.tls.enabled (and .Values.global.tls .Values.global.tls.enabled) }}true{{ end -}}
 {{- end }}
+
+{{/*
+Quality backend: quality.backend, else global.quality.backend (the umbrella
+chart sets it to redis with redis.enabled), else memory.
+*/}}
+{{- define "forecast-serving.qualityBackend" -}}
+{{- .Values.quality.backend | default .Values.global.quality.backend | default "memory" -}}
+{{- end }}
