@@ -91,6 +91,9 @@ k logs deploy/keda-operator --tail=500 > "$OUT_DIR/keda-operator.log" 2>&1 || tr
 for q in \
   'predictive_scaler_observed_demand' 'predictive_scaler_predicted_demand' \
   'predictive_scaler_reported_demand' 'predictive_scaler_desired_replicas' \
+  'predictive_scaler_smoothed_demand' 'predictive_scaler_spikes_suppressed_total' \
+  'predictive_scaler_forecast_service_breaker_open' \
+  'histogram_quantile(0.95, sum by (le) (rate(predictive_scaler_forecast_latency_seconds_bucket[2m])))' \
   'sum by (source) (predictive_scaler_decisions_total)' \
   'count(up{app="cpu-burner"} == 1)' 'forecast_rolling_mae' 'forecast_quality_backend_up' \
   'histogram_quantile(0.95, sum by (le) (rate(cpu_burner_request_duration_seconds_bucket[1m])))'; do
@@ -115,11 +118,15 @@ failures=$(icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query" --data-urlencode '
 trips=$(icurl "prometheus.$DOMAIN" -G "$PROM/api/v1/query" --data-urlencode 'query=sum by (reason) (predictive_scaler_breaker_trips_total)' \
   | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(", ".join(f"{x[\"metric\"].get(\"reason\",\"?\")}={x[\"value\"][1]}" for x in r) or "none")' 2>/dev/null || echo "n/a")
 breaker_open=$(promq 'max(predictive_scaler_breaker_open) or vector(0)')
+suppressed=$(promq 'sum(predictive_scaler_spikes_suppressed_total) or vector(0)')
+service_trips=$(promq 'sum(predictive_scaler_forecast_service_breaker_trips_total) or vector(0)')
+forecast_p95=$(promq "histogram_quantile(0.95, sum by (le) (rate(predictive_scaler_forecast_latency_seconds_bucket[$((LOAD_SECONDS + 120))s])))")
 scaler_mae=$(promq 'max(rate(predictive_scaler_forecast_abs_error_sum[10m]) / rate(predictive_scaler_forecast_abs_error_count[10m]))')
 
 {
   echo "forecast decisions: $before_forecast -> $after_forecast (observed-demand decisions: $observed)"
   echo "forecast failures by reason: $failures; breaker trips by reason: $trips; breaker open now: ${breaker_open:-n/a}"
+  echo "spikes suppressed by the gate: ${suppressed:-n/a}; forecast-service breaker trips: ${service_trips:-n/a}; forecast call p95: ${forecast_p95:-n/a}s"
   echo "scaler-side forecast MAE, step max over 10m (model units): ${scaler_mae:-n/a}"
   echo "desired replicas (max): ${max_desired:-n/a}; scraped cpu-burner pods (max): ${max_pods:-n/a}"
   echo "cpu-burner replicas: $replicas_before -> $replicas_after; SuccessfulRescale events: $rescales"

@@ -263,6 +263,19 @@ scalerDefaults:
   breakerJumpMinSamples: "48"   # history needed before a rise can count as unusual (4 h at 5 min)
   breakerMinOpenSeconds: "600"
   breakerCalmPolls: "6"
+  # Metric conditioning (scaler/README.md): the forecast demand is smoothed
+  # with an EWMA before it meets observed demand (S = a*Y + (1-a)*S_prev;
+  # "1" = raw forecast), a rise that does not last spikeMinSteps consecutive
+  # horizon steps is treated as noise ("0" = off), and the forecast call has
+  # its own timeout and failure budget: after forecastBreakerFailures failures
+  # in a row the scaler stops calling the service for forecastBreakerOpenSeconds
+  # and scales on observed demand.
+  smoothingAlpha: "0.3"
+  smoothingMaxAgeSeconds: "600"
+  spikeMinSteps: "3"
+  forecastTimeoutSeconds: "0.2"
+  forecastBreakerFailures: "3"
+  forecastBreakerOpenSeconds: "30"
   # Name of the demand series when a workload lists extra channels (see
   # workloads[].channels); the model's target channel.
   targetChannel: cpu
@@ -271,7 +284,7 @@ scalerDefaults:
   reactiveFloor:
     enabled: false
     cpuUtilization: "70"
-  timeoutSeconds: "3"
+  timeoutSeconds: "3"     # Prometheus; the forecast call uses forecastTimeoutSeconds
   pollingInterval: 15
   cooldownPeriod: 300
   scaleDownStabilizationSeconds: 300

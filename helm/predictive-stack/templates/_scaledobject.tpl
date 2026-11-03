@@ -24,7 +24,7 @@ falls back to .Values.scalerDefaults.
 {{- $historySteps := $w.historySteps | default $d.historySteps | default (add $timeSteps $season) }}
 # Scales {{ $w.deployment }} on forecast demand:
 #   desiredReplicas = ceil(reportedDemand / targetValue),
-#   reportedDemand  = max(forecast, observed) in the query's units (mode=max).
+#   reportedDemand  = max(smoothed forecast, observed) in the query's units (mode=max).
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -104,6 +104,14 @@ spec:
         breakerJumpMinSamples: {{ $w.breakerJumpMinSamples | default $d.breakerJumpMinSamples | quote }}
         breakerMinOpenSeconds: {{ $w.breakerMinOpenSeconds | default $d.breakerMinOpenSeconds | quote }}
         breakerCalmPolls: {{ $w.breakerCalmPolls | default $d.breakerCalmPolls | quote }}
+        # metric conditioning: EWMA on the forecast, hysteresis gate on the
+        # horizon, timeout and failure budget for the forecast call
+        smoothingAlpha: {{ $w.smoothingAlpha | default $d.smoothingAlpha | quote }}
+        smoothingMaxAgeSeconds: {{ $w.smoothingMaxAgeSeconds | default $d.smoothingMaxAgeSeconds | quote }}
+        spikeMinSteps: {{ $w.spikeMinSteps | default $d.spikeMinSteps | quote }}
+        forecastTimeoutSeconds: {{ $w.forecastTimeoutSeconds | default $d.forecastTimeoutSeconds | quote }}
+        forecastBreakerFailures: {{ $w.forecastBreakerFailures | default $d.forecastBreakerFailures | quote }}
+        forecastBreakerOpenSeconds: {{ $w.forecastBreakerOpenSeconds | default $d.forecastBreakerOpenSeconds | quote }}
 {{- if $root.Values.global.tls.enabled }}
       authenticationRef:
         name: predictive-scaler-mtls

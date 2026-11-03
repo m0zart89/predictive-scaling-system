@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -16,6 +17,7 @@ class Responder:
     def __init__(self):
         self.status = 200
         self.body = {}
+        self.delay = 0.0          # seconds to sleep before answering (timeout tests)
         self.requests = []
         responder = self
 
@@ -24,6 +26,8 @@ class Responder:
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = self.rfile.read(length) if length else b""
                 responder.requests.append((self.command, self.path, payload))
+                if responder.delay:
+                    time.sleep(responder.delay)
                 raw = responder.body if isinstance(responder.body, bytes) \
                     else json.dumps(responder.body).encode()
                 self.send_response(responder.status)
@@ -141,7 +145,7 @@ def test_forecast_reads_the_whole_horizon(http):
 
 
 @pytest.mark.parametrize("status,reason", [(503, "not_ready"), (422, "bad_response"),
-                                           (500, "bad_response")])
+                                           (500, "server_error"), (502, "server_error")])
 def test_forecast_http_errors_are_classified(http, status, reason):
     http.status = status
     http.body = {"detail": "nope"}
@@ -164,6 +168,13 @@ def test_forecast_unreachable():
     with pytest.raises(ForecastError) as err:
         ForecastClient().predict("http://127.0.0.1:1", [0.1], timeout=1)
     assert err.value.reason == "unavailable"
+
+
+def test_forecast_timeout_is_its_own_reason(http):
+    http.delay = 0.5
+    with pytest.raises(ForecastError) as err:
+        ForecastClient().predict(http.url, [0.1], timeout=0.1)
+    assert err.value.reason == "timeout" and "0.1s" in str(err.value)
 
 
 def test_forecast_sends_series_and_timestamp_when_given(http):

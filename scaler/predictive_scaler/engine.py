@@ -7,8 +7,12 @@ One decision per (ScaledObject, config):
                                                              │
     observed (last sample) ──────────────────────────────────┤
                                                              ▼
-                                  mode=max:      max(predicted, observed)
-                                  mode=forecast: predicted
+                          conditioning (smoothing.py): service breaker,
+                          surge cap, hysteresis gate, EWMA
+                                                             │
+                                                             ▼
+                                  mode=max:      max(smoothed, observed)
+                                  mode=forecast: smoothed
                                                              │
                                                              ▼
                                          reported demand (KEDA divides it by
@@ -18,7 +22,13 @@ Failure policy
 --------------
 * Forecast service down / not ready / bad answer  → report observed demand.
   The workload keeps scaling reactively, like a plain HPA, and
-  predictive_scaler_forecast_failures_total records it.
+  predictive_scaler_forecast_failures_total records it. After
+  forecastBreakerFailures such failures in a row the service breaker opens
+  and the service is not called for forecastBreakerOpenSeconds
+  (predictive_scaler_forecast_service_breaker_open); one probe then decides.
+* Forecast rise shorter than spikeMinSteps consecutive horizon steps → the
+  hysteresis gate suppresses it (predictive_scaler_spikes_suppressed_total)
+  and the decision rests on observed demand.
 * Not enough history for a full model window      → report observed demand.
 * Prometheus down or query returns nothing        → raise. The gRPC layer turns
   this into an error so KEDA applies the ScaledObject's `fallback` replicas;
@@ -39,6 +49,7 @@ from .clients import ForecastClient, ForecastError, PrometheusClient, Prometheus
 from .config import ScalerConfig
 from .metrics import ScalerMetrics
 from .quality import ForecastLedger
+from .smoothing import EwmaSmoother, ServiceBreaker, ServiceBreakerConfig, spike_gate
 
 log = logging.getLogger("predictive-scaler.engine")
 
@@ -51,9 +62,10 @@ class NoDataError(PrometheusError):
 class Decision:
     value: float                 # demand reported to KEDA
     observed: float              # last observed demand
-    predicted: Optional[float]   # forecast demand, None when not available
+    predicted: Optional[float]   # forecast demand (after the surge cap), None when not available
     source: str                  # "forecast" | "observed"
     reason: str                  # human-readable explanation, logged
+    smoothed: Optional[float] = None   # the EWMA of the forecast the decision used, if it did
 
     def desired_replicas(self, target_value: float) -> int:
         return max(0, math.ceil(self.value / target_value))
@@ -77,6 +89,9 @@ class PredictiveEngine:
         self.ledger = ForecastLedger()
         # one breaker per ScaledObject; its thresholds come from the trigger metadata
         self._breakers: Dict[Tuple[str, str], CircuitBreaker] = {}
+        # metric conditioning, keyed by namespace/name (smoothing.py)
+        self.smoother = EwmaSmoother(clock=clock)
+        self._service_breakers: Dict[Tuple[str, str], ServiceBreaker] = {}
 
     def _channels(self, cfg: ScalerConfig, grid_ts, length: int) -> Dict[str, list]:
         """
@@ -115,6 +130,17 @@ class PredictiveEngine:
                 max_open_seconds=max(cfg.breaker_min_open_seconds, 3600.0),
                 calm_polls=cfg.breaker_calm_polls), clock=time.time)
         return self._breakers[bk]
+
+    def _service_breaker(self, key: str, cfg: ScalerConfig) -> ServiceBreaker:
+        bk = (key, cfg.cache_key)
+        with self._lock:
+            if bk not in self._service_breakers:
+                self._service_breakers = {k: v for k, v in self._service_breakers.items() if k[0] != key}
+                self._service_breakers[bk] = ServiceBreaker(
+                    ServiceBreakerConfig(failures=cfg.forecast_breaker_failures,
+                                         open_seconds=cfg.forecast_breaker_open_seconds),
+                    clock=self._clock)
+            return self._service_breakers[bk]
 
     # KEDA calls GetMetrics on every HPA sync and IsActive on every polling
     # interval, often for the same ScaledObject within seconds. Caching keeps
@@ -181,72 +207,72 @@ class PredictiveEngine:
         if verdict.tripped:
             self.metrics.breaker_trips.labels(**labels, reason=verdict.tripped).inc()
 
+        smoothed: Optional[float] = None
+        horizon_demand: list = []
+        gate_reason = ""
+        service = self._service_breaker(key, cfg)
         if len(values) < cfg.time_steps:
             source = "observed"
             reason = (f"only {len(values)}/{cfg.time_steps} samples of history; "
                       "scaling on observed demand until the window fills")
         else:
-            if cfg.history_steps > cfg.time_steps:
-                # the whole history, holes as null: serving interpolates the old part
-                model_input = [None if v is None else v / cfg.capacity for v in history]
-            else:
-                model_input = [v / cfg.capacity for v in values[-cfg.time_steps:]]
-            if cfg.channels:
-                # multivariate: the extra series on the target's grid, keyed by channel name
-                try:
-                    model_input = {cfg.target_channel: model_input,
-                                   **self._channels(cfg, grid_ts, len(model_input))}
-                except PrometheusError:
-                    self.metrics.prometheus_failures.labels(**labels).inc()
-                    raise
-            started = time.perf_counter()
-            try:
-                # series + the last sample's time let forecast-serving score this
-                # forecast against the actual value once a later window carries it
-                horizon = self.forecast.predict(cfg.forecast_url, model_input, cfg.timeout_seconds,
-                                                series=f"{namespace}/{name}", timestamp=timestamps[-1],
-                                                step_seconds=cfg.step_seconds)
-            except ForecastError as exc:
-                self.metrics.forecast_failures.labels(**labels, reason=exc.reason).inc()
+            admission = service.admit(key)
+            if not admission.allowed:
+                # The service failed too often: reactive mode without paying
+                # the call (or its timeout) at all until the hold elapses.
+                self.metrics.forecast_skipped.labels(**labels).inc()
                 source = "observed"
-                reason = f"forecast unavailable ({exc}); falling back to observed demand"
+                reason = f"{admission.reason}; reactive mode on observed demand"
             else:
-                # next: the coming interval. max: the peak over the model's whole
-                # horizon, which buys lead time equal to the horizon.
-                model_out = max(horizon) if cfg.forecast_aggregation == "max" else horizon[0]
-                predicted = max(0.0, model_out * cfg.capacity)
-                source = "forecast"
-                self.ledger.record(key, timestamps[-1], cfg.step_seconds, horizon)
-                for k, v in enumerate(horizon, start=1):
-                    self.metrics.forecast_demand.labels(**labels, step=str(k)).set(max(0.0, v * cfg.capacity))
-                reason = (f"forecast {predicted:.4g} ({cfg.forecast_aggregation} of "
-                          f"{len(horizon)} step(s)), observed {observed:.4g}, mode={cfg.mode}")
-                cap = observed * cfg.forecast_surge_factor
-                if cfg.mode == "max" and cfg.forecast_surge_factor > 0 and observed > 0 and predicted > cap:
-                    reason += f"; capped at {cfg.forecast_surge_factor:g}x observed ({cap:.4g})"
-                    predicted = cap
-            finally:
-                self.metrics.forecast_latency.observe(time.perf_counter() - started)
+                source, reason, predicted, horizon_demand = self._forecast(
+                    namespace, name, cfg, labels, key, grid_ts, history, values, timestamps, observed, service)
+        self.metrics.forecast_service_breaker_open.labels(**labels).set(0 if service.state(key) == "closed" else 1)
+
+        if predicted is not None:
+            # Hysteresis gate on the horizon vector (demand units): a rise that
+            # does not last spikeMinSteps consecutive steps is noise.
+            gate = spike_gate(horizon_demand, observed, cfg.target_value, cfg.spike_min_steps)
+            if gate.suppressed:
+                self.metrics.spikes_suppressed.labels(**labels).inc()
+                gate_reason = gate.reason
+                log.info("event=spike_suppressed namespace=%s scaledobject=%s observed=%.4g forecast=%.4g "
+                         "rise_steps=%d longest_run=%d min_steps=%d horizon=%s",
+                         namespace, name, observed, predicted, gate.rise_steps, gate.longest_run,
+                         cfg.spike_min_steps, [round(h, 4) for h in horizon_demand])
 
         if predicted is not None and not verdict.use_forecast:
-            # The breaker is open: the forecast is recorded (metrics, scoring)
-            # but the decision is reactive until the series looks normal again.
+            # The anomaly breaker is open: the forecast is recorded (metrics,
+            # scoring) but the decision is reactive until the series looks normal again.
             self.metrics.breaker_bypass.labels(**labels).inc()
             source = "observed"
             reason = f"{verdict.reason}; forecast {predicted:.4g} bypassed, observed {observed:.4g}"
             value = observed
+        elif predicted is not None and gate_reason:
+            source = "observed"
+            reason = f"{gate_reason}; forecast {predicted:.4g} suppressed, observed {observed:.4g}"
+            value = observed
         elif predicted is None:
             value = observed
-        elif cfg.mode == "forecast":
-            value = predicted
         else:
-            # Never scale below what the workload needs right now: the forecast
-            # can add capacity ahead of load but cannot remove capacity that is
-            # currently in use.
-            value = max(predicted, observed)
+            # EWMA on the forecast that will be used: S_t = a*Y_t + (1-a)*S_{t-1}.
+            sm = self.smoother.update(key, predicted, cfg.smoothing_alpha, cfg.smoothing_max_age_seconds)
+            smoothed = max(0.0, sm.value)
+            self.metrics.smoothed_demand.labels(**labels).set(smoothed)
+            if not sm.seeded and abs(sm.damped) > 1e-9:
+                reason += f"; smoothed to {smoothed:.4g} (alpha={cfg.smoothing_alpha:g}, previous {sm.previous:.4g})"
+                log.info("event=forecast_smoothed namespace=%s scaledobject=%s raw=%.4g smoothed=%.4g "
+                         "previous=%.4g alpha=%g", namespace, name, predicted, smoothed, sm.previous,
+                         cfg.smoothing_alpha)
+            if cfg.mode == "forecast":
+                value = smoothed
+            else:
+                # Never scale below what the workload needs right now: the forecast
+                # can add capacity ahead of load but cannot remove capacity that is
+                # currently in use.
+                value = max(smoothed, observed)
 
         decision = Decision(value=value, observed=observed, predicted=predicted,
-                            source=source, reason=reason)
+                            source=source, reason=reason, smoothed=smoothed)
 
         self.metrics.observed_demand.labels(**labels).set(observed)
         if predicted is not None:
@@ -262,9 +288,89 @@ class PredictiveEngine:
                     self.metrics.forecast_demand.remove(namespace, name, str(k))
                 except KeyError:
                     break
+        if smoothed is None:
+            try:
+                self.metrics.smoothed_demand.remove(namespace, name)
+            except KeyError:
+                pass
         self.metrics.reported_demand.labels(**labels).set(value)
         self.metrics.desired_replicas.labels(**labels).set(decision.desired_replicas(cfg.target_value))
         self.metrics.decisions.labels(**labels, source=source).inc()
 
-        log.info("%s/%s: reported=%.4g source=%s (%s)", namespace, name, value, source, reason)
+        log.info("event=decision namespace=%s scaledobject=%s source=%s reported=%.4g observed=%.4g "
+                 "forecast=%s smoothed=%s replicas=%d service_breaker=%s anomaly_breaker=%s reason=%r",
+                 namespace, name, source, value, observed,
+                 f"{predicted:.4g}" if predicted is not None else "-",
+                 f"{smoothed:.4g}" if smoothed is not None else "-",
+                 decision.desired_replicas(cfg.target_value), service.state(key), verdict.state, reason)
         return decision
+
+    def _forecast(self, namespace: str, name: str, cfg: ScalerConfig, labels: dict, key: str,
+                  grid_ts, history, values, timestamps, observed: float, service: ServiceBreaker):
+        """
+        The forecast-service call with its fault boundary: build the input,
+        POST /predict with forecast_timeout_seconds, record the horizon;
+        every failure (timeout, 5xx, network, unusable body) counts against
+        the service breaker and yields observed demand. Returns
+        (source, reason, predicted, horizon in demand units).
+        """
+        if cfg.history_steps > cfg.time_steps:
+            # the whole history, holes as null: serving interpolates the old part
+            model_input = [None if v is None else v / cfg.capacity for v in history]
+        else:
+            model_input = [v / cfg.capacity for v in values[-cfg.time_steps:]]
+        if cfg.channels:
+            # multivariate: the extra series on the target's grid, keyed by channel name
+            try:
+                model_input = {cfg.target_channel: model_input,
+                               **self._channels(cfg, grid_ts, len(model_input))}
+            except PrometheusError:
+                self.metrics.prometheus_failures.labels(**labels).inc()
+                raise
+        started = time.perf_counter()
+        try:
+            # series + the last sample's time let forecast-serving score this
+            # forecast against the actual value once a later window carries it
+            horizon = self.forecast.predict(cfg.forecast_url, model_input, cfg.forecast_timeout_seconds,
+                                            series=key, timestamp=timestamps[-1],
+                                            step_seconds=cfg.step_seconds)
+        except ForecastError as exc:
+            self.metrics.forecast_failures.labels(**labels, reason=exc.reason).inc()
+            opened = service.failure(key)
+            if opened:
+                self.metrics.forecast_service_breaker_trips.labels(**labels).inc()
+                log.warning("event=forecast_service_breaker_open namespace=%s scaledobject=%s reason=%s "
+                            "failures=%d hold=%gs error=%r", namespace, name, exc.reason,
+                            cfg.forecast_breaker_failures, cfg.forecast_breaker_open_seconds, str(exc))
+            else:
+                log.warning("event=forecast_failed namespace=%s scaledobject=%s reason=%s error=%r "
+                            "breaker=%s", namespace, name, exc.reason, str(exc), service.state(key))
+            return "observed", f"forecast unavailable ({exc}); falling back to observed demand", None, []
+        except Exception as exc:                 # a client bug is a service failure, not a crash
+            self.metrics.forecast_failures.labels(**labels, reason="bad_response").inc()
+            if service.failure(key):
+                self.metrics.forecast_service_breaker_trips.labels(**labels).inc()
+            log.exception("event=forecast_failed namespace=%s scaledobject=%s reason=unexpected error=%r",
+                          namespace, name, str(exc))
+            return "observed", f"forecast call failed ({exc!r}); falling back to observed demand", None, []
+        finally:
+            self.metrics.forecast_latency.observe(time.perf_counter() - started)
+
+        if service.success(key):
+            log.info("event=forecast_service_breaker_closed namespace=%s scaledobject=%s", namespace, name)
+        # next: the coming interval. max: the peak over the model's whole
+        # horizon, which buys lead time equal to the horizon.
+        model_out = max(horizon) if cfg.forecast_aggregation == "max" else horizon[0]
+        predicted = max(0.0, model_out * cfg.capacity)
+        horizon_demand = [max(0.0, v * cfg.capacity) for v in horizon]
+        self.ledger.record(key, timestamps[-1], cfg.step_seconds, horizon)
+        for k, v in enumerate(horizon_demand, start=1):
+            self.metrics.forecast_demand.labels(**labels, step=str(k)).set(v)
+        reason = (f"forecast {predicted:.4g} ({cfg.forecast_aggregation} of "
+                  f"{len(horizon)} step(s)), observed {observed:.4g}, mode={cfg.mode}")
+        cap = observed * cfg.forecast_surge_factor
+        if cfg.mode == "max" and cfg.forecast_surge_factor > 0 and observed > 0 and predicted > cap:
+            reason += f"; capped at {cfg.forecast_surge_factor:g}x observed ({cap:.4g})"
+            predicted = cap
+            horizon_demand = [min(v, cap) for v in horizon_demand]
+        return "forecast", reason, predicted, horizon_demand

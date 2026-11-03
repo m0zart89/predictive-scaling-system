@@ -216,6 +216,10 @@ jobs:
           # the scaler sends the window plus a day of 5-minute samples (10 + 288)
           grep -q 'historySteps: "298"' /tmp/stack.yaml
           grep -q 'TRAIN_UNDER_WEIGHT' /tmp/stack.yaml
+          # metric conditioning keys reach the trigger metadata
+          grep -q 'smoothingAlpha: "0.3"' /tmp/stack.yaml
+          grep -q 'spikeMinSteps: "3"' /tmp/stack.yaml
+          grep -q 'forecastTimeoutSeconds: "0.2"' /tmp/stack.yaml
           # workloads: one ScaledObject each, the model trained on training.workload
           helm template predictive helm/predictive-stack/ -n predictive \
             -f helm/predictive-stack/ci/workloads-values.yaml > /tmp/workloads.yaml

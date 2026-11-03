@@ -182,7 +182,7 @@ def test_next_aggregation_uses_first_step(metrics):
 
 def test_max_aggregation_scales_for_the_peak_of_the_horizon(metrics):
     eng = engine_with(metrics, FakePrometheus(WINDOW), FakeForecast(lambda v: [0.5, 0.9, 0.7]))
-    d = eng.decide(NS, NAME, make_config(mode="forecast", forecastAggregation="max"))
+    d = eng.decide(NS, NAME, make_config(mode="forecast", forecastAggregation="max", spikeMinSteps="0"))
     assert d.predicted == pytest.approx(0.9)
     assert "max of 3 step(s)" in d.reason
 
@@ -389,3 +389,173 @@ def test_a_lagging_channel_is_carried_forward_and_a_failing_one_is_an_error(metr
     with pytest.raises(PrometheusError):
         eng.decide(NS, NAME, make_config(channels=json.dumps({"rps": "rps"})))
     assert registry.get_sample_value("predictive_scaler_prometheus_failures_total", labels()) == 1
+
+
+# ── metric conditioning: EWMA, hysteresis gate, forecast-service breaker ───────
+
+def test_forecast_is_smoothed_between_polls_and_never_below_observed(metrics, registry):
+    """S_t = a*Y_t + (1-a)*S_{t-1}: the first forecast seeds the state; a jump
+    on the next poll moves the reported value by alpha of its height; with
+    mode=max observed demand stays the floor."""
+    fc = FakeForecast(lambda v: 0.5)
+    prom = FakePrometheus(WINDOW)
+    clock = Clock()
+    eng = engine_with(metrics, prom, fc, clock)
+    cfg = make_config(cacheSeconds="0", smoothingAlpha="0.3", forecastSurgeFactor="0")
+    d = eng.decide(NS, NAME, cfg)
+    assert d.predicted == pytest.approx(0.5) and d.smoothed == pytest.approx(0.5)   # seeded
+    fc.fn = lambda v: 1.5                                   # a one-poll excursion
+    clock.t += 15
+    d = eng.decide(NS, NAME, cfg)
+    assert d.predicted == pytest.approx(1.5)
+    assert d.smoothed == pytest.approx(0.3 * 1.5 + 0.7 * 0.5)
+    assert d.value == pytest.approx(0.8) and d.source == "forecast"
+    assert "smoothed to 0.8" in d.reason
+    assert registry.get_sample_value("predictive_scaler_smoothed_demand", labels()) == pytest.approx(0.8)
+    fc.fn = lambda v: 0.1                                   # the forecast drops under observed
+    clock.t += 15
+    d = eng.decide(NS, NAME, cfg)
+    assert d.smoothed == pytest.approx(0.3 * 0.1 + 0.7 * 0.8)
+    assert d.value == pytest.approx(0.59)                   # the smoothed forecast still leads
+    for _ in range(2):                                      # ... until it sinks under observed demand
+        clock.t += 15
+        d = eng.decide(NS, NAME, cfg)
+    assert d.smoothed == pytest.approx(0.3 * 0.1 + 0.7 * (0.3 * 0.1 + 0.7 * 0.59))
+    assert d.value == pytest.approx(0.4)                    # observed is the floor
+
+
+def test_smoothing_state_is_per_scaledobject_and_expires(metrics):
+    fc = FakeForecast(lambda v: 0.5)
+    clock = Clock()
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc, clock)
+    cfg = make_config(cacheSeconds="0", smoothingAlpha="0.5", smoothingMaxAgeSeconds="100",
+                      forecastSurgeFactor="0")
+    eng.decide(NS, "a", cfg)
+    fc.fn = lambda v: 1.5
+    clock.t += 10
+    assert eng.decide(NS, "b", cfg).smoothed == pytest.approx(1.5)      # b has its own state
+    assert eng.decide(NS, "a", cfg).smoothed == pytest.approx(1.0)      # a is smoothed from 0.5
+    clock.t += 200                                                      # a's state is stale
+    assert eng.decide(NS, "a", cfg).smoothed == pytest.approx(1.5)      # seeded again
+
+
+def test_alpha_one_is_the_raw_forecast(metrics):
+    fc = FakeForecast(lambda v: 0.5)
+    clock = Clock()
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc, clock)
+    cfg = make_config(cacheSeconds="0", smoothingAlpha="1", forecastSurgeFactor="0")
+    eng.decide(NS, NAME, cfg)
+    fc.fn = lambda v: 1.5
+    clock.t += 15
+    d = eng.decide(NS, NAME, cfg)
+    assert d.value == pytest.approx(1.5) and "smoothed" not in d.reason
+
+
+def test_short_spike_in_the_horizon_is_suppressed(metrics, registry):
+    """targetValue 0.5, observed 0.4 → 1 replica. Two of six horizon steps ask
+    for more, not three in a row: noise; the decision is observed demand and
+    the forecast is still recorded and scored."""
+    fc = FakeForecast(lambda v: [0.4, 0.9, 1.1, 0.4, 0.3, 0.9])
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    cfg = make_config(cacheSeconds="0", forecastAggregation="max", spikeMinSteps="3")
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "observed" and d.value == pytest.approx(0.4)
+    assert d.predicted == pytest.approx(1.1) and d.smoothed is None
+    assert "spike gate" in d.reason and "longest run 2 < spikeMinSteps=3" in d.reason
+    assert registry.get_sample_value("predictive_scaler_spikes_suppressed_total", labels()) == 1
+    assert registry.get_sample_value("predictive_scaler_decisions_total", labels(source="observed")) == 1
+    assert registry.get_sample_value("predictive_scaler_forecast_demand", labels(step="3")) == pytest.approx(1.1)
+    assert eng.ledger.pending() == 1
+
+
+def test_sustained_rise_passes_the_gate(metrics, registry):
+    fc = FakeForecast(lambda v: [0.4, 0.9, 1.1, 1.0, 0.3, 0.3])
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    d = eng.decide(NS, NAME, make_config(cacheSeconds="0", forecastAggregation="max", spikeMinSteps="3"))
+    assert d.source == "forecast" and d.value == pytest.approx(1.1)
+    assert registry.get_sample_value("predictive_scaler_spikes_suppressed_total", labels()) is None
+
+
+def test_gate_is_inactive_on_a_horizon_shorter_than_min_steps(metrics):
+    fc = FakeForecast(lambda v: [0.9, 0.4])
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    d = eng.decide(NS, NAME, make_config(spikeMinSteps="3"))
+    assert d.source == "forecast" and d.value == pytest.approx(0.9)
+
+
+def test_gate_counts_replicas_not_demand(metrics):
+    """A forecast above observed demand that still fits in the replicas the
+    present load needs is not a spike: nothing would be scaled up for it."""
+    fc = FakeForecast(lambda v: [0.45, 0.49, 0.41, 0.3, 0.3, 0.3])     # all ceil(x/0.5) == 1
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    d = eng.decide(NS, NAME, make_config(forecastAggregation="max", spikeMinSteps="3"))
+    assert d.source == "forecast" and d.value == pytest.approx(0.49)
+
+
+def test_forecast_service_breaker_opens_after_consecutive_failures(metrics, registry):
+    """Three failures in a row (timeout, 5xx, ...) open the breaker: the next
+    polls do not call the service at all and report observed demand; after
+    the hold one probe is let through and closes it."""
+    fc = FakeForecast(exc=ForecastError("slow", "timeout"))
+    clock = Clock()
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc, clock)
+    cfg = make_config(cacheSeconds="0", forecastBreakerFailures="3", forecastBreakerOpenSeconds="30",
+                      forecastTimeoutSeconds="0.2")
+    for _ in range(3):
+        d = eng.decide(NS, NAME, cfg)
+        assert d.source == "observed" and d.value == pytest.approx(0.4)
+        clock.t += 15
+    assert len(fc.calls) == 3
+    assert registry.get_sample_value("predictive_scaler_forecast_failures_total", labels(reason="timeout")) == 3
+    assert registry.get_sample_value("predictive_scaler_forecast_service_breaker_trips_total", labels()) == 1
+    assert registry.get_sample_value("predictive_scaler_forecast_service_breaker_open", labels()) == 1
+
+    d = eng.decide(NS, NAME, cfg)                             # open: no call
+    assert d.source == "observed" and "breaker open" in d.reason
+    assert len(fc.calls) == 3
+    assert registry.get_sample_value("predictive_scaler_forecast_skipped_total", labels()) == 1
+
+    clock.t += 31                                             # hold elapsed: one probe
+    fc.exc = None
+    fc.fn = lambda v: 0.9
+    d = eng.decide(NS, NAME, cfg)
+    assert d.source == "forecast" and d.value == pytest.approx(0.9)
+    assert len(fc.calls) == 4
+    assert registry.get_sample_value("predictive_scaler_forecast_service_breaker_open", labels()) == 0
+
+
+def test_a_failed_probe_reopens_the_breaker(metrics, registry):
+    fc = FakeForecast(exc=ForecastError("500", "server_error"))
+    clock = Clock()
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc, clock)
+    cfg = make_config(cacheSeconds="0", forecastBreakerFailures="2", forecastBreakerOpenSeconds="30")
+    eng.decide(NS, NAME, cfg)
+    eng.decide(NS, NAME, cfg)                                 # opens
+    clock.t += 31
+    eng.decide(NS, NAME, cfg)                                 # probe fails → open again
+    assert len(fc.calls) == 3
+    clock.t += 10
+    eng.decide(NS, NAME, cfg)                                 # still open, no call
+    assert len(fc.calls) == 3
+    assert registry.get_sample_value("predictive_scaler_forecast_service_breaker_trips_total", labels()) == 2
+
+
+def test_forecast_timeout_is_the_dedicated_setting(metrics):
+    fc = FakeForecast(lambda v: 0.9)
+    prom = FakePrometheus(WINDOW)
+    eng = engine_with(metrics, prom, fc)
+    eng.decide(NS, NAME, make_config(timeoutSeconds="2", forecastTimeoutSeconds="0.15"))
+    assert prom.calls[0]["timeout"] == 2
+    assert fc.kwargs_timeout == pytest.approx(0.15)
+
+
+def test_service_breaker_is_per_scaledobject(metrics):
+    fc = FakeForecast(exc=ForecastError("down"))
+    clock = Clock()
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc, clock)
+    cfg = make_config(cacheSeconds="0", forecastBreakerFailures="1")
+    eng.decide(NS, "a", cfg)                                  # a's breaker opens
+    fc.exc = None
+    fc.fn = lambda v: 0.9
+    assert eng.decide(NS, "b", cfg).source == "forecast"      # b is unaffected
+    assert eng.decide(NS, "a", cfg).source == "observed"

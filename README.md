@@ -70,7 +70,7 @@ A stateless FastAPI service: validates the input, applies the stored scaler(s) a
 
 ### Predictive scaler (`scaler/`)
 
-A KEDA external scaler (gRPC). Each `ScaledObject` carries its own PromQL query (plus extra channels for a multivariate model), target per replica, `capacity` (units conversion), forecast settings and circuit-breaker thresholds in trigger metadata, so one deployment serves any number of workloads. The scaler scores its own forecasts against the history it fetches, caps a forecast at `forecastSurgeFactor` × observed, and opens its breaker (reactive scaling, interval exported for retraining to exclude) when the series stops resembling the history. Failure policy, metrics and metadata reference: [scaler/README.md](scaler/README.md).
+A KEDA external scaler (gRPC). Each `ScaledObject` carries its own PromQL query (plus extra channels for a multivariate model), target per replica, `capacity` (units conversion), forecast settings and circuit-breaker thresholds in trigger metadata, so one deployment serves any number of workloads. The scaler scores its own forecasts against the history it fetches, caps a forecast at `forecastSurgeFactor` × observed, smooths it with an EWMA (`smoothingAlpha`), drops rises shorter than `spikeMinSteps` horizon steps as noise, stops calling a failing forecast service for a while (`forecastTimeoutSeconds` 200 ms, `forecastBreakerFailures`), and opens its anomaly breaker (reactive scaling, interval exported for retraining to exclude) when the series stops resembling the history. Failure policy, metrics and metadata reference: [scaler/README.md](scaler/README.md).
 
 ### Observability (`monitoring/`)
 

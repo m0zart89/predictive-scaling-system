@@ -5,6 +5,26 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 
 ## Unreleased
 
+### Scaler metric conditioning (PR #12)
+
+- **EWMA on the forecast.** `smoothingAlpha` (0.3): `S = α·Y + (1−α)·S_prev`
+  on the forecast demand before it meets observed demand, per ScaledObject,
+  thread-safe, seeded again after `smoothingMaxAgeSeconds` without a
+  forecast; `predictive_scaler_smoothed_demand`. `mode=max` still floors at
+  observed demand.
+- **Hysteresis gate.** `spikeMinSteps` (3): a forecast that needs more
+  replicas than observed demand for fewer than that many consecutive
+  horizon steps is noise; the decision is observed demand
+  (`predictive_scaler_spikes_suppressed_total`).
+- **Forecast-service breaker.** `forecastTimeoutSeconds` (0.2) for the
+  `/predict` call; timeouts and 5xx get their own failure reasons; after
+  `forecastBreakerFailures` (3) failures in a row the service is not called
+  for `forecastBreakerOpenSeconds` (30) and the scaler is reactive
+  (`predictive_scaler_forecast_service_breaker_open`, `_trips_total`,
+  `predictive_scaler_forecast_skipped_total`).
+- Decisions are logged as `event=… key=value` lines. The benchmark numbers in
+  `docs/benchmark.md` predate the smoothing; the next `benchmark` run shows
+  what α = 0.3 costs in lead time.
 ### Quality state in Redis (PR #11)
 
 - **`serving/quality.py` has a Redis backend.** `RedisMetricsEngine` keeps
