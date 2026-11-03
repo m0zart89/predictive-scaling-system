@@ -124,7 +124,7 @@ Liveness (process and event loop up) and readiness (a model is loaded: 200 with 
 
 ### Model lifecycle
 
-There is no reload endpoint. A lifecycle worker in every replica polls the registry alias every `MODEL_REFRESH_SECONDS` (60) and hot-swaps the model under a lock when the alias moved, so all replicas converge on the same version without anyone pushing to them. Startup fetches the champion once before the port opens (`STARTUP_LOAD_TIMEOUT`); if MLflow is unreachable the pod starts alive but unready, serves the last-known-good copy from `MODEL_CACHE_DIR` when there is one, and the worker keeps retrying every `MODEL_RETRY_SECONDS`. Inference runs in a bounded thread pool (`INFERENCE_THREADS`), never on the event loop.
+There is no reload endpoint. A lifecycle worker in every replica polls the registry alias every `MODEL_REFRESH_SECONDS` (60) and hot-swaps the model under a lock when the alias moved, so all replicas converge on the same version without anyone pushing to them (the download and the warm-up forecast run outside the lock, which is taken only for the swap, and startup and the worker share one download). Startup fetches the champion once before the port opens (`STARTUP_LOAD_TIMEOUT`); if MLflow is unreachable the pod starts alive but unready, serves the last-known-good copy from `MODEL_CACHE_DIR` when there is one, and the worker keeps retrying every `MODEL_RETRY_SECONDS`. Inference runs in a bounded thread pool (`INFERENCE_THREADS`), never on the event loop.
 
 ### `GET /metrics`
 

@@ -15,6 +15,13 @@ swap happens under an asyncio.Lock so two loads never interleave, and the
 served state is one immutable `Bundle` behind one reference, so a request
 either sees the previous bundle or the new one, never a half-built mix.
 
+A load has two phases. The heavy one (download, unpickling, the warm-up
+forecast) runs in a worker thread with no lock held; only the commit, one
+reference assignment, takes the lock, for microseconds. Readers (`/predict`,
+`/readyz`, `/healthz`) never take it, so probes and inference keep answering
+while a new model downloads and warms up. Loads are single-flight: startup
+and the lifecycle worker share one download instead of racing two.
+
 Startup fetches the champion once, synchronously, before the port opens
 (bounded by STARTUP_LOAD_TIMEOUT). If the registry is unreachable the pod
 starts anyway, alive but not ready (`/readyz` → 503), serving the
@@ -415,17 +422,23 @@ def _validated(bundle: Bundle) -> Bundle:
     return bundle
 
 
-def warm_up(bundle: Bundle) -> float:
+def warm_up(bundle: Bundle, passes: int = 2) -> float:
     """
-    Run one forecast through the bundle before it is swapped into service:
-    a synthetic window shaped like a real request (mid-range values of each
+    Run forecasts through the bundle before it is swapped into service: a
+    synthetic window shaped like a real request (mid-range values of each
     channel's training range, `input_length` samples, timestamped now).
     The first call of a freshly unpickled model pays for lazy state the
     estimators build on demand (threadpools, prediction buffers, the feature
     pipeline's first allocation); paying it here keeps it off the first
-    request. The output is also checked (horizon length, finite), so a model
-    that loads but cannot forecast is rejected before it replaces a working
-    one. Blocking; called from a thread. Returns the duration in seconds.
+    request. A second pass confirms the steady state. Every output is checked
+    (horizon length, finite), so a model that loads but cannot forecast is
+    rejected before it replaces a working one.
+
+    Blocking and lock-free: called from a worker thread of the default
+    executor, never from the event loop, never under the store's lock, and
+    never in the inference pool, so a warm-up takes no capacity from live
+    requests. Returns the cold (first-pass) duration in seconds, the cost a
+    first request would otherwise have paid.
     """
     meta = bundle.meta
     length = input_length(meta)
@@ -436,18 +449,21 @@ def warm_up(bundle: Bundle) -> float:
         mid = lo + 0.5 * (hi - lo) if math.isfinite(lo) and math.isfinite(hi) else 0.5
         rows.append(np.full(length, mid, dtype=float))
     dummy = rows[0] if len(rows) == 1 else np.stack(rows)
-    started = time.perf_counter()
-    try:
-        out = bundle.forecast(dummy, time.time())
-    except Exception as exc:
-        raise RuntimeError(f"warm-up forecast failed: {exc!r}") from exc
-    elapsed = time.perf_counter() - started
-    if len(out) != int(meta["horizon"]) or not all(math.isfinite(v) for v in out):
-        raise RuntimeError(f"warm-up forecast returned {out!r} for a horizon of {meta['horizon']}")
-    MODEL_WARMUP_SECONDS.set(elapsed)
-    log.info("warm-up of v%s done in %.1f ms (%d value(s), %d channel(s))",
-             bundle.info["model_version"], elapsed * 1000, len(out), len(bundle.scalers))
-    return elapsed
+    durations: list[float] = []
+    for _ in range(max(1, passes)):
+        started = time.perf_counter()
+        try:
+            out = bundle.forecast(dummy, time.time())
+        except Exception as exc:
+            raise RuntimeError(f"warm-up forecast failed: {exc!r}") from exc
+        durations.append(time.perf_counter() - started)
+        if len(out) != int(meta["horizon"]) or not all(math.isfinite(v) for v in out):
+            raise RuntimeError(f"warm-up forecast returned {out!r} for a horizon of {meta['horizon']}")
+    cold = durations[0]
+    MODEL_WARMUP_SECONDS.set(cold)
+    log.info("warm-up of v%s done: cold %.1f ms, steady %.1f ms (%d value(s), %d channel(s))",
+             bundle.info["model_version"], cold * 1000, durations[-1] * 1000, len(out), len(bundle.scalers))
+    return cold
 
 
 # ── Last-known-good cache ──────────────────────────────────────────────────────
@@ -492,18 +508,30 @@ def read_cache() -> Bundle:
 
 class ModelStore:
     """
-    Holds the served Bundle. Readers take no lock: they read one reference,
-    and a Bundle is immutable, so they see the previous or the new model in
-    full. Writers serialise on `lock` (asyncio.Lock for the worker and
-    startup; a threading.Lock under it for the synchronous entry points the
-    tests and tooling use), so two loads never interleave and metrics are
-    updated once per swap.
+    Holds the served Bundle.
+
+    Readers (/predict, /readyz, /healthz, /model-info) take no lock: they read
+    one reference, and a Bundle is immutable, so they see the previous model
+    or the new one in full, whatever a load is doing.
+
+    A load has two phases. The heavy one (registry download, unpickling, the
+    warm-up forecast) runs in a worker thread with NO lock held. The commit,
+    `install` (one reference assignment plus metric updates, microseconds),
+    runs on the event loop under `lock`: the only time the lock is taken.
+
+    Loads are single-flight. `load_task()` returns the load already in
+    progress instead of starting another, so the startup hook and the
+    lifecycle worker share one download: a startup that gave up waiting
+    (STARTUP_LOAD_TIMEOUT) leaves the download running, and the worker joins
+    it instead of fetching the same artifacts a second time while the
+    registry is already struggling.
     """
 
     def __init__(self) -> None:
         self._bundle: Optional[Bundle] = None
         self._swap = threading.Lock()
         self._lock: Optional[asyncio.Lock] = None   # created in the running loop
+        self._flight: Optional["asyncio.Task[Bundle]"] = None
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -518,18 +546,29 @@ class ModelStore:
     def loaded(self) -> bool:
         return self._bundle is not None
 
-    # synchronous entry points (blocking; the worker calls them in a thread)
+    @property
+    def loading(self) -> bool:
+        """True while a registry load (download, warm-up or swap) is in progress."""
+        flight = self._flight
+        return flight is not None and not flight.done()
 
-    def install(self, bundle: Bundle) -> None:
+    # ── the commit: the only step that needs the lock ──────────────────────────
+
+    def install(self, bundle: Bundle) -> Bundle:
         """Hot-swap: one reference assignment under the swap lock, then metrics.
-        Callers warm the bundle up first (warm_up); nothing untested is swapped in."""
+        Returns the installed bundle (stamped with `loaded_at`). Callers warm the
+        bundle up first (warm_up); nothing untested is swapped in. Cheap by
+        design: it runs on the event loop."""
         info = {**bundle.info, "loaded_at": datetime.now(timezone.utc).isoformat()}
         bundle = Bundle(bundle.model, bundle.scalers, bundle.meta, info, bundle.tags)
         with self._swap:
             previous = self._bundle
             self._bundle = bundle
-            if previous is not None and previous.info["run_id"] != bundle.info["run_id"]:
-                TRACKER.reset(pending_only=True)   # the old model's forecasts are not the new one's errors
+            if (previous is None or previous.info["run_id"] != bundle.info["run_id"]
+                    or previous.info["model_version"] != info["model_version"]):
+                # The old model's forecasts are not the new one's errors; records of
+                # the old version still in flight in the quality pool are dropped.
+                TRACKER.reset(pending_only=True, model_version=info["model_version"])
             MODEL_LOADED.set(1)
             MODEL_INFO.clear()                     # one series only: drop the previous version's labels
             MODEL_INFO.labels(model_name=MODEL_NAME, model_version=info["model_version"],
@@ -546,10 +585,13 @@ class ModelStore:
                  "channels=%s", MODEL_NAME, info["model_stage"], info["model_version"], info["run_id"],
                  info.get("candidate") or "-", bundle.meta["time_steps"], bundle.meta["horizon"],
                  channel_names(bundle.meta) or "-")
+        return bundle
 
-    def load_from_registry(self) -> Bundle:
-        """Fetch the champion and swap it in. Raises on failure; the current
-        model, if any, keeps serving."""
+    # ── the heavy phase: blocking, lock-free, always run in a thread ───────────
+
+    def _prepare_from_registry(self) -> Bundle:
+        """Download the champion and warm it up. A failure is counted; the
+        current model, if any, keeps serving."""
         try:
             bundle = fetch_bundle()
             warm_up(bundle)                      # before the swap: a model that cannot forecast never serves
@@ -558,30 +600,43 @@ class ModelStore:
             if self._bundle is None:
                 MODEL_LOADED.set(0)
             raise
-        self.install(bundle)
+        return bundle
+
+    def _prepare_from_cache(self) -> Bundle:
+        bundle = read_cache()
+        warm_up(bundle)
+        return bundle
+
+    @staticmethod
+    def _write_cache(installed: Bundle) -> None:
+        if not MODEL_CACHE_DIR:
+            return
+        try:
+            write_cache(installed)               # a convenience, never a reason to fail a load
+        except Exception as exc:
+            log.warning("could not write the model cache at %s: %s", MODEL_CACHE_DIR, exc)
+
+    # ── synchronous entry points (tests and tooling; no event loop) ────────────
+
+    def load_from_registry(self) -> Bundle:
+        """Fetch the champion, warm it up and swap it in. Raises on failure."""
+        bundle = self._prepare_from_registry()
+        installed = self.install(bundle)
         MODEL_RELOADS.labels(result="success").inc()
-        if MODEL_CACHE_DIR:
-            try:
-                write_cache(self._bundle)        # a convenience, never a reason to fail a load
-            except Exception as exc:
-                log.warning("could not write the model cache at %s: %s", MODEL_CACHE_DIR, exc)
+        self._write_cache(installed)
         return bundle
 
     def load_from_cache(self) -> Bundle:
-        bundle = read_cache()
-        warm_up(bundle)
+        bundle = self._prepare_from_cache()
         self.install(bundle)
         log.warning("serving model v%s from the cache at %s; the registry is unavailable",
                     bundle.info["model_version"], MODEL_CACHE_DIR)
         return bundle
 
-    def refresh(self) -> bool:
-        """One registry check: swap when the alias points elsewhere than what is
-        served, or when the served model came from the cache. True on a swap.
-        A registry outage logs a warning and keeps the current model."""
-        current = self._bundle
-        if current is None:
-            return False
+    def _needs_refresh(self, current: Bundle) -> bool:
+        """One registry check (network; run in a thread): does the alias point
+        elsewhere than what is served, or does the served model come from the
+        cache? A registry outage logs a warning and answers no."""
         try:
             v, _, _ = resolve_version(_client())
         except RegistryError as exc:
@@ -591,6 +646,13 @@ class ModelStore:
             return False
         log.info("registry alias moved to v%s (serving v%s %s); loading", v.version,
                  current.info["model_version"], current.info["model_stage"])
+        return True
+
+    def refresh(self) -> bool:
+        """Check the alias and swap if it moved. True on a swap."""
+        current = self._bundle
+        if current is None or not self._needs_refresh(current):
+            return False
         try:
             self.load_from_registry()
         except Exception as exc:
@@ -598,19 +660,76 @@ class ModelStore:
             return False
         return True
 
-    # asynchronous entry points (the worker and startup)
+    # ── asynchronous entry points (startup and the lifecycle worker) ───────────
+
+    def load_task(self) -> "asyncio.Task[Bundle]":
+        """The registry load in progress, or a new one (single-flight). Await it
+        through asyncio.shield: cancelling a waiter (a startup timeout, a
+        shutdown) must not cancel a download other waiters share."""
+        loop = asyncio.get_running_loop()
+        flight = self._flight
+        if flight is not None and not flight.done() and flight.get_loop() is loop:
+            return flight
+        flight = loop.create_task(self._load_from_registry_flight(), name="model-load")
+        flight.add_done_callback(self._flight_done)
+        self._flight = flight
+        return flight
+
+    async def _load_from_registry_flight(self) -> Bundle:
+        bundle = await asyncio.to_thread(self._prepare_from_registry)    # download + warm-up, no lock
+        async with self.lock:                                            # the swap, and nothing else
+            installed = self.install(bundle)
+        MODEL_RELOADS.labels(result="success").inc()
+        await asyncio.to_thread(self._write_cache, installed)            # after the swap, off the lock
+        return bundle
+
+    @staticmethod
+    def _flight_done(task: "asyncio.Task[Bundle]") -> None:
+        # Mark the outcome as retrieved even when every waiter gave up (a startup
+        # that timed out); failures are reported by whoever awaits the load.
+        if not task.cancelled() and task.exception() is not None:
+            log.debug("model load task finished with %r", task.exception())
+
+    def cancel_inflight(self) -> None:
+        """Shutdown: stop waiting for a load in progress (its thread finishes on its own)."""
+        flight = self._flight
+        if flight is not None and not flight.done():
+            flight.cancel()
 
     async def load_from_registry_async(self) -> Bundle:
-        async with self.lock:
-            return await asyncio.to_thread(self.load_from_registry)
+        return await asyncio.shield(self.load_task())
 
-    async def load_from_cache_async(self) -> Bundle:
+    async def load_from_cache_async(self) -> Optional[Bundle]:
+        """Serve the last-known-good copy, unless a model is already serving: a
+        registry load that finished first must never be replaced by the cache."""
+        bundle = await asyncio.to_thread(self._prepare_from_cache)       # read + warm-up, no lock
         async with self.lock:
-            return await asyncio.to_thread(self.load_from_cache)
+            if self._bundle is not None:
+                log.info("model cache v%s not used: v%s is already serving", bundle.info["model_version"],
+                         self._bundle.info["model_version"])
+                return None
+            self.install(bundle)
+        log.warning("serving model v%s from the cache at %s; the registry is unavailable",
+                    bundle.info["model_version"], MODEL_CACHE_DIR)
+        return bundle
 
     async def refresh_async(self) -> bool:
-        async with self.lock:
-            return await asyncio.to_thread(self.refresh)
+        """The worker's periodic check. Skipped while a load is in progress; the
+        alias check itself runs in a thread and the load joins the single flight."""
+        current = self._bundle
+        if current is None:
+            return False
+        if self.loading:
+            log.debug("model refresh skipped: a load is already in progress")
+            return False
+        if not await asyncio.to_thread(self._needs_refresh, current):
+            return False
+        try:
+            await asyncio.shield(self.load_task())
+        except Exception as exc:
+            log.warning("model load failed (%s); keeping v%s", exc, current.info["model_version"])
+            return False
+        return True
 
 
 STORE = ModelStore()
@@ -664,17 +783,24 @@ async def lifecycle_worker() -> None:
 
 async def startup_load() -> None:
     """
-    The synchronous first fetch, bounded by STARTUP_LOAD_TIMEOUT. On failure
-    the pod starts alive but not ready, from the cache when one exists.
+    The first fetch, waited for at most STARTUP_LOAD_TIMEOUT before the port
+    opens. Waiting is all that times out: the download itself is a shared
+    single flight (ModelStore.load_task) and keeps running in its thread, so
+    the lifecycle worker joins it instead of starting a second download, and
+    the model appears as soon as it lands. If the registry is down, or the
+    wait ran out, the pod starts alive but not ready, serving the cache when
+    one exists.
     """
+    flight = STORE.load_task()
     try:
-        await asyncio.wait_for(STORE.load_from_registry_async(), timeout=STARTUP_LOAD_TIMEOUT)
+        await asyncio.wait_for(asyncio.shield(flight), timeout=STARTUP_LOAD_TIMEOUT)
         return
-    except asyncio.TimeoutError:
-        log.critical("registry did not answer within %gs at startup; starting without a model",
-                     STARTUP_LOAD_TIMEOUT)
-    except Exception as exc:
-        log.critical("could not load the model at startup (%s); starting without a model", exc)
+    except Exception as exc:               # a timeout of the wait, or the load's own failure
+        if flight.done():
+            log.critical("could not load the model at startup (%s); starting without a model", exc)
+        else:
+            log.critical("registry did not answer within %gs at startup; starting without a model, "
+                         "the download continues in the background", STARTUP_LOAD_TIMEOUT)
     if MODEL_CACHE_DIR:
         try:
             await STORE.load_from_cache_async()
@@ -732,6 +858,7 @@ async def lifespan(application: FastAPI):
     try:
         yield
     finally:
+        STORE.cancel_inflight()
         worker.cancel()
         try:
             await worker

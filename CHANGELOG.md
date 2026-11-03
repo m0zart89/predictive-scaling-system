@@ -3,6 +3,34 @@
 Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 `main`; `v1.0.0` is the first release where every stage is in.
 
+## Unreleased
+
+### Model loading: single flight, the lock only for the swap (PR #18)
+
+- **Download and warm-up run outside the store's lock.** A load is two
+  phases: the heavy one (registry download, unpickling, the warm-up
+  forecast) in a worker thread with no lock held, then the commit
+  (`install`: one reference assignment and the metric updates) under the
+  `asyncio.Lock`, for microseconds. Readers (`/predict`, `/readyz`,
+  `/healthz`) never took the lock and still do not; what changes is that
+  two loads can no longer sit behind one that is mid-download, and the
+  cache write after a swap is off the lock as well.
+- **One download for startup and the worker.** Loads are single-flight
+  (`ModelStore.load_task`). When `STARTUP_LOAD_TIMEOUT` runs out only the
+  wait ends; the download keeps running, the lifecycle worker joins it
+  instead of starting a second one, and the pod becomes ready when it
+  lands. Before, the timed-out thread was left running unobserved while the
+  worker started a duplicate. A cached model is installed only if nothing
+  is serving yet, so a champion that landed first is never replaced by the
+  cache.
+- **A swap no longer lets the old model's in-flight records through.**
+  `TRACKER.reset(model_version=new)` names the serving version: the
+  in-memory tracker drops a record of any other version, the Redis engine
+  keeps scoring it under its own version and leaves the new model's gauges
+  alone.
+- `warm_up` makes two passes (cold, then steady) and logs both;
+  `forecast_model_warmup_seconds` keeps reporting the cold one.
+
 ## v1.2.0 — production hardening (PRs #8–#16)
 
 ### Relative delta alignment (PR #16) — docs/relative-delta-alignment.md applied
