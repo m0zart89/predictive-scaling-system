@@ -94,9 +94,28 @@ spec:
               value: /cache
             - name: TMPDIR
               value: /tmp
-            # in-process quality tracking; 0 when the scaler scores forecasts itself
+            # forecast quality tracking: memory (per pod) or redis (shared)
+            - name: QUALITY_BACKEND
+              value: {{ include "forecast-serving.qualityBackend" . | quote }}
+            - name: FORECAST_MAE_WINDOW
+              value: {{ .Values.quality.rollingWindow | quote }}
+            {{- if eq (include "forecast-serving.qualityBackend" .) "redis" }}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "forecast-serving.fullname" . }}
+                  key: REDIS_URL
+            - name: FORECAST_TTL_SECONDS
+              value: {{ .Values.quality.ttlSeconds | quote }}
+            - name: QUALITY_REDIS_MAX_CONNECTIONS
+              value: {{ .Values.quality.redisMaxConnections | quote }}
+            - name: QUALITY_REDIS_TIMEOUT
+              value: {{ .Values.quality.redisTimeoutSeconds | quote }}
+            {{- else }}
+            # 0 when the scaler scores forecasts itself
             - name: FORECAST_MAX_SERIES
               value: {{ .Values.quality.maxSeries | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

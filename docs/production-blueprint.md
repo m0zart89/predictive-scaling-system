@@ -270,6 +270,13 @@ Three facts about this code decide the manifests:
    single-replica dev installs; in production set `FORECAST_MAX_SERIES=0`
    to switch it off.
 
+   *Applied differently (PR #11):* `serving/quality.py` gained a Redis
+   backend (`QUALITY_BACKEND=redis`), so the serving-side figures stay exact
+   with several replicas — forecasts with a 24 h TTL, error windows as
+   bounded Redis lists, one claim per (forecast, step) across replicas —
+   and `values-prod.yaml` uses it instead of switching the tracker off. The
+   scaler-side recording rules above remain the Redis-independent source.
+
 2. **`/reload` reaches one pod.** The training job POSTs to the Service.
    With three replicas two keep serving the old version. Replace push with
    pull: a background thread in serving checks the registry alias every

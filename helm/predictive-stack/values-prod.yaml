@@ -13,6 +13,13 @@
 demo:
   enabled: false
 
+# Forecast scoring state shared by the serving replicas. The bundled Redis
+# (redis.enabled, no persistence: every key has a TTL) or a managed one:
+#   redis: {enabled: false}, global.quality.redisUrl: redis://:pw@host:6379/0
+global:
+  quality:
+    backend: redis
+
 # ── forecast-serving: 3 replicas, 2 must stay up, one per node ─────────────────
 forecast-serving:
   replicaCount: 3
@@ -37,10 +44,10 @@ forecast-serving:
         matchLabels: {app.kubernetes.io/name: forecast-serving}
   model:
     refreshSeconds: "60"
-  # With several replicas the scaler's own scoring is the source of the live
-  # error (predictive_scaler_forecast_abs_error); the in-process tracker is off.
+  # Several replicas: the forecast scoring state lives in Redis
+  # (global.quality below), so a forecast made on one pod is scored on any.
   quality:
-    maxSeries: "0"
+    redisTimeoutSeconds: "0.25"
 
 # ── predictive-scaler: 2 replicas, one per node ────────────────────────────────
 predictive-scaler:
