@@ -521,3 +521,131 @@ def test_capacity_fraction_contract_is_checked_at_load(registry, serving, monkey
     with pytest.raises(RuntimeError, match="capacity_reference"):
         serving_app._validated(serving_app.Bundle(b.model, b.scalers, {**b.meta, "units": "capacity_fraction"},
                                                   b.info, b.tags))
+
+
+# ── single-flight loads, lock only for the swap ────────────────────────────────
+
+def _slow(gate, entered, calls, wrapped):
+    """A stand-in for a blocking step: records the call, parks on `gate`, then runs the real one."""
+    def run(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert gate.wait(10), "test gate never opened"
+        return wrapped(*args, **kwargs)
+    return run
+
+
+def test_startup_timeout_leaves_the_download_running_and_the_worker_joins_it(registry, serving, monkeypatch):
+    """A startup that stops waiting must not discard the download: the lifecycle
+    worker joins the same flight, and the artifacts are fetched exactly once."""
+    import asyncio
+    import threading
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    gate, entered, calls = threading.Event(), threading.Event(), []
+    monkeypatch.setattr(serving_app, "fetch_bundle", _slow(gate, entered, calls, serving_app.fetch_bundle))
+    monkeypatch.setattr(serving_app, "STARTUP_LOAD_TIMEOUT", 0.3)
+    monkeypatch.setattr(serving_app, "MODEL_CACHE_DIR", "")
+
+    async def scenario():
+        await serving_app.startup_load()                 # gives up waiting after 0.3 s
+        assert not serving_app.STORE.loaded and serving_app.STORE.loading
+        worker = asyncio.create_task(serving_app.lifecycle_worker())
+        await asyncio.sleep(0.4)                         # the worker's first attempt joins the flight
+        assert len(calls) == 1
+        gate.set()
+        for _ in range(100):
+            if serving_app.STORE.loaded:
+                break
+            await asyncio.sleep(0.1)
+        worker.cancel()
+        assert serving_app.STORE.loaded and not serving_app.STORE.loading
+
+    asyncio.run(scenario())
+    assert len(calls) == 1                               # one download for startup and worker together
+    assert serving_app.STORE.get().info["model_version"] == "1"
+
+
+def test_nothing_holds_the_lock_while_a_model_downloads_or_warms_up(registry, serving, monkeypatch):
+    """The store's lock is taken only for the swap: probes and /predict answer
+    while the next version is parked in its download and in its warm-up."""
+    import asyncio
+    import dataclasses
+    import threading
+
+    import httpx
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    v1 = serving_app.STORE.get()
+    fetch_gate, fetch_entered, warm_gate, warm_entered = (threading.Event() for _ in range(4))
+
+    def fetch_v2():
+        fetch_entered.set()
+        assert fetch_gate.wait(10)
+        return dataclasses.replace(v1, info={**v1.info, "model_version": "2", "run_id": "run-2"})
+
+    original_warm = serving_app.warm_up
+
+    def warm(bundle, *a, **kw):
+        warm_entered.set()
+        assert warm_gate.wait(10)
+        return original_warm(bundle, *a, **kw)
+
+    monkeypatch.setattr(serving_app, "fetch_bundle", fetch_v2)
+    monkeypatch.setattr(serving_app, "warm_up", warm)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=serving_app.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            flight = serving_app.STORE.load_task()
+            await asyncio.to_thread(fetch_entered.wait, 5)
+            for phase in ("downloading", "warming up"):
+                assert serving_app.STORE.loading and not serving_app.STORE.lock.locked(), phase
+                health = await asyncio.wait_for(client.get("/healthz"), 1.0)
+                ready = await asyncio.wait_for(client.get("/readyz"), 1.0)
+                predicted = await asyncio.wait_for(client.post("/predict", json={"values": [0.3] * 10}), 5.0)
+                assert health.status_code == 200 and ready.json()["model_version"] == "1", phase
+                assert predicted.status_code == 200 and predicted.json()["model_version"] == "1", phase
+                if phase == "downloading":
+                    fetch_gate.set()
+                    await asyncio.to_thread(warm_entered.wait, 5)
+            warm_gate.set()
+            await asyncio.wait_for(flight, 10)
+            assert (await client.get("/readyz")).json()["model_version"] == "2"
+
+    asyncio.run(scenario())
+
+
+def test_a_record_still_in_flight_from_the_old_model_is_dropped_after_the_swap(registry, serving):
+    """TRACKER.reset(model_version=new) on the swap: the old model's request that
+    reaches the quality pool afterwards is not scored as the new model's."""
+    import dataclasses
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    v1 = serving_app.STORE.get()
+    window = [0.3] * 10
+    assert serving_app.TRACKER.record("s", window, [0.3, 0.3], STEP, 1_700_000_000, model_version="1") == 0
+    assert serving_app.TRACKER.pending._value.get() == 1
+    serving_app.STORE.install(dataclasses.replace(v1, info={**v1.info, "model_version": "2", "run_id": "run-2"}))
+    assert serving_app.TRACKER.pending._value.get() == 0            # the old pending forecasts are gone
+    serving_app.TRACKER.record("s", window, [0.3, 0.3], STEP, 1_700_000_000 + STEP, model_version="1")
+    assert serving_app.TRACKER.pending._value.get() == 0            # ... and a late record of v1 is not queued
+    serving_app.TRACKER.record("s", window, [0.3, 0.3], STEP, 1_700_000_000 + STEP, model_version="2")
+    assert serving_app.TRACKER.pending._value.get() == 1
+
+
+def test_a_cached_model_never_replaces_a_champion_that_landed_first(registry, serving, monkeypatch, tmp_path):
+    import asyncio
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    monkeypatch.setattr(serving_app, "MODEL_CACHE_DIR", str(tmp_path / "cache"))
+    serving_app.load_model()                                         # writes the cache
+    serving_app.STORE.install(serving_app.STORE.get())               # a champion is serving
+    assert asyncio.run(serving_app.STORE.load_from_cache_async()) is None
+    assert serving_app.STORE.get().info["model_stage"] != "cache"

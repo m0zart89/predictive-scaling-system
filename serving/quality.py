@@ -72,7 +72,7 @@ class QualityBackend(Protocol):
                step_seconds: int, timestamp: Optional[float] = None,
                model_version: Optional[str] = None) -> int: ...
 
-    def reset(self, pending_only: bool = False) -> None: ...
+    def reset(self, pending_only: bool = False, model_version: Optional[str] = None) -> None: ...
 
     def snapshot(self, model_version: Optional[str] = None, horizon: int = 0) -> Dict[int, float]: ...
 
@@ -125,6 +125,10 @@ class ForecastTracker:
         self.tolerance = tolerance
         self._clock = clock
         self._lock = threading.Lock()
+        # The model version whose forecasts are tracked (set by reset on a swap, or
+        # by the first versioned record). A record from another version is a
+        # request that was already in flight when the model was swapped.
+        self._version: Optional[str] = None
         # series key → pending forecasts, oldest first; OrderedDict gives LRU eviction
         self._pending: "OrderedDict[str, Deque[_Pending]]" = OrderedDict()
         self._errors: Dict[int, Deque[float]] = {}   # horizon step → recent abs errors
@@ -144,14 +148,25 @@ class ForecastTracker:
         """
         Score earlier forecasts of `series` against `values`, then remember
         `predictions` for scoring later. Returns how many (forecast, step)
-        pairs were resolved by this window. `model_version` is accepted for
-        contract parity with the Redis backend and not used: one pod serves
-        one version at a time and `reset(pending_only=True)` runs on a swap.
+        pairs were resolved by this window.
+
+        `model_version` guards the swap: the record of a request that began
+        on the previous model and reaches this tracker after
+        `reset(model_version=new)` is dropped (returns 0). Its forecasts
+        belong to a model that no longer serves, and queued here they would
+        be scored as the new model's errors. Without a version (older
+        callers, tests) nothing is dropped.
         """
         if step_seconds <= 0 or not predictions or self.max_series <= 0:
             return 0      # max_series=0: tracking off (the scaler scores forecasts itself)
         now = float(timestamp) if timestamp is not None else self._clock()
         with self._lock:
+            if model_version is not None:
+                if self._version is None:
+                    self._version = str(model_version)
+                elif str(model_version) != self._version:
+                    log.debug("quality: dropped a record of v%s, v%s is serving", model_version, self._version)
+                    return 0
             queue = self._pending.get(series)
             if queue is None:
                 if len(self._pending) >= self.max_series:
@@ -171,15 +186,22 @@ class ForecastTracker:
             self.pending.set(sum(len(q) for q in self._pending.values()))
         return resolved
 
-    def reset(self, pending_only: bool = False) -> None:
+    def reset(self, pending_only: bool = False, model_version: Optional[str] = None) -> None:
         """Forget pending forecasts (after a model swap: the old model's forecasts
-        are not the new model's errors) and, unless pending_only, the errors too."""
+        are not the new model's errors) and, unless pending_only, the errors too.
+        `model_version` names the model that serves from now on: records of any
+        other version that are still in flight are dropped (see record). A full
+        reset without a version forgets the version too."""
         with self._lock:
             self._pending.clear()
             self.pending.set(0)
             if not pending_only:
                 self._errors.clear()
                 self.rolling_mae.clear()
+            if model_version is not None:
+                self._version = str(model_version)
+            elif not pending_only:
+                self._version = None
 
     def snapshot(self, model_version: Optional[str] = None, horizon: int = 0) -> Dict[int, float]:
         """Current rolling MAE per horizon step (for tests and /model-info)."""
@@ -433,7 +455,13 @@ class RedisMetricsEngine:
         version = str(model_version) if model_version else "unknown"
         with self._lock:
             self._seen_horizon = max(self._seen_horizon, len(predictions))
-            self._current_version = version
+            # The serving version is set by reset() on a swap. A record of the
+            # previous version still in flight is stored and scored under its
+            # own version's key (nothing of it reaches the new model's window
+            # or gauges); only a pod that never saw a swap adopts the version
+            # of its first record.
+            if self._current_version is None:
+                self._current_version = version
         if not self._available():
             return 0
         try:
@@ -541,17 +569,21 @@ class RedisMetricsEngine:
                 out[k] = mean
         return out
 
-    def reset(self, pending_only: bool = False) -> None:
+    def reset(self, pending_only: bool = False, model_version: Optional[str] = None) -> None:
         """
         On a model swap the pod's gauges stop describing the new version until
         it has errors of its own; the shared state is left alone (another
         replica may still serve the old version, and its forecasts score into
         their own ``metrics:mae:{old_version}:*`` windows, never the new one's).
+        `model_version` names the version that serves from now on: gauges and
+        `snapshot` follow it, and a record of the old version still in flight
+        cannot move them back. Without it the version is forgotten and the next
+        record sets it again.
         """
         self.rolling_mae.clear()
         with self._lock:
-            if not pending_only:
-                self._current_version = None
+            # without a version the pod forgets it and adopts that of the next record
+            self._current_version = str(model_version) if model_version is not None else None
 
     def ping(self) -> bool:
         """True when Redis answers; used by the startup log and tests."""

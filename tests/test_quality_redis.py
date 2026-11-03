@@ -225,3 +225,17 @@ def test_rejects_ambiguous_tolerance_and_empty_windows(client, registry):
     assert eng.record("s", [0.0] * N, [], STEP, timestamp=T0) == 0
     assert eng.resolve_and_score("s", [], STEP, timestamp=T0) == 0
     assert eng.snapshot() == {}
+
+
+def test_a_late_record_of_the_old_model_cannot_move_the_gauges_back(client, registry):
+    """After reset(model_version=2) the pod's gauges follow v2; a v1 request
+    still in flight is scored into v1's own list and leaves v2's view alone."""
+    eng = engine(client, registry)
+    eng.record("s", [0.0] * N, [1.0], STEP, timestamp=T0, model_version="1")
+    eng.reset(pending_only=True, model_version="2")
+    eng.record("s", [0.0] * N, [0.5], STEP, timestamp=T0 + STEP, model_version="2")
+    # the v1 request that was in flight resolves the v1 forecast made at T0
+    eng.record("s", [0.0] * N, [0.2], STEP, timestamp=T0 + 2 * STEP, model_version="1")
+    assert eng._current_version == "2"
+    assert client.lrange("metrics:mae:1:1", 0, -1) == ["1.0"]       # scored under its own version
+    assert mae(registry, 1) is None or mae(registry, 1) == pytest.approx(0.5)

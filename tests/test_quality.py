@@ -144,3 +144,23 @@ def test_snapshot_reports_current_mae(tracker):
     tracker.record("s", [0.0] * N, [0.25, 0.5], STEP, timestamp=t0)
     tracker.record("s", [0.0] * N, [0.0], STEP, timestamp=t0 + 2 * STEP)
     assert tracker.snapshot() == {1: 0.25, 2: 0.5}
+
+
+def test_records_of_a_swapped_out_model_are_dropped(registry):
+    """reset(model_version=new) after a swap: a record of the previous version that
+    was still in flight is not queued, a record of the new one is."""
+    tracker = ForecastTracker(registry)
+    t0 = 1_000_000
+    assert tracker.record("s", [0.0] * N, [1.0], STEP, timestamp=t0, model_version="1") == 0
+    assert registry.get_sample_value("forecast_pending_forecasts") == 1
+    tracker.reset(pending_only=True, model_version="2")
+    assert registry.get_sample_value("forecast_pending_forecasts") == 0
+    tracker.record("s", [0.0] * N, [1.0], STEP, timestamp=t0 + STEP, model_version="1")      # late, old model
+    assert registry.get_sample_value("forecast_pending_forecasts") == 0
+    tracker.record("s", [0.0] * N, [1.0], STEP, timestamp=t0 + STEP, model_version="2")
+    assert tracker.record("s", [0.0] * N, [1.0], STEP, timestamp=t0 + 2 * STEP, model_version="2") == 1
+    # unversioned callers are never gated; a full reset forgets the version
+    tracker.record("s", [0.0] * N, [1.0], STEP, timestamp=t0 + 3 * STEP)
+    tracker.reset()
+    tracker.record("s", [0.0] * N, [1.0], STEP, timestamp=t0 + 4 * STEP, model_version="1")
+    assert registry.get_sample_value("forecast_pending_forecasts") == 1
