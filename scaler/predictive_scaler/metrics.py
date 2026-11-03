@@ -121,6 +121,18 @@ class ScalerMetrics:
             "Decisions that did not call the forecast service because its breaker was open",
             _LABELS, registry=registry,
         )
+        self.capacity_reference = Gauge(
+            "predictive_scaler_capacity_reference",
+            "Reference capacity in cores the history is divided by and the forecast multiplied by: "
+            "from capacityQuery (source=query) or the static capacity key (source=static)",
+            _LABELS + ("source",), registry=registry,
+        )
+        self.capacity_drift = Gauge(
+            "predictive_scaler_capacity_drift",
+            "Runtime reference capacity / the capacity_reference the served model was trained with; "
+            "far from 1 means the model's fractions describe another envelope",
+            _LABELS, registry=registry,
+        )
         self.forecast_latency = Histogram(
             "predictive_scaler_forecast_latency_seconds",
             "Latency of calls to the forecast service",

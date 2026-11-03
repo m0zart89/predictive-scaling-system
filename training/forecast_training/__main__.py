@@ -28,6 +28,7 @@ import sys
 from .data import (DataError, align_series, load_export, parse_exclude, query_prometheus,
                    regularize)
 from .model import CANDIDATE_NAMES, DEFAULT_UNDER_WEIGHT
+from .features import UNITS
 from .registry import BASELINES, TrainConfig, run_pipeline
 
 
@@ -93,6 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
                    default=float(_env("TRAIN_UNDER_WEIGHT", DEFAULT_UNDER_WEIGHT)),
                    help="selection cost: one unit of demand the forecast missed costs this many "
                         "idle units (default 3; 1 = plain MAE)")
+    p.add_argument("--units", choices=UNITS, default=_env("TRAIN_UNITS", "scaled"),
+                   help="target channel units: scaled (MinMax of the training series) or capacity_fraction "
+                        "(the series is demand / --capacity-reference and is not re-scaled, so forecasts "
+                        "are fractions of capacity on every workload)")
+    p.add_argument("--capacity-reference", type=float,
+                   default=float(_env("TRAIN_CAPACITY_REFERENCE", 0) or 0) or None,
+                   help="cores the series was divided by (required with --units capacity_fraction)")
     p.add_argument("--baseline", choices=BASELINES, default=_env("TRAIN_BASELINE", "persistence"),
                    help="what the winner must beat: persistence (last value), seasonal (the value "
                         "one --period-seconds earlier) or best of the two (default persistence; "
@@ -159,6 +167,7 @@ def main(argv=None) -> int:
             period_seconds=args.period_seconds, test_fraction=args.test_fraction, min_tracking=args.min_tracking,
             min_improvement=args.min_improvement, min_fresh_windows=args.min_fresh_windows,
             under_weight=args.under_weight, baseline=args.baseline, reason=args.reason,
+            units=args.units, capacity_reference=args.capacity_reference,
             refit=not args.no_refit, dry_run=args.dry_run, channels=tuple(names),
             candidates=[c.strip() for c in args.candidates.split(",") if c.strip()],
         )

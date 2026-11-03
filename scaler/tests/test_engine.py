@@ -559,3 +559,95 @@ def test_service_breaker_is_per_scaledobject(metrics):
     fc.fn = lambda v: 0.9
     assert eng.decide(NS, "b", cfg).source == "forecast"      # b is unaffected
     assert eng.decide(NS, "a", cfg).source == "observed"
+
+
+# ── reference capacity at runtime (capacity.py) ────────────────────────────────
+
+CAP_Q = 'max(kube_pod_container_resource_limits{container="api", resource="cpu"}) * 20'
+
+
+def test_capacity_query_is_the_reference_on_both_sides_of_the_forecast(metrics, registry):
+    """History in, forecast out: both use the queried envelope, and the
+    coefficient from a capacity_fraction model becomes cores by that value."""
+    from predictive_scaler.clients import ForecastAnswer
+
+    window = [2.0] * 9 + [3.0]                  # cores
+    fc = FakeForecast(lambda v: ForecastAnswer([0.5], "capacity_fraction", 8.0))
+    prom = FakePrometheus(window, scalars={CAP_Q: 8.0})
+    eng = engine_with(metrics, prom, fc)
+    d = eng.decide(NS, NAME, make_config(capacity="4", capacityQuery=CAP_Q, targetValue="1",
+                                         forecastSurgeFactor="0"))
+    assert fc.calls[0] == pytest.approx([0.25] * 9 + [0.375])    # divided by 8, not the static 4
+    assert d.predicted == pytest.approx(4.0)                     # 0.5 x 8 cores
+    assert registry.get_sample_value("predictive_scaler_capacity_reference", labels(source="query")) == 8.0
+    assert registry.get_sample_value("predictive_scaler_capacity_reference", labels(source="static")) is None
+    assert registry.get_sample_value("predictive_scaler_capacity_drift", labels()) == pytest.approx(1.0)
+
+
+def test_capacity_query_is_cached_and_falls_back_to_the_static_key(metrics, registry):
+    from predictive_scaler.clients import PrometheusError
+
+    clock = Clock()
+    fc = FakeForecast(lambda v: 0.5)
+    prom = FakePrometheus(WINDOW, scalars={CAP_Q: 2.0})
+    eng = engine_with(metrics, prom, fc, clock)
+    cfg = make_config(capacity="4", capacityQuery=CAP_Q, capacityRefreshSeconds="100", cacheSeconds="0",
+                      forecastSurgeFactor="0")
+    assert eng.decide(NS, NAME, cfg).predicted == pytest.approx(1.0)      # 0.5 x 2
+    clock.t += 50
+    eng.decide(NS, NAME, cfg)
+    assert len(prom.scalar_calls) == 1                                   # cached
+    clock.t += 60
+    prom.scalars[CAP_Q] = PrometheusError("down")
+    d = eng.decide(NS, NAME, cfg)                                        # refresh fails: last good value
+    assert d.predicted == pytest.approx(1.0) and len(prom.scalar_calls) == 2
+    assert registry.get_sample_value("predictive_scaler_capacity_reference", labels(source="query")) == 2.0
+
+    # a workload whose query never answered: the static capacity, once logged
+    prom2 = FakePrometheus(WINDOW, scalars={CAP_Q: None})
+    eng2 = engine_with(metrics, prom2, FakeForecast(lambda v: 0.5), clock)
+    d = eng2.decide(NS, "other", cfg)
+    assert d.predicted == pytest.approx(2.0)                             # 0.5 x static 4
+    assert registry.get_sample_value("predictive_scaler_capacity_reference",
+                                     {"namespace": NS, "scaledobject": "other", "source": "static"}) == 4.0
+
+
+def test_capacity_drift_against_the_models_reference_is_flagged(metrics, registry, caplog):
+    import logging
+
+    from predictive_scaler.clients import ForecastAnswer
+
+    fc = FakeForecast(lambda v: ForecastAnswer([0.5], "capacity_fraction", 2.0))   # trained on 2 cores
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    with caplog.at_level(logging.WARNING, logger="predictive-scaler.engine"):
+        d = eng.decide(NS, NAME, make_config(capacity="8", capacityDriftFactor="2", forecastSurgeFactor="0"))
+    assert d.predicted == pytest.approx(4.0)                             # still multiplied by the runtime 8
+    assert registry.get_sample_value("predictive_scaler_capacity_drift", labels()) == pytest.approx(4.0)
+    assert any("event=capacity_drift" in r.message and "factor=4.00" in r.message for r in caplog.records)
+
+
+def test_legacy_answers_without_units_scale_by_the_static_capacity(metrics, registry):
+    fc = FakeForecast(lambda v: 0.5)                                     # a plain list: units unknown
+    eng = engine_with(metrics, FakePrometheus(WINDOW), fc)
+    d = eng.decide(NS, NAME, make_config(capacity="4", forecastSurgeFactor="0"))
+    assert d.predicted == pytest.approx(2.0)
+    assert registry.get_sample_value("predictive_scaler_capacity_drift", labels()) is None
+    assert registry.get_sample_value("predictive_scaler_capacity_reference", labels(source="static")) == 4.0
+
+
+def test_forecasts_are_scored_against_the_reference_they_were_made_with(metrics, registry):
+    """The envelope changes between a forecast and its scoring: the actual is
+    divided by the reference in force when the forecast was made."""
+    clock = Clock()
+    fc = FakeForecast(lambda v: [0.5])
+    prom = FakePrometheus([0.2] * 10, scalars={CAP_Q: 2.0})
+    eng = engine_with(metrics, prom, fc, clock)
+    cfg = make_config(capacityQuery=CAP_Q, capacityRefreshSeconds="0", stepSeconds="30", cacheSeconds="0")
+    eng.decide(NS, NAME, cfg)
+    prom.scalars[CAP_Q] = 4.0                                            # limits doubled
+    prom.values = [0.2] * 10 + [1.0]
+    prom.NOW = FakePrometheus.NOW + 30
+    clock.t += 30
+    eng.decide(NS, NAME, cfg)
+    total = registry.get_sample_value("predictive_scaler_forecast_abs_error_sum", labels(step="1"))
+    assert total == pytest.approx(abs(1.0 / 2.0 - 0.5))                 # against 2, not 4

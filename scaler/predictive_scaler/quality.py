@@ -28,6 +28,7 @@ class _Pending:
     made_at: float            # unix time of the window's last sample
     step_seconds: int
     values: List[float]       # forecast per horizon step, model units
+    capacity: Optional[float] = None   # cores the history was divided by when this forecast was made
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,12 @@ class ForecastLedger:
         self._lock = threading.Lock()
         self._pending: "OrderedDict[str, Deque[_Pending]]" = OrderedDict()
 
-    def record(self, key: str, made_at: float, step_seconds: int, values: Sequence[float]) -> None:
-        """Remember a forecast made for the instants made_at + k*step, k = 1..len(values)."""
+    def record(self, key: str, made_at: float, step_seconds: int, values: Sequence[float],
+               capacity: Optional[float] = None) -> None:
+        """Remember a forecast made for the instants made_at + k*step, k = 1..len(values).
+        `capacity`: the reference the history was divided by; the actual is
+        divided by the same one when the forecast is scored, so a change of
+        the runtime reference between the two is not read as model error."""
         if not values or step_seconds <= 0 or self.max_series <= 0:
             return
         with self._lock:
@@ -65,7 +70,8 @@ class ForecastLedger:
             # one forecast per instant: a cached decision or a retry must not count twice
             if queue and abs(queue[-1].made_at - made_at) <= self.tolerance * step_seconds:
                 return
-            queue.append(_Pending(float(made_at), int(step_seconds), [float(v) for v in values]))
+            queue.append(_Pending(float(made_at), int(step_seconds), [float(v) for v in values],
+                                  float(capacity) if capacity else None))
 
     def score(self, key: str, timestamps: Sequence[float], history: Sequence[Optional[float]],
               capacity: float = 1.0) -> List[Resolved]:
@@ -92,14 +98,14 @@ class ForecastLedger:
                     target = p.made_at + k * p.step_seconds
                     actual = _lookup(by_ts, target, tol)
                     if actual is not None:
-                        resolved.append(Resolved(k, forecast, actual / capacity, target))
+                        resolved.append(Resolved(k, forecast, actual / (p.capacity or capacity), target))
                 last_target = p.made_at + len(p.values) * p.step_seconds
                 if last_target > newest + tol:
                     keep.append(p)          # later steps still to come
             # a resolved step must not be scored again on the next poll: drop
             # the forecast's steps that are now in the past
             self._pending[key] = deque(
-                (_Pending(p.made_at, p.step_seconds, p.values) for p in keep), maxlen=self.max_pending)
+                (_Pending(p.made_at, p.step_seconds, p.values, p.capacity) for p in keep), maxlen=self.max_pending)
             for p in self._pending[key]:
                 done = int((newest + self.tolerance * p.step_seconds - p.made_at) // p.step_seconds)
                 if done > 0:

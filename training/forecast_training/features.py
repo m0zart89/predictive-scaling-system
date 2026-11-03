@@ -56,11 +56,22 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.preprocessing import MinMaxScaler
 
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
+# Units of the target channel inside the model (docs/relative-delta-alignment.md):
+#   scaled             MinMax of the training series (formats <= 4): a delta of 0.1
+#                      is a tenth of the range that series happened to cover
+#   capacity_fraction  the series is demand / capacity_reference and the target
+#                      channel is not re-scaled, so a delta of 0.1 is a tenth of the
+#                      workload's capacity whichever workload or week it was trained on
+UNITS = ("scaled", "capacity_fraction")
+# A capacity_fraction series above this is a wrong reference, not a busy workload.
+CAPACITY_FRACTION_MAX = 1.5
 FEATURE_KINDS = ("window", "anchored", "anchored_tod", "anchored_season")
 TARGET_KINDS = ("level", "delta")
 # Feature kinds that need the timestamp of each window's last sample.
@@ -82,6 +93,8 @@ class ForecastMeta:
     season_steps: int = 0      # anchored_season: samples per cycle (period / step); the input is
                                # time_steps + season_steps samples long. 0 for the other kinds.
     channels: Tuple[str, ...] = ()   # () = one unnamed series; else channel names, [0] the target
+    units: str = "scaled"            # units of the target channel: scaled | capacity_fraction
+    capacity_reference: Optional[float] = None   # cores the series was divided by (capacity_fraction)
     format_version: int = FORMAT_VERSION
 
     def __post_init__(self):
@@ -97,6 +110,12 @@ class ForecastMeta:
             raise ValueError("time_steps must be >= 2 and horizon >= 1")
         if self.period_seconds <= 0:
             raise ValueError("period_seconds must be > 0")
+        if self.units not in UNITS:
+            raise ValueError(f"units must be one of {UNITS}")
+        if self.units == "capacity_fraction":
+            if self.capacity_reference is None or not self.capacity_reference > 0:
+                raise ValueError("capacity_fraction units need a positive capacity_reference")
+            object.__setattr__(self, "capacity_reference", float(self.capacity_reference))
         if self.features in SEASONAL_FEATURE_KINDS:
             if self.season_steps < self.horizon:
                 raise ValueError("season_steps must be >= horizon for seasonal features")
@@ -127,6 +146,65 @@ class ForecastMeta:
     def from_dict(cls, d: dict) -> "ForecastMeta":
         known = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
         return cls(**known)
+
+
+class CapacityFractionScaler(BaseEstimator, TransformerMixin):
+    """
+    Identity transform for a series already expressed as a fraction of the
+    reference capacity (demand / capacity_reference): with it, the delta
+    target `Y - X[:, -1]` is exactly (CPU_{t+k} - CPU_t) / capacity. It
+    exposes data_min_ / data_max_ like MinMaxScaler, so serving's warm-up
+    and anything that reads the training range need no special case, and
+    pickles next to the model under forecast_training.features, which both
+    images carry.
+    """
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        self.data_min_ = np.nanmin(X, axis=0)
+        self.data_max_ = np.nanmax(X, axis=0)
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X):
+        return np.asarray(X, dtype=np.float64)
+
+    def inverse_transform(self, X):
+        return np.asarray(X, dtype=np.float64)
+
+
+def is_identity_scaler(scaler) -> bool:
+    """True when `scaler` leaves values unchanged (the capacity_fraction contract)."""
+    try:
+        probe = np.array([[0.0], [0.37], [1.25]])
+        return bool(np.allclose(scaler.transform(probe), probe)
+                    and np.allclose(scaler.inverse_transform(probe), probe))
+    except Exception:
+        return False
+
+
+def fit_scalers(chans: np.ndarray, units: str) -> list:
+    """One scaler per channel, the target first. capacity_fraction: identity on
+    the target (its units are the contract), MinMax on the exogenous channels
+    (their range has no capacity to be relative to); scaled: MinMax everywhere."""
+    if units not in UNITS:
+        raise ValueError(f"units must be one of {UNITS}")
+    scalers = []
+    for i, ch in enumerate(np.asarray(chans, dtype=np.float64)):
+        column = ch.reshape(-1, 1)
+        if i == 0 and units == "capacity_fraction":
+            peak = float(np.nanmax(column)) if column.size else 0.0
+            if peak > CAPACITY_FRACTION_MAX:
+                raise ValueError(
+                    f"the target series reaches {peak:.3g} x its capacity reference; a fraction of "
+                    f"capacity cannot exceed {CAPACITY_FRACTION_MAX:g}, so the reference (TRAIN_CAPACITY_REFERENCE "
+                    "/ the chart's capacity) is wrong for this workload")
+            scalers.append(CapacityFractionScaler().fit(column))
+        else:
+            scalers.append(MinMaxScaler().fit(column))
+    return scalers
 
 
 # Models registered before this pipeline existed (the notebook's Random Forest):

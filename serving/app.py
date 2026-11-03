@@ -62,8 +62,8 @@ from prometheus_client import Counter, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator, metrics
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from forecast_training.features import (FEATURE_KINDS, TARGET_KINDS, build_features_mv, from_target,
-                                        target_channel)
+from forecast_training.features import (FEATURE_KINDS, TARGET_KINDS, UNITS, build_features_mv, from_target,
+                                        is_identity_scaler, target_channel)
 from quality import ForecastTracker, QualityBackend, RedisMetricsEngine
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -207,6 +207,7 @@ TRACKER: QualityBackend = build_tracker()
 LEGACY_FORECAST_META: dict[str, Any] = {
     "time_steps": TIME_STEPS, "horizon": 1, "step_seconds": 300, "features": "window",
     "target": "level", "period_seconds": 86400, "season_steps": 0, "channels": [],
+    "units": "scaled", "capacity_reference": None,
 }
 
 
@@ -399,6 +400,18 @@ def _validated(bundle: Bundle) -> Bundle:
         raise RuntimeError(f"unsupported {META_ARTIFACT}: {meta}")
     if len(bundle.scalers) != max(1, len(channel_names(meta))):
         raise RuntimeError(f"{len(bundle.scalers)} scaler(s) for channels {channel_names(meta)}")
+    units = meta.get("units") or "scaled"
+    if units not in UNITS:
+        raise RuntimeError(f"unsupported units {units!r} in {META_ARTIFACT}")
+    if units == "capacity_fraction":
+        # The contract says the numbers are fractions of capacity_reference: that
+        # is only true when the target channel is not re-scaled on the way in.
+        ref = meta.get("capacity_reference")
+        if not isinstance(ref, (int, float)) or not ref > 0:
+            raise RuntimeError(f"capacity_fraction units without a positive capacity_reference ({ref!r})")
+        if not is_identity_scaler(bundle.scalers[0]):
+            raise RuntimeError("capacity_fraction units but the target scaler is not the identity "
+                               f"({type(bundle.scalers[0]).__name__}): the model was not trained on fractions")
     return bundle
 
 
@@ -808,6 +821,11 @@ class PredictResponse(BaseModel):
     prediction: float                 # next interval (first step of `predictions`)
     predictions: list[float]          # one value per step of the model's horizon
     step_seconds: int                 # spacing of `predictions`
+    # What the numbers are: capacity_fraction = fractions of capacity_reference
+    # (multiply by the workload's capacity in cores); scaled = the training
+    # series' own units (models before format 5)
+    units: str
+    capacity_reference: Optional[float] = None
     model: str
     stage: str                        # registry selector the model was loaded from (or "cache")
     model_version: Optional[str] = None
@@ -869,6 +887,8 @@ async def model_info() -> dict[str, Any]:
         "features": meta["features"],
         "target": meta["target"],
         "period_seconds": meta.get("period_seconds", 86400),
+        "units": meta.get("units") or "scaled",
+        "capacity_reference": meta.get("capacity_reference"),
         "refresh_seconds": MODEL_REFRESH_SECONDS,
         "rolling_mae": {str(k): round(v, 6) for k, v in sorted(rolling.items())},
         **(b.info if b is not None else {}),
@@ -935,6 +955,8 @@ async def predict(req: PredictRequest) -> PredictResponse:
         prediction=predictions[0],
         predictions=predictions,
         step_seconds=int(b.meta["step_seconds"]),
+        units=b.meta.get("units") or "scaled",
+        capacity_reference=b.meta.get("capacity_reference"),
         model=MODEL_NAME,
         stage=b.info["model_stage"],
         model_version=b.info["model_version"],

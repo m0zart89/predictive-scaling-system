@@ -5,6 +5,28 @@ Stages follow [docs/ROADMAP.md](docs/ROADMAP.md). Versions are git tags on
 
 ## Unreleased
 
+### Relative delta alignment (PR #16) — docs/relative-delta-alignment.md applied
+
+- **Models speak fractions of capacity.** `--units capacity_fraction
+  --capacity-reference C` (`TRAIN_UNITS`, `TRAIN_CAPACITY_REFERENCE`, set by
+  the chart's CronJob from the workload's `capacity`): the target channel is
+  not re-scaled (`CapacityFractionScaler`), so the delta target is exactly
+  `(CPU_{t+k} − CPU_t) / C`; `forecast_meta.json` format 5 and the version
+  tags carry `units` and `capacity_reference`; a series above 1.5 × C is
+  refused. `scaled` (MinMax, formats ≤ 4) stays the default and keeps
+  loading.
+- **Serving says what its numbers are:** `units` and `capacity_reference`
+  in `/predict` and `/model-info`; a bundle claiming fractions with a
+  non-identity target scaler is rejected at load.
+- **Scaler: reference capacity at runtime.** `capacityQuery` (PromQL for
+  the workload's envelope in cores, cached `capacityRefreshSeconds`, last
+  good value then the static `capacity` on failure), the forecast
+  coefficient × that reference, the ledger scored against the reference
+  each forecast was made with, `predictive_scaler_capacity_reference{source}`
+  and `predictive_scaler_capacity_drift` with `capacityDriftFactor`;
+  `event=capacity_fallback|capacity_changed|capacity_drift|forecast_scaled`
+  logs. Chart keys per workload; CI checks the rendering.
+
 ### Model warm-up (PR #13)
 
 - **A model is warmed up before it is swapped in.** After the download

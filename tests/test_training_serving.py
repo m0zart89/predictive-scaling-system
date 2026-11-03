@@ -479,3 +479,45 @@ def test_a_model_that_cannot_forecast_is_rejected_and_the_old_one_keeps_serving(
         assert REGISTRY.get_sample_value("forecast_model_reloads_total", {"result": "failure"}) == failures_before + 1
         assert serving.get("/readyz").status_code == 200 and REGISTRY.get_sample_value("forecast_model_loaded") == 1
     assert serving.post("/predict", json={"values": [0.3] * 10}).status_code == 200
+
+
+def test_capacity_fraction_model_says_what_its_numbers_are(registry, serving):
+    """A format-5 model: /predict and /model-info carry units and the reference
+    the series was divided by, so the scaler can multiply by its own capacity
+    and check it against the model's."""
+    ts, values = demand()
+    run_pipeline(values / 4.0, TrainConfig(horizon=2, candidates=["hgb_delta"], units="capacity_fraction",
+                                           capacity_reference=4.0), "test", timestamps=ts)
+    serving_app.load_model()
+    info = serving.get("/model-info").json()
+    assert info["units"] == "capacity_fraction" and info["capacity_reference"] == 4.0
+    r = serving.post("/predict", json={"values": [float(v) / 4.0 for v in values[-10:]]}).json()
+    assert r["units"] == "capacity_fraction" and r["capacity_reference"] == 4.0
+    assert len(r["predictions"]) == 2 and max(r["predictions"]) < 1.5
+
+
+def test_scaled_models_report_scaled_units(registry, serving):
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    assert serving.get("/model-info").json()["units"] == "scaled"
+    r = serving.post("/predict", json={"values": [0.3] * 10}).json()
+    assert r["units"] == "scaled" and r["capacity_reference"] is None
+
+
+def test_capacity_fraction_contract_is_checked_at_load(registry, serving, monkeypatch):
+    """A bundle whose metadata claims fractions but whose target scaler is a
+    MinMaxScaler would silently serve mis-scaled numbers: rejected."""
+    from sklearn.preprocessing import MinMaxScaler
+
+    ts, values = demand()
+    run_pipeline(values, TrainConfig(horizon=2, candidates=["hgb_delta"]), "test", timestamps=ts)
+    serving_app.load_model()
+    b = serving_app.STORE.get()
+    bad_meta = {**b.meta, "units": "capacity_fraction", "capacity_reference": 4.0}
+    bad = serving_app.Bundle(b.model, (MinMaxScaler().fit([[0.0], [2.0]]),), bad_meta, b.info, b.tags)   # x 0.5
+    with pytest.raises(RuntimeError, match="not the identity"):
+        serving_app._validated(bad)
+    with pytest.raises(RuntimeError, match="capacity_reference"):
+        serving_app._validated(serving_app.Bundle(b.model, b.scalers, {**b.meta, "units": "capacity_fraction"},
+                                                  b.info, b.tags))

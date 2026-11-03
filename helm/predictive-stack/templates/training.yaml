@@ -78,6 +78,15 @@ spec:
                   value: {{ $t.cronjob.underWeight | quote }}
                 - name: TRAIN_BASELINE
                   value: {{ $t.cronjob.baseline | quote }}
+                # The series above is demand / capacity: say so in the model's
+                # contract (units, format 5) and record the number, so the scaler
+                # can check its runtime capacity against it.
+                - name: TRAIN_UNITS
+                  value: {{ $t.cronjob.units | default "scaled" | quote }}
+                {{- if $tw.capacity }}
+                - name: TRAIN_CAPACITY_REFERENCE
+                  value: {{ $tw.capacity | quote }}
+                {{- end }}
                 - name: MODEL_NAME
                   value: cpu-forecasting
                 - name: MODEL_ALIAS

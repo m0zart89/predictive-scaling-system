@@ -100,6 +100,22 @@ promoted; the real-traces workflow uses `best`.
    to. Fewer than `--min-fresh-windows` (48) such windows → keep the champion.
    Promote if the new cost is lower by at least `--min-improvement`.
 
+## Units: fractions of capacity (format 5)
+
+`--units capacity_fraction --capacity-reference C` (`TRAIN_UNITS`,
+`TRAIN_CAPACITY_REFERENCE`; the chart's CronJob sets both from the
+workload's `capacity`) says the series is `demand / C`. The target channel
+is then not re-scaled (`CapacityFractionScaler`, an identity), so the delta
+target is exactly `(CPU_{t+k} − CPU_t) / C` and a forecast of `+0.05` means
+"5 % of the envelope" on every workload and model version; `holdout_mae_step_k`
+and `ForecastDriftHigh` compare like with like. The version is tagged
+`units` and `capacity_reference`, and `forecast_meta.json` carries both.
+Exogenous channels keep MinMax scaling. A series above 1.5 × C is refused:
+that is a wrong reference, not a busy workload. The default, `scaled` (MinMax
+of the training series), is what every earlier model implies; notebooks,
+the real-traces workflow and the bootstrap Job (which trains on a saved
+export in raw cores) keep it.
+
 ## Model contract (shared with serving)
 
 A registered version has three artifacts:

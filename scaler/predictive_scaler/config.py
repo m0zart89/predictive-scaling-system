@@ -85,6 +85,14 @@ class ScalerConfig:
     forecast_timeout_seconds: float = 0.2
     forecast_breaker_failures: int = 3
     forecast_breaker_open_seconds: float = 30.0
+    # Reference capacity at runtime (capacity.py): a PromQL instant query for
+    # the workload's envelope in cores (max limit per pod x maxReplicas),
+    # cached capacity_refresh_seconds; "" = the static `capacity` above. A
+    # resolved value more than capacity_drift_factor away from the model's
+    # own capacity_reference is flagged (0 = no check).
+    capacity_query: str = ""
+    capacity_refresh_seconds: float = 300.0
+    capacity_drift_factor: float = 2.0
 
     @property
     def cache_key(self) -> str:
@@ -178,6 +186,9 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
     alpha = _positive_float(meta, "smoothingAlpha", default=0.3)
     if alpha > 1:
         raise ConfigError(f"metadata.smoothingAlpha must be in (0, 1], got {alpha!r}")
+    drift = _positive_float(meta, "capacityDriftFactor", default=2.0, allow_zero=True)
+    if 0 < drift < 1:
+        raise ConfigError(f"metadata.capacityDriftFactor must be >= 1 (or 0 for no check), got {drift!r}")
 
     return ScalerConfig(
         prometheus_address=_required(meta, "prometheusServerAddress").rstrip("/"),
@@ -212,4 +223,8 @@ def parse_metadata(meta: Mapping[str, str]) -> ScalerConfig:
         forecast_timeout_seconds=_positive_float(meta, "forecastTimeoutSeconds", default=0.2),
         forecast_breaker_failures=_positive_int(meta, "forecastBreakerFailures", default=3, allow_zero=True),
         forecast_breaker_open_seconds=_positive_float(meta, "forecastBreakerOpenSeconds", default=30.0),
+        capacity_query=(meta.get("capacityQuery") or "").strip(),
+        capacity_refresh_seconds=_positive_float(meta, "capacityRefreshSeconds", default=300.0,
+                                                 allow_zero=True),
+        capacity_drift_factor=drift,
     )

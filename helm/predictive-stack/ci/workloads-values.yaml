@@ -8,6 +8,7 @@ workloads:
     targetValue: "0.7"
     capacity: "4"
     maxReplicas: 20
+    capacityQuery: max(kube_pod_container_resource_limits{container="api", resource="cpu"}) * 20
   - name: worker
     deployment: worker
     query: sum(rate(container_cpu_usage_seconds_total{container="worker"}[2m]))

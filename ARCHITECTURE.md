@@ -50,9 +50,9 @@ The forecast service itself knows nothing about replicas or clusters. It is a st
 ```
 KEDA ──GetMetrics(ScaledObjectRef + trigger metadata)──► predictive-scaler
   1. Prometheus query_range: last timeSteps samples of `query`, stepSeconds apart
-  2. model input = demand / capacity          (workload units → model units)
+  2. model input = demand / capacity          (capacity: the static key or capacityQuery, in cores)
   3. POST /predict {values, series: ns/name, timestamp, step_seconds}
-  4. predicted = (max over horizon | next step) × capacity
+  4. predicted = (max over horizon | next step) × capacity   (units: capacity_fraction → checked against the model's reference)
   5. condition it: surge cap, hysteresis gate (spikeMinSteps), EWMA (smoothingAlpha);
      a failing service (forecastTimeoutSeconds, forecastBreakerFailures) means predicted = none
   6. reported  = max(smoothed, observed)      (mode=max) | smoothed (mode=forecast)
@@ -130,6 +130,7 @@ CI builds the four images on every PR and publishes them to GHCR on `main`. `scr
 | **Compare with the champion only on data neither model has seen** (`data_end_ts` tag, `min_fresh_windows`) | compare on the current holdout | A model always looks best on data it was fitted to; without the rule the nightly job would replace a good champion with a model that merely saw yesterday. |
 | **Registry aliases** (`@champion`) instead of stages | `Production` stage | Stages are deprecated in MLflow; an alias is a single pointer the pipeline moves atomically and every serving replica resolves on its next poll. The stage is still honoured as a fallback so notebook-registered models keep working. |
 | **Forecast quality measured in serving, from the windows it already receives** | a separate feedback service; a Prometheus recording rule joining forecasts with actuals | The information is already in the request stream; no new deployment, no clock skew between systems. The cost is per-request bookkeeping and the need for callers to pass `series`/`timestamp` for exact matching. |
+| **The model speaks fractions of a fixed reference capacity** (`units: capacity_fraction`, `capacity_reference` in the contract) | MinMax units of the training series; absolute cores | A delta of 0.1 means a tenth of the workload's envelope on every workload and week, so holdout MAE, drift thresholds and the breaker's residuals compare across models; the scaler multiplies by its own reference (static or `capacityQuery`) and can tell when the two disagree. The reference is the fixed envelope, never the live replica total, which would feed the scaler's own actions back into the series. |
 | **Quality state in Redis with TTLs, not in the pod** (several replicas) | per-pod memory; a database | A forecast made on one replica is scored on whichever replica gets the later window; the pod holds nothing per series, so hundreds of workloads cost Redis memory bounded by TTL × request rate, not pod memory. Every key expires, so no cleanup job; Redis down degrades to "no quality figures", never to a failed prediction. |
 | **Dashboards and rules as JSON/YAML, validated and synced by a script** | hand-edited ConfigMaps; Grafana as the source of truth | The validator catches a renamed metric or label before Grafana shows "No data" or an alert silently never fires; the chart ships copies the check keeps in sync. |
 | **One umbrella chart with KEDA as a dependency** | separate installs per component; kustomize | One command, one namespace, namespace-scoped RBAC, pinned versions. The only wrinkle — a `ScaledObject` cannot be in the same install as the CRDs that define it — is handled by `demo.scaling` and a two-phase `up.sh`. |

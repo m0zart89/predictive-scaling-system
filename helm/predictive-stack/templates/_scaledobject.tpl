@@ -112,6 +112,12 @@ spec:
         forecastTimeoutSeconds: {{ $w.forecastTimeoutSeconds | default $d.forecastTimeoutSeconds | quote }}
         forecastBreakerFailures: {{ $w.forecastBreakerFailures | default $d.forecastBreakerFailures | quote }}
         forecastBreakerOpenSeconds: {{ $w.forecastBreakerOpenSeconds | default $d.forecastBreakerOpenSeconds | quote }}
+        {{- with $w.capacityQuery | default $d.capacityQuery }}
+        # reference capacity from Prometheus at runtime (else `capacity` above)
+        capacityQuery: {{ . | quote }}
+        capacityRefreshSeconds: {{ $w.capacityRefreshSeconds | default $d.capacityRefreshSeconds | quote }}
+        {{- end }}
+        capacityDriftFactor: {{ $w.capacityDriftFactor | default $d.capacityDriftFactor | quote }}
 {{- if $root.Values.global.tls.enabled }}
       authenticationRef:
         name: predictive-scaler-mtls
