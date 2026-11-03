@@ -14,11 +14,20 @@ class FakePrometheus:
     """Returns a fixed history (None = missing sample; or raises) and records
     every call. Like the real client, the grid ends at the newest sample."""
 
-    def __init__(self, values=None, exc=None, by_query=None):
+    def __init__(self, values=None, exc=None, by_query=None, scalars=None):
         self.values = list(values or [])
         self.by_query = dict(by_query or {})   # query → values for extra channels
+        self.scalars = dict(scalars or {})     # query → instant answer (capacityQuery), or an exception
         self.exc = exc
         self.calls = []
+        self.scalar_calls = []
+
+    def query_scalar(self, address, query, timeout):
+        self.scalar_calls.append(query)
+        answer = self.scalars.get(query)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     NOW = 1_700_000_000.0   # time of the last sample the fake returns
 
@@ -58,6 +67,8 @@ class FakeForecast:
         if self.exc:
             raise self.exc
         out = self.fn(values)
+        if hasattr(out, "units"):                 # a ForecastAnswer: keep its units / reference
+            return out
         return list(out) if isinstance(out, (list, tuple)) else [out]
 
 

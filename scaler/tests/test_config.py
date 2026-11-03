@@ -92,3 +92,16 @@ def test_channels_are_a_json_map_and_exclude_the_target():
             make_config(channels=bad)
     with pytest.raises(ConfigError, match="target channel"):
         make_config(channels='{"cpu": "x"}')
+
+
+def test_capacity_query_settings():
+    from fakes import make_config
+    from predictive_scaler.config import ConfigError
+    import pytest
+
+    cfg = make_config()
+    assert cfg.capacity_query == "" and cfg.capacity_refresh_seconds == 300.0 and cfg.capacity_drift_factor == 2.0
+    cfg = make_config(capacityQuery=" max(x) * 3 ", capacityRefreshSeconds="0", capacityDriftFactor="0")
+    assert cfg.capacity_query == "max(x) * 3" and cfg.capacity_refresh_seconds == 0 and cfg.capacity_drift_factor == 0
+    with pytest.raises(ConfigError, match="capacityDriftFactor"):
+        make_config(capacityDriftFactor="0.5")

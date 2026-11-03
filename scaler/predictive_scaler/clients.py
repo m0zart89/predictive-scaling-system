@@ -65,6 +65,39 @@ def _is_timeout(exc: BaseException) -> bool:
 
 
 class PrometheusClient:
+    def query_scalar(self, address: str, query: str, timeout: float) -> Optional[float]:
+        """
+        Instant query that must resolve to one sample; its value as a float,
+        None when the query matched nothing, PrometheusError on a failure or
+        on several series. Used for the reference capacity (capacityQuery).
+        """
+        params = urllib.parse.urlencode({"query": query})
+        url = f"{address}/api/v1/query?{params}"
+        try:
+            body = _read_json(urllib.request.Request(url), timeout)
+        except urllib.error.HTTPError as exc:
+            raise PrometheusError(f"Prometheus returned HTTP {exc.code} for query") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise PrometheusError(f"Prometheus unreachable at {address}: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise PrometheusError("Prometheus returned invalid JSON") from exc
+        if body.get("status") != "success":
+            raise PrometheusError(f"Prometheus query failed: {body.get('error', 'unknown error')}")
+        data = body.get("data", {})
+        if data.get("resultType") == "scalar":
+            result = [{"value": data.get("result")}]
+        else:
+            result = data.get("result", [])
+        if len(result) > 1:
+            raise PrometheusError(f"query returned {len(result)} series; aggregate it to one (e.g. max(...))")
+        if not result:
+            return None
+        try:
+            value = float(result[0]["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise PrometheusError("Prometheus returned an unusable sample") from exc
+        return value if math.isfinite(value) else None
+
     def fetch_window(self, address: str, query: str, points: int, step_seconds: int,
                      timeout: float, now: Optional[float] = None) -> List[float]:
         """Values of fetch_series (kept for callers that do not need timestamps)."""
@@ -157,14 +190,30 @@ class PrometheusClient:
         return grid, values
 
 
+class ForecastAnswer(list):
+    """
+    The horizon as a list (model units, one value per step) plus what the
+    service says those numbers are: `units` is "capacity_fraction" for models
+    trained on demand / capacity_reference (multiply by the ScaledObject's
+    capacity to get cores) or "scaled" for older models and services that do
+    not say; `capacity_reference` is the model's own reference when known.
+    """
+
+    def __init__(self, values, units: str = "scaled", capacity_reference: Optional[float] = None):
+        super().__init__(values)
+        self.units = units
+        self.capacity_reference = capacity_reference
+
+
 class ForecastClient:
     def predict(self, base_url: str, values: List[Optional[float]], timeout: float,
                 series: Optional[str] = None, timestamp: Optional[float] = None,
-                step_seconds: Optional[int] = None) -> List[float]:
+                step_seconds: Optional[int] = None) -> ForecastAnswer:
         """
         Call POST /predict and return the forecast for each step of the model's
-        horizon (model space). Models with a single-step horizon, and services
-        that predate multi-step forecasts, yield a one-element list.
+        horizon (model space) as a ForecastAnswer: a list with `units` and
+        `capacity_reference` from the response. Models with a single-step
+        horizon, and services that predate multi-step forecasts, yield one value.
 
         `values` may hold None for gaps in the older part of a long history
         (sent as null; the service interpolates them). `series`, `timestamp`
@@ -210,4 +259,12 @@ class ForecastClient:
             raise ForecastError("forecast response has no numeric 'prediction'", "bad_response") from exc
         if not predictions or not all(math.isfinite(v) for v in predictions):
             raise ForecastError("forecast service returned a non-finite prediction", "bad_response")
-        return predictions
+        units = str(body.get("units") or "scaled")
+        ref = body.get("capacity_reference")
+        try:
+            ref = float(ref) if ref is not None else None
+            if ref is not None and not (math.isfinite(ref) and ref > 0):
+                ref = None
+        except (TypeError, ValueError):
+            ref = None
+        return ForecastAnswer(predictions, units, ref)

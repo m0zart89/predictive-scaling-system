@@ -212,3 +212,38 @@ def test_forecast_sends_nulls_for_history_gaps(http):
     assert out == [0.5, 0.6]
     sent = json.loads(http.requests[0][2])
     assert sent["values"] == [None, 0.2, None, 0.3, 0.4]
+
+
+def test_forecast_answer_carries_units_and_reference(http):
+    http.body = {"prediction": 0.4, "predictions": [0.4, 0.6], "units": "capacity_fraction",
+                 "capacity_reference": 8}
+    out = ForecastClient().predict(http.url, [0.1], timeout=2)
+    assert list(out) == [0.4, 0.6] and max(out) == 0.6
+    assert out.units == "capacity_fraction" and out.capacity_reference == 8.0
+    http.body = {"prediction": 0.4}                                      # an older service
+    out = ForecastClient().predict(http.url, [0.1], timeout=2)
+    assert out.units == "scaled" and out.capacity_reference is None
+    http.body = {"prediction": 0.4, "units": "capacity_fraction", "capacity_reference": "bogus"}
+    assert ForecastClient().predict(http.url, [0.1], timeout=2).capacity_reference is None
+
+
+def test_prometheus_scalar_query(http):
+    from predictive_scaler.clients import PrometheusClient, PrometheusError
+
+    http.body = {"status": "success", "data": {"resultType": "vector",
+                                               "result": [{"metric": {}, "value": [1700000000, "16"]}]}}
+    assert PrometheusClient().query_scalar(http.url, "max(limit) * 20", timeout=2) == 16.0
+    assert http.requests[-1][1].startswith("/api/v1/query?")
+    http.body = {"status": "success", "data": {"resultType": "scalar", "value": [1700000000, "2.5"]}}
+    http.body["data"]["result"] = [1700000000, "2.5"]
+    assert PrometheusClient().query_scalar(http.url, "2.5", timeout=2) == 2.5
+    http.body = {"status": "success", "data": {"resultType": "vector", "result": []}}
+    assert PrometheusClient().query_scalar(http.url, "nothing", timeout=2) is None
+    http.body = {"status": "success", "data": {"resultType": "vector", "result": [
+        {"metric": {"pod": "a"}, "value": [1, "1"]}, {"metric": {"pod": "b"}, "value": [1, "2"]}]}}
+    with pytest.raises(PrometheusError, match="aggregate"):
+        PrometheusClient().query_scalar(http.url, "two", timeout=2)
+    http.status = 500
+    http.body = {"status": "error", "error": "boom"}
+    with pytest.raises(PrometheusError):
+        PrometheusClient().query_scalar(http.url, "x", timeout=2)

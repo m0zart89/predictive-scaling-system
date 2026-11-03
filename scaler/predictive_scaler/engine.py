@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
 from .breaker import BreakerConfig, CircuitBreaker
+from .capacity import CapacityRef, CapacityResolver
 from .clients import ForecastClient, ForecastError, PrometheusClient, PrometheusError
 from .config import ScalerConfig
 from .metrics import ScalerMetrics
@@ -91,6 +92,8 @@ class PredictiveEngine:
         self._breakers: Dict[Tuple[str, str], CircuitBreaker] = {}
         # metric conditioning, keyed by namespace/name (smoothing.py)
         self.smoother = EwmaSmoother(clock=clock)
+        # the reference capacity in cores: capacityQuery at runtime, else the static key
+        self.capacity = CapacityResolver(self.prometheus, clock=clock)
         self._service_breakers: Dict[Tuple[str, str], ServiceBreaker] = {}
 
     def _channels(self, cfg: ScalerConfig, grid_ts, length: int) -> Dict[str, list]:
@@ -189,10 +192,20 @@ class PredictiveEngine:
         observed = max(0.0, values[-1])
         predicted: Optional[float] = None
         key = f"{namespace}/{name}"
+        # Cores the model's fractions refer to: everything below in model
+        # units is demand / ref.value, and a forecast is coefficient x ref.value.
+        ref = self.capacity.resolve(key, cfg)
+        self.metrics.capacity_reference.labels(**labels, source=ref.source).set(ref.value)
+        other = "static" if ref.source == "query" else "query"
+        try:
+            self.metrics.capacity_reference.remove(namespace, name, other)
+        except KeyError:
+            pass
 
-        # Score the forecasts made earlier for instants this history now holds.
+        # Score the forecasts made earlier for instants this history now holds
+        # (each against the reference it was made with).
         residuals = []
-        for r in self.ledger.score(key, grid_ts, history, cfg.capacity):
+        for r in self.ledger.score(key, grid_ts, history, ref.value):
             self.metrics.forecast_abs_error.labels(**labels, step=str(r.step)).observe(abs(r.error))
             if r.step == 1:
                 self.metrics.forecast_residual.labels(**labels).set(r.error)
@@ -200,8 +213,8 @@ class PredictiveEngine:
 
         # Does the present resemble the history the model learned? (model units)
         verdict = self._breaker(key, cfg).observe(
-            key, observed / cfg.capacity,
-            [None if v is None else v / cfg.capacity for v in history],
+            key, observed / ref.value,
+            [None if v is None else v / ref.value for v in history],
             cfg.history_steps - cfg.time_steps, residuals)
         self.metrics.breaker_open.labels(**labels).set(0 if verdict.use_forecast else 1)
         if verdict.tripped:
@@ -225,7 +238,8 @@ class PredictiveEngine:
                 reason = f"{admission.reason}; reactive mode on observed demand"
             else:
                 source, reason, predicted, horizon_demand = self._forecast(
-                    namespace, name, cfg, labels, key, grid_ts, history, values, timestamps, observed, service)
+                    namespace, name, cfg, labels, key, grid_ts, history, values, timestamps, observed, service,
+                    ref)
         self.metrics.forecast_service_breaker_open.labels(**labels).set(0 if service.state(key) == "closed" else 1)
 
         if predicted is not None:
@@ -306,19 +320,22 @@ class PredictiveEngine:
         return decision
 
     def _forecast(self, namespace: str, name: str, cfg: ScalerConfig, labels: dict, key: str,
-                  grid_ts, history, values, timestamps, observed: float, service: ServiceBreaker):
+                  grid_ts, history, values, timestamps, observed: float, service: ServiceBreaker,
+                  ref: CapacityRef):
         """
-        The forecast-service call with its fault boundary: build the input,
-        POST /predict with forecast_timeout_seconds, record the horizon;
-        every failure (timeout, 5xx, network, unusable body) counts against
-        the service breaker and yields observed demand. Returns
-        (source, reason, predicted, horizon in demand units).
+        The forecast-service call with its fault boundary: build the input
+        (demand / ref.value), POST /predict with forecast_timeout_seconds,
+        read the answer's units, multiply the coefficients by ref.value,
+        record the horizon; every failure (timeout, 5xx, network, unusable
+        body) counts against the service breaker and yields observed demand.
+        Returns (source, reason, predicted, horizon in demand units).
         """
+        capacity = ref.value
         if cfg.history_steps > cfg.time_steps:
             # the whole history, holes as null: serving interpolates the old part
-            model_input = [None if v is None else v / cfg.capacity for v in history]
+            model_input = [None if v is None else v / capacity for v in history]
         else:
-            model_input = [v / cfg.capacity for v in values[-cfg.time_steps:]]
+            model_input = [v / capacity for v in values[-cfg.time_steps:]]
         if cfg.channels:
             # multivariate: the extra series on the target's grid, keyed by channel name
             try:
@@ -358,12 +375,32 @@ class PredictiveEngine:
 
         if service.success(key):
             log.info("event=forecast_service_breaker_closed namespace=%s scaledobject=%s", namespace, name)
+        # What the numbers are (docs/relative-delta-alignment.md): fractions of
+        # the model's capacity_reference, or the training series' own units
+        # for models before format 5. Either way the scaler multiplies by its
+        # reference; with fractions it can also tell whether the two agree.
+        units = getattr(horizon, "units", "scaled")
+        trained_ref = getattr(horizon, "capacity_reference", None)
+        if units == "capacity_fraction" and trained_ref:
+            drift = capacity / trained_ref
+            self.metrics.capacity_drift.labels(**labels).set(drift)
+            factor = cfg.capacity_drift_factor
+            if factor and (drift > factor or drift < 1 / factor):
+                log.warning("event=capacity_drift namespace=%s scaledobject=%s runtime=%g trained=%g "
+                            "factor=%.2f source=%s", namespace, name, capacity, trained_ref, drift, ref.source)
+        else:
+            try:
+                self.metrics.capacity_drift.remove(namespace, name)
+            except KeyError:
+                pass
         # next: the coming interval. max: the peak over the model's whole
         # horizon, which buys lead time equal to the horizon.
         model_out = max(horizon) if cfg.forecast_aggregation == "max" else horizon[0]
-        predicted = max(0.0, model_out * cfg.capacity)
-        horizon_demand = [max(0.0, v * cfg.capacity) for v in horizon]
-        self.ledger.record(key, timestamps[-1], cfg.step_seconds, horizon)
+        predicted = max(0.0, model_out * capacity)
+        horizon_demand = [max(0.0, v * capacity) for v in horizon]
+        log.info("event=forecast_scaled namespace=%s scaledobject=%s coefficient=%.4f units=%s capacity=%g "
+                 "source=%s demand=%.4g", namespace, name, model_out, units, capacity, ref.source, predicted)
+        self.ledger.record(key, timestamps[-1], cfg.step_seconds, horizon, capacity=capacity)
         for k, v in enumerate(horizon_demand, start=1):
             self.metrics.forecast_demand.labels(**labels, step=str(k)).set(v)
         reason = (f"forecast {predicted:.4g} ({cfg.forecast_aggregation} of "
